@@ -545,7 +545,17 @@ def remove_run_temp(root: Path, run_id: str) -> None:
     run_dir = (root / "runs" / run_id).resolve()
     runs_root = (root / "runs").resolve()
     if run_dir.is_dir() and is_within(run_dir, runs_root):
-        remove_owned_tree(run_dir, runs_root)
+        delays = (0.1, 0.2, 0.4, 0.8) if os.name == "nt" else ()
+        for delay in (*delays, None):
+            try:
+                remove_owned_tree(run_dir, runs_root)
+                return
+            except OSError as error:
+                if delay is None or not (
+                    isinstance(error, PermissionError) or getattr(error, "winerror", None) in {5, 32}
+                ):
+                    raise
+                time.sleep(delay)
 
 
 def utc_now() -> str:

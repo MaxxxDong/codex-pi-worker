@@ -280,9 +280,20 @@ def schedule_cache_gc(runtime: Path) -> bool:
             start_new_session=os.name != "nt",
             close_fds=True,
         )
-        return True
     except OSError:
         return False
+    return True
+
+
+def cleanup_run_temp(runtime: Path, run_id: str) -> dict[str, object]:
+    try:
+        remove_run_temp(runtime, run_id)
+    except OSError as error:
+        return {
+            "status": "deferred",
+            "error": redact_credentials(str(error).encode("utf-8"))[:500].decode("utf-8", errors="ignore"),
+        }
+    return {"status": "removed"}
 
 
 def parse_events(path: Path) -> dict[str, object]:
@@ -462,6 +473,7 @@ def main(args: argparse.Namespace | None = None) -> int:
         }
     )
     cache_status: dict[str, object] = {}
+    run_temp_cleanup: dict[str, object] = {"status": "pending"}
     try:
         with events_path.open("wb") as events_file, stderr_path.open("wb") as stderr_file:
             process = subprocess.Popen(
@@ -551,8 +563,10 @@ def main(args: argparse.Namespace | None = None) -> int:
                 watchdog.join(timeout=1)
     finally:
         close_windows_handle(attention_handle)
-        remove_run_temp(runtime, run_id)
-        cache_status = release_cache(runtime, run_id)
+        try:
+            run_temp_cleanup = cleanup_run_temp(runtime, run_id)
+        finally:
+            cache_status = release_cache(runtime, run_id)
 
     timed_out = timeout_event.is_set()
 
@@ -627,6 +641,7 @@ def main(args: argparse.Namespace | None = None) -> int:
         "sessionDir": str(args.session_dir.resolve()),
         "turnIndex": args.turn_index,
         "cleanupStatus": "pending_review",
+        "runTempCleanup": run_temp_cleanup,
         "reviewRequired": True,
         "continuationAvailable": True,
         "nextAction": "review_then_continue_or_finalize",

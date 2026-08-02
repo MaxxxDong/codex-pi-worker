@@ -339,7 +339,8 @@ class SessionContinuationTests(unittest.TestCase):
             self.assertEqual(continued.returncode, 0, continued.stderr)
             second_receipt = json.loads(continued.stdout)
             second_receipt_path = Path(second_receipt["outputDir"]) / "pi-receipt.json"
-            self._watch(second_receipt_path, env)
+            watched = self._watch(owner_receipt, env)
+            self.assertEqual(watched["result"]["turnIndex"], 2)
             second_result = json.loads(Path(second_receipt["resultPath"]).read_text(encoding="utf-8"))
             self.assertEqual(second_result["turnIndex"], 2)
             self.assertIn("PREV=FIRST", second_result["finalText"])
@@ -369,7 +370,7 @@ class SessionContinuationTests(unittest.TestCase):
             )
             self.assertEqual(job["state"], "settled")
 
-    def _watch(self, receipt: Path, env: dict[str, str]) -> None:
+    def _watch(self, receipt: Path, env: dict[str, str]) -> dict[str, object]:
         watched = subprocess.run(
             [
                 sys.executable,
@@ -386,7 +387,9 @@ class SessionContinuationTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(watched.returncode, 0, watched.stderr)
-        self.assertEqual(json.loads(watched.stdout)["event"], "terminal")
+        result = json.loads(watched.stdout)
+        self.assertEqual(result["event"], "terminal")
+        return result
 
 
 if __name__ == "__main__":

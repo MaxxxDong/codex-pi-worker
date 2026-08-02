@@ -28,6 +28,14 @@ def read_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def latest_receipt(path: Path) -> tuple[Path, dict[str, object]]:
+    supplied = read_json(path)
+    owner_path = Path(str(supplied.get("ownerReceiptPath") or path)).resolve()
+    owner = read_json(owner_path)
+    latest_path = Path(str(owner.get("latestReceiptPath") or path)).resolve()
+    return latest_path, read_json(latest_path)
+
+
 def terminal(receipt_path: Path, receipt: dict[str, object]) -> dict[str, object] | None:
     result_path = Path(str(receipt["resultPath"]))
     if not result_path.is_file():
@@ -63,7 +71,7 @@ def main() -> int:
     parser.add_argument("receipts", type=Path, nargs="+")
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     args = parser.parse_args()
-    receipts = [(path.resolve(), read_json(path.resolve())) for path in args.receipts]
+    receipts = [latest_receipt(path.resolve()) for path in args.receipts]
     for path, receipt in receipts:
         event = terminal(path, receipt)
         if event:

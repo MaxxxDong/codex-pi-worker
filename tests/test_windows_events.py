@@ -20,6 +20,7 @@ from prepare_pi_playwright_windows import NEW, OLD, patch_runtime  # noqa: E402
 from run_pi_worker import (  # noqa: E402
     MAX_FINAL_TEXT_BYTES,
     MAX_TOOL_ERROR_BYTES,
+    cleanup_run_temp,
     classify_attention,
     compact_event,
     git_changes,
@@ -39,6 +40,7 @@ from runtime_support import (  # noqa: E402
     reconcile_jobs,
     record_job,
     remove_owned_tree,
+    remove_run_temp,
     set_attention_event,
     worker_environment,
 )
@@ -73,6 +75,27 @@ class WindowsEventTests(unittest.TestCase):
             remove_owned_tree(target, root)
 
             self.assertFalse(target.exists())
+
+    def test_remove_run_temp_retries_transient_windows_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "runs" / "locked"
+            run_dir.mkdir(parents=True)
+            with (
+                patch("runtime_support.os.name", "nt"),
+                patch("runtime_support.remove_owned_tree", side_effect=[PermissionError(5, "locked"), None]) as remove,
+                patch("runtime_support.time.sleep") as sleep,
+            ):
+                remove_run_temp(root, "locked")
+            self.assertEqual(remove.call_count, 2)
+            sleep.assert_called_once_with(0.1)
+
+    def test_locked_run_temp_is_deferred_without_runner_failure(self) -> None:
+        error = PermissionError(5, "locked JNA DLL")
+        with patch("run_pi_worker.remove_run_temp", side_effect=error):
+            status = cleanup_run_temp(Path("runtime"), "run")
+        self.assertEqual(status["status"], "deferred")
+        self.assertIn("locked JNA DLL", status["error"])
 
     def test_compact_tool_start_is_timestamped(self) -> None:
         event = json.loads(compact_event(b'{"type":"tool_execution_start","toolName":"read"}\n'))
