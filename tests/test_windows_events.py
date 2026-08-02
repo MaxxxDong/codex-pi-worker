@@ -379,6 +379,47 @@ class WindowsEventTests(unittest.TestCase):
             self.assertFalse((runtime / "runs" / run_id).exists())
 
     @unittest.skipUnless(os.name == "nt", "Windows integration test")
+    def test_watch_reports_dead_runner_as_structured_orphan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            output = root / "output"
+            output.mkdir()
+            run_id = "dead-turn"
+            receipt = output / "pi-receipt.json"
+            result = output / "pi-result.json"
+            atomic_json(
+                receipt,
+                {
+                    "runId": run_id,
+                    "pid": 2_000_000_000,
+                    "resultPath": str(result),
+                    "outputDir": str(output),
+                    "runtimeRoot": str(runtime),
+                },
+            )
+            atomic_json(
+                runtime / "jobs" / f"{run_id}.json",
+                {"jobId": run_id, "state": "running", "pid": 2_000_000_000, "resultPath": str(result)},
+            )
+            atomic_json(runtime / "active" / f"{run_id}.json", {"runId": run_id, "pid": 2_000_000_000})
+
+            watched = subprocess.run(
+                [sys.executable, str(SCRIPTS / "watch_pi_worker.py"), str(receipt), "--timeout-seconds", "1"],
+                capture_output=True,
+                text=True,
+                encoding="cp936",
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False,
+            )
+
+            self.assertEqual(watched.returncode, 0, watched.stderr)
+            self.assertEqual(json.loads(watched.stdout)["event"], "orphaned")
+            job = json.loads((runtime / "jobs" / f"{run_id}.json").read_text(encoding="utf-8"))
+            self.assertEqual(job["state"], "orphaned")
+            self.assertFalse((runtime / "active" / f"{run_id}.json").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows integration test")
     def test_start_rolls_back_when_receipt_write_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

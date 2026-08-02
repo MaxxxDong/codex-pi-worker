@@ -45,6 +45,10 @@ MAX_TOOL_ERROR_BYTES = 2048
 
 BASE_TOOLS = "read,bash,edit,write,grep,find,ls,web_search,fetch_content,get_search_content"
 ANALYSIS_TOOLS = "read,grep,find,ls,web_search,fetch_content,get_search_content"
+IMPLEMENTATION_GUIDANCE = (
+    "The current working directory is the isolated execution worktree. Use relative paths for edits and commands. "
+    "The source checkout and home may be inspected read-only, but never mutate or execute against them."
+)
 
 CREDENTIAL_PATTERNS = (
     re.compile(rb"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"),
@@ -406,6 +410,11 @@ def main(args: argparse.Namespace | None = None) -> int:
     enabled_tools = ANALYSIS_TOOLS if args.mode == "analysis" else BASE_TOOLS
     if args.firecrawl:
         enabled_tools += ",mcp"
+    guidance = (
+        IMPLEMENTATION_GUIDANCE
+        if args.mode == "implementation"
+        else "This is a read-only task. Inspect the current working directory without changing files or repository state."
+    )
     command = [
         pi,
         "--mode",
@@ -422,6 +431,8 @@ def main(args: argparse.Namespace | None = None) -> int:
         args.model,
         "--thinking",
         args.thinking,
+        "--append-system-prompt",
+        guidance,
         "--extension",
         str(Path(__file__).with_name("pi_worker_guard.mjs")),
         "--tools",

@@ -14,6 +14,8 @@ from runtime_support import (
     close_windows_handle,
     create_attention_event,
     emit_json,
+    record_job,
+    release_cache,
     reset_attention_event,
 )
 
@@ -66,6 +68,38 @@ def attention(receipt_path: Path, receipt: dict[str, object]) -> dict[str, objec
     }
 
 
+def orphaned(receipt_path: Path, receipt: dict[str, object]) -> dict[str, object]:
+    runtime = receipt.get("runtimeRoot")
+    reconciliation = None
+    if runtime:
+        root = Path(str(runtime)).resolve()
+        owner_path = receipt.get("ownerReceiptPath")
+        owner = read_json(Path(str(owner_path)).resolve()) if owner_path else receipt
+        job = record_job(
+            root,
+            str(owner.get("runId") or receipt.get("runId")),
+            state="orphaned",
+            pid=0,
+            latestRunId=receipt.get("runId"),
+            resultPath=receipt.get("resultPath"),
+        )
+        reconciliation = {"state": job["state"], "cache": release_cache(root, str(receipt.get("runId")))}
+    output_dir = Path(str(receipt.get("outputDir") or receipt_path.parent)).resolve()
+    return {
+        "event": "orphaned",
+        "receipt": str(receipt_path),
+        "runId": receipt.get("runId"),
+        "reason": "worker_exited_without_result",
+        "outputDir": str(output_dir),
+        "evidence": {
+            "events": str(output_dir / "pi-events.jsonl"),
+            "stderr": str(output_dir / "pi-stderr.log"),
+            "runtimeStderr": str(output_dir / "runtime.stderr.log"),
+        },
+        "runtimeReconciliation": reconciliation,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("receipts", type=Path, nargs="+")
@@ -106,7 +140,8 @@ def main() -> int:
                 if event:
                     emit_json(event)
                     return 0
-                raise SystemExit(f"worker process is unavailable and has no result: {path}")
+                emit_json(orphaned(path, receipt))
+                return 0
             event_name = receipt.get("attentionEventName")
             if event_name:
                 attention_handle = create_attention_event(str(event_name))
@@ -138,7 +173,8 @@ def main() -> int:
                 continue
             event = terminal(path, receipt)
             if not event:
-                raise SystemExit(f"worker exited without result: {path}")
+                emit_json(orphaned(path, receipt))
+                return 0
             emit_json(event)
             return 0
     finally:
