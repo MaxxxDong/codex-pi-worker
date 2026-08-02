@@ -51,10 +51,12 @@ const MUTATION_OR_EXECUTION = /\b(?:rm|remove-item|del|erase|rd|rmdir|mv|move|cp
 
 function outsideExecutionCwd(command, cwd) {
   const tokens = command.match(/"(?:\\.|[^"])*"|'[^']*'|[^\s;&|<>]+/g) || [];
-  return tokens.some((rawToken) => {
+  return tokens.some((rawToken, index) => {
     let token = rawToken.replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/, "$1$2");
     const equals = token.indexOf("=");
     if (equals >= 0) token = token.slice(equals + 1);
+    const previous = (tokens[index - 1] || "").replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/, "$1$2");
+    if (/^(?:\\|\/dev\/null|nul)$/i.test(token) || (token === "/" && previous === "tr")) return false;
     const absolute = path.isAbsolute(token) || path.win32.isAbsolute(token);
     const traverses = /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(token);
     return (absolute || traverses) && !isInside(path.resolve(cwd, token), cwd);

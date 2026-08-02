@@ -263,10 +263,25 @@ def write_patch(cwd: Path, output_dir: Path, base_commit: str) -> dict[str, obje
         return None
     patch_path = output_dir / "changes.patch"
     patch_path.write_bytes(completed.stdout)
+    files = [
+        path
+        for path in subprocess.run(
+            ["git", "diff", "--name-only", base_commit, "--", "."],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            check=False,
+        ).stdout.splitlines()
+        if not is_generated_path(path)
+    ]
     return {
         "path": str(patch_path),
         "sha256": hashlib.sha256(completed.stdout).hexdigest(),
         "bytes": len(completed.stdout),
+        "files": files,
     }
 
 

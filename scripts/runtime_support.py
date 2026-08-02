@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import stat
+import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -207,9 +208,24 @@ def remove_owned_tree(path: Path, owned_root: Path) -> bool:
 
 def atomic_json(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            fd = -1
+            handle.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        for attempt in range(10):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 9:
+                    raise
+                time.sleep(0.005 * (attempt + 1))
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
 
 
 def validate_route(provider: str, model: str) -> None:
@@ -219,21 +235,22 @@ def validate_route(provider: str, model: str) -> None:
 
 def record_job(root: Path, job_id: str, **values: object) -> dict[str, object]:
     path = root / "jobs" / f"{job_id}.json"
-    try:
-        current = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        current = {"jobId": job_id, "createdAtEpoch": time.time()}
-    same_turn = current.get("latestRunId") == values.get("latestRunId")
-    if (
-        same_turn
-        and current.get("state") in {"pending_review", "settled"}
-        and values.get("state") in {"starting", "running"}
-    ):
-        values.pop("state", None)
-    current.update(values)
-    current["updatedAtEpoch"] = time.time()
-    atomic_json(path, current)
-    return current
+    with runtime_lock(root):
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            current = {"jobId": job_id, "createdAtEpoch": time.time()}
+        same_turn = current.get("latestRunId") == values.get("latestRunId")
+        if same_turn and current.get("state") in {"pending_review", "settled"} and values.get("state") in {
+            "starting",
+            "running",
+            "orphaned",
+        }:
+            return current
+        current.update(values)
+        current["updatedAtEpoch"] = time.time()
+        atomic_json(path, current)
+        return current
 
 
 def remove_job(root: Path, job_id: str) -> None:

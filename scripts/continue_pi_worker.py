@@ -81,6 +81,8 @@ def main() -> int:
 
     with runtime_lock(root):
         owner = read_json(owner_path)
+        if owner.get("cleanupStatus") == "settled":
+            raise SystemExit("worker is already finalized")
         if int(owner.get("lastTurnIndex") or 1) + 1 != turn_index:
             raise SystemExit("another continuation was allocated concurrently")
         output_dir.mkdir(parents=True, exist_ok=False)

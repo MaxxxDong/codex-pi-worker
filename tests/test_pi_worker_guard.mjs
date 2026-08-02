@@ -90,6 +90,17 @@ test("keeps mutation and execution paths inside the execution worktree", () => {
   assert.equal(evaluateToolCall("bash", { command: `rg TODO "${p.home}"` }, p), null);
 });
 
+test("allows shell syntax that is not an outside path", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
+  const p = policy(root);
+  fs.mkdirSync(p.cwd, { recursive: true });
+  assert.equal(evaluateToolCall("bash", { command: "git status --short 2>/dev/null" }, p), null);
+  assert.equal(evaluateToolCall("bash", { command: "echo a | tr '/' '_' > result.txt" }, p), null);
+  assert.equal(evaluateToolCall("bash", { command: "curl https://example.com \\\n    -o page.html" }, p), null);
+  assert.match(evaluateToolCall("bash", { command: "mkdir /tmp/out" }, p), /outside/i);
+  assert.match(evaluateToolCall("bash", { command: "mkdir '/'" }, p), /outside/i);
+});
+
 test("allows only the pinned Playwright wrapper outside the worktree", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
   const p = { ...policy(root), agentDir: path.join(root, "home", ".pi", "agent") };

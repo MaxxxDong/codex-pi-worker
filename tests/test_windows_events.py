@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -57,6 +58,38 @@ class WindowsEventTests(unittest.TestCase):
             self.assertFalse(patch_runtime(runtime, backup))
             self.assertIn(NEW, runtime.read_text(encoding="utf-8"))
             self.assertEqual(backup.read_text(encoding="utf-8"), OLD)
+
+    def test_atomic_json_supports_concurrent_writers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                list(pool.map(lambda value: atomic_json(path, {"value": value}), range(100)))
+            self.assertIn(json.loads(path.read_text(encoding="utf-8"))["value"], range(100))
+            self.assertEqual(list(path.parent.glob(f".{path.name}.*.tmp")), [])
+
+    def test_terminal_job_is_not_downgraded_to_orphaned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = root / "result.json"
+            current = record_job(
+                root,
+                "job",
+                state="pending_review",
+                pid=0,
+                latestRunId="turn",
+                resultPath=str(result),
+            )
+            preserved = record_job(
+                root,
+                "job",
+                state="orphaned",
+                pid=0,
+                latestRunId="turn",
+                resultPath=str(root / "missing.json"),
+            )
+            self.assertEqual(preserved, current)
+            self.assertEqual(preserved["state"], "pending_review")
+            self.assertEqual(preserved["resultPath"], str(result))
 
     @unittest.skipUnless(os.name == "nt", "Windows extended-length path behavior")
     def test_remove_owned_tree_handles_extended_length_paths(self) -> None:
@@ -146,6 +179,7 @@ class WindowsEventTests(unittest.TestCase):
             self.assertIn("tracked.txt", patch_text)
             self.assertNotIn("playwright", patch_text)
             self.assertNotIn("pycache", patch_text)
+            self.assertEqual(patch["files"], ["tracked.txt"])
             self.assertEqual(git_changes(root), [" M tracked.txt"])
 
     def test_compact_message_caps_repeated_stream_text(self) -> None:

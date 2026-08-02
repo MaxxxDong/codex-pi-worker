@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -84,6 +85,63 @@ class SessionContinuationTests(unittest.TestCase):
             restored = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(restored["latestReceiptPath"], str(receipt.resolve()))
             self.assertEqual(restored["cleanupStatus"], "pending_review")
+
+    def test_continuation_rechecks_finalization_under_runtime_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            runtime = base / "runtime"
+            output = base / "output"
+            source = base / "source"
+            session = runtime / "sessions" / "session"
+            source.mkdir()
+            session.mkdir(parents=True)
+            output.mkdir()
+            prompt = base / "prompt.md"
+            prompt.write_text("continue", encoding="utf-8")
+            result = output / "pi-result.json"
+            receipt = output / "pi-receipt.json"
+            result.write_text("{}", encoding="utf-8")
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "runId": "owner",
+                        "pid": 0,
+                        "resultPath": str(result),
+                        "latestReceiptPath": str(receipt),
+                        "ownerReceiptPath": str(receipt),
+                        "cleanupStatus": "pending_review",
+                        "sessionDir": str(session),
+                        "sessionId": "session",
+                        "runtimeRoot": str(runtime),
+                        "executionCwd": str(source),
+                        "sourceCwd": str(source),
+                        "sourceRoot": str(source),
+                        "outputDir": str(output),
+                        "mode": "analysis",
+                        "provider": "opencode-go",
+                        "model": "deepseek-v4-flash",
+                        "thinking": "max",
+                        "lastTurnIndex": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            @contextmanager
+            def finalize_before_lock(_root: Path):
+                owner = json.loads(receipt.read_text(encoding="utf-8"))
+                owner["cleanupStatus"] = "settled"
+                receipt.write_text(json.dumps(owner), encoding="utf-8")
+                yield
+
+            argv = ["continue_pi_worker.py", str(receipt), "--prompt-file", str(prompt)]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(continue_pi_worker, "runtime_lock", finalize_before_lock),
+                self.assertRaisesRegex(SystemExit, "already finalized"),
+            ):
+                continue_pi_worker.main()
+            self.assertFalse((output / "turns" / "turn-002").exists())
 
     def test_finalize_accept_requires_integrated_flag_for_patch_only_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
