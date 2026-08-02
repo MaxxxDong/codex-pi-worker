@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pi Worker"
+  short_description: "Review-gated Pi worktrees with event-driven parallel execution"
+  default_prompt: "Use $pi-worker to run this bounded task, wait once, review the result, and finalize its receipt."
