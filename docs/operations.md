@@ -16,6 +16,21 @@ python scripts\start_pi_worker.py `
   --output-dir C:\absolute\evidence
 ```
 
+普通任务默认是 `implementation`，可省略 `--mode implementation`。只有明确只读任务才使用 `--mode analysis`；两种模式都有 `read/grep/find/ls` 和联网搜索。按任务增加能力：
+
+```powershell
+# Firecrawl MCP，可用于只读或实现任务
+python scripts\start_pi_worker.py ... --mode analysis --firecrawl
+
+# Playwright 仅用于浏览器 implementation 任务
+python scripts\start_pi_worker.py ... --playwright
+
+# 大日志/全仓聚合才启用
+python scripts\start_pi_worker.py ... --context-mode
+```
+
+这些开关会写入 receipt，并由同一任务的 continuation 自动继承。
+
 启动返回 `pi-receipt.json`，其中记录 run、PID、session、worktree、provider/model、result 和后续动作。每轮必须使用唯一 output directory。
 
 ### 3. 等待一次

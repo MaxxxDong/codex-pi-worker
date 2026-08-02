@@ -69,6 +69,41 @@ pi install npm:context-mode@1.0.169
 
 普通任务不要加 `--context-mode`，以减少启动和上下文开销。
 
+Firecrawl 与 Playwright 也采用按任务加载：
+
+```powershell
+pi install npm:pi-mcp-adapter@2.17.0
+pi install npm:pi-playwright@0.1.1
+```
+
+在 `~/.config/mcp/mcp.json` 中使用环境变量，不要写明文 Key：
+
+```json
+{
+  "mcpServers": {
+    "firecrawl": {
+      "command": "npx",
+      "args": ["-y", "firecrawl-mcp@3.23.0"],
+      "env": { "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}" },
+      "lifecycle": "lazy"
+    }
+  }
+}
+```
+
+`pi-playwright 0.1.1` 需要包内依赖、Chromium 和 Windows wrapper 修正：
+
+```powershell
+$package = "$env:USERPROFILE\.pi\agent\npm\node_modules\pi-playwright"
+Push-Location $package
+npm install --ignore-scripts
+npm run setup
+Pop-Location
+python C:\CodexWS\Software\codex-pi-worker\scripts\prepare_pi_playwright_windows.py
+```
+
+在 `pi config` 中把 `pi-mcp-adapter` extension 与 `pi-playwright` skill 设为默认 filtered；runtime 会在 `--firecrawl` 或 `--playwright` 时显式加载。Tavily、Firecrawl 等 Key 应持久写入 Windows 用户环境变量，新启动的 Codex/Pi 进程才会继承。
+
 ## 6. 验证安装
 
 ```powershell

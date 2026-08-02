@@ -16,6 +16,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import start_pi_worker  # noqa: E402
+from prepare_pi_playwright_windows import NEW, OLD, patch_runtime  # noqa: E402
 from run_pi_worker import (  # noqa: E402
     MAX_FINAL_TEXT_BYTES,
     MAX_TOOL_ERROR_BYTES,
@@ -44,6 +45,17 @@ from runtime_support import (  # noqa: E402
 
 
 class WindowsEventTests(unittest.TestCase):
+    def test_playwright_windows_patch_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime.js"
+            backup = root / "backup.js"
+            runtime.write_text(OLD, encoding="utf-8")
+            self.assertTrue(patch_runtime(runtime, backup))
+            self.assertFalse(patch_runtime(runtime, backup))
+            self.assertIn(NEW, runtime.read_text(encoding="utf-8"))
+            self.assertEqual(backup.read_text(encoding="utf-8"), OLD)
+
     @unittest.skipUnless(os.name == "nt", "Windows extended-length path behavior")
     def test_remove_owned_tree_handles_extended_length_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
