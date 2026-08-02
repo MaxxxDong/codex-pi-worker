@@ -12,14 +12,15 @@ verifying material changes.
 
 1. Write one bounded UTF-8 prompt with scope, deliverable, and focused checks.
    Do not include secrets.
-2. Choose `analysis` for read-only work or `implementation` for writes and shell
-   checks. Implementation requires a clean source and gets an isolated worktree.
+2. Normal work defaults to `implementation`; it can read, search, edit, and run
+   checks in an isolated worktree. Use `--mode analysis` only when the task is
+   explicitly read-only.
 3. Start detached with a unique output directory:
 
 ```powershell
 python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\start_pi_worker.py" `
   --cwd C:\absolute\repo --prompt-file C:\absolute\task.md `
-  --mode implementation --output-dir C:\absolute\evidence
+  --output-dir C:\absolute\evidence
 ```
 
 4. Wait once. Resume the same yielded shell process/cell; never replace it with
@@ -57,8 +58,8 @@ Use `--decision rejected` for discarded work. Finalize analysis runs too.
 - Default route is `opencode-go/deepseek-v4-flash` with `max`; override provider,
   model, or thinking only when the task requires it.
 - Add `--context-mode` only for large logs/files or repository-wide aggregation.
-- Web tools load normally. Add MCP only when built-ins and installed extensions
-  cannot do the task.
+- Both modes have `read/grep/find/ls` and web search. Add `--firecrawl` for a
+  Firecrawl task. Add `--playwright` only for browser work (implementation mode).
 - Treat `status=completed` as execution completion, not proof of correctness.
 - Never print or copy `~/.pi/agent/models.json`; it contains provider credentials.
 - Use grok-worker when strict schema gates or live mid-run steering is required.

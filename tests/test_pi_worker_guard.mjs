@@ -90,6 +90,32 @@ test("keeps mutation and execution paths inside the execution worktree", () => {
   assert.equal(evaluateToolCall("bash", { command: `rg TODO "${p.home}"` }, p), null);
 });
 
+test("allows only the pinned Playwright wrapper outside the worktree", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
+  const p = { ...policy(root), agentDir: path.join(root, "home", ".pi", "agent") };
+  fs.mkdirSync(p.cwd, { recursive: true });
+  const script = path.join(
+    p.agentDir,
+    "npm",
+    "node_modules",
+    "pi-playwright",
+    "skills",
+    "playwright-browser",
+    "scripts",
+    "pw.js",
+  );
+  assert.equal(evaluateToolCall("bash", { command: `node "${script}" open about:blank` }, p), null);
+  assert.match(
+    evaluateToolCall("bash", { command: `node "${script}" screenshot --filename "${p.home}\\bad.png"` }, p),
+    /home|outside/i,
+  );
+  assert.equal(
+    evaluateToolCall("bash", { command: `node "${script}" eval '() => document.title'` }, p),
+    null,
+  );
+  assert.match(evaluateToolCall("bash", { command: `node "${script}" close; rm -rf C:/` }, p), /recursive/i);
+});
+
 test("blocks symlink or junction escapes for direct write tools", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
   const p = policy(root);

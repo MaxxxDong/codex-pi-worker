@@ -50,6 +50,8 @@ python scripts\start_pi_worker.py `
 | `npm_config_cache` | 显式覆盖 Worker 共享 npm cache |
 | `PI_CODING_AGENT_DIR` | Pi agent 目录；用于定位可选 context-mode |
 | `PI_ALLOW_BROWSER_COOKIES` | 显式允许 Pi Web 访问浏览器 cookies |
+| `TAVILY_API_KEY` | Tavily 搜索；从用户环境按白名单传入 Worker |
+| `FIRECRAWL_API_KEY` | Firecrawl MCP；从用户环境按白名单传入 Worker |
 
 Worker 环境采用白名单继承。Java、Android、Rust、Go、Node、Python 等常见工具链变量会保留；无关秘密默认不传给子进程。联网搜索 Key 只有列入安全白名单时才会传递，因此应按最小权限配置。
 
@@ -57,7 +59,10 @@ Worker 环境采用白名单继承。Java、Android、Rust、Go、Node、Python 
 
 - `pi_worker_guard.mjs` 始终加载。
 - Pi 自身已配置的常规扩展、skills 和 web 工具保持可用。
+- 两种模式都显式启用 `grep/find/ls`。默认 `implementation` 另有 `bash/edit/write`；只有明确只读任务才传 `--mode analysis`。
 - `context-mode` 只有显式 `--context-mode` 才额外加载，避免简单任务为大日志能力付固定成本。
+- `pi-mcp-adapter` 与 Firecrawl 只有显式 `--firecrawl` 才加载；MCP 配置使用 `${FIRECRAWL_API_KEY}`，不保存明文 Key。
+- `pi-playwright` 只有显式 `--playwright` 才加载，并要求 implementation 模式。
 - session 默认启用，因为 continuation 依赖同一 Pi session；不是可随意删除的开销项。
 
 ## Responses 兼容说明

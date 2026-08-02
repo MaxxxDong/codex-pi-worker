@@ -142,6 +142,10 @@ def main() -> int:
         command.extend(("--worktree-path", str(worktree), "--allow-existing-changes"))
     if owner.get("contextMode"):
         command.append("--context-mode")
+    if owner.get("firecrawl"):
+        command.append("--firecrawl")
+    if owner.get("playwright"):
+        command.append("--playwright")
 
     stdout_file = (output_dir / "runtime.stdout.log").open("wb")
     stderr_file = (output_dir / "runtime.stderr.log").open("wb")
@@ -220,6 +224,8 @@ def main() -> int:
         "thinking": owner["thinking"],
         "timeoutSeconds": timeout_seconds,
         "contextMode": bool(owner.get("contextMode")),
+        "firecrawl": bool(owner.get("firecrawl")),
+        "playwright": bool(owner.get("playwright")),
         "cleanupStatus": "pending_worker",
         "cacheStatusAtStart": cache_status,
         "runtimeRoot": str(root),

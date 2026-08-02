@@ -54,7 +54,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cwd", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, required=True)
-    parser.add_argument("--mode", choices=("analysis", "implementation"), required=True)
+    parser.add_argument("--mode", choices=("analysis", "implementation"), default="implementation")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument(
@@ -73,6 +73,8 @@ def main() -> int:
         default=DEFAULT_THINKING,
     )
     parser.add_argument("--context-mode", action="store_true")
+    parser.add_argument("--firecrawl", action="store_true")
+    parser.add_argument("--playwright", action="store_true")
     args = parser.parse_args()
 
     output_dir = args.output_dir.resolve()
@@ -213,6 +215,10 @@ def main() -> int:
         command.extend(("--worktree-path", str(worktree_path)))
     if args.context_mode:
         command.append("--context-mode")
+    if args.firecrawl:
+        command.append("--firecrawl")
+    if args.playwright:
+        command.append("--playwright")
 
     stdout_file = (output_dir / "runtime.stdout.log").open("wb")
     stderr_file = (output_dir / "runtime.stderr.log").open("wb")
@@ -268,6 +274,8 @@ def main() -> int:
         "cacheLimitBytes": 20 * 1024**3,
         "cacheStatusAtStart": cache_status,
         "contextMode": args.context_mode,
+        "firecrawl": args.firecrawl,
+        "playwright": args.playwright,
         "runtimeRoot": str(root),
         "runtimeReconciliation": reconciliation,
         "nextAction": "watch",

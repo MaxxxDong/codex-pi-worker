@@ -41,12 +41,17 @@ MAX_RAW_EVENT_BYTES = 8 * 1024**2
 MAX_EVENT_LOG_BYTES = 16 * 1024**2
 MAX_STDERR_LOG_BYTES = 8 * 1024**2
 MAX_FINAL_TEXT_BYTES = 1024**2
+MAX_TOOL_ERROR_BYTES = 2048
+
+BASE_TOOLS = "read,bash,edit,write,grep,find,ls,web_search,fetch_content,get_search_content"
+ANALYSIS_TOOLS = "read,grep,find,ls,web_search,fetch_content,get_search_content"
 
 CREDENTIAL_PATTERNS = (
     re.compile(rb"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"),
     re.compile(rb"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(rb"(?i)(?<![A-Za-z0-9])(?:sk|nb)[-_][A-Za-z0-9_-]{8,}"),
 )
+GENERATED_PATH_PARTS = {"__pycache__", ".pytest_cache", ".playwright-cli"}
 
 
 def redact_credentials(raw: bytes) -> bytes:
@@ -61,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-cwd", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, default=None)
     parser.add_argument("--prompt-file", type=Path, required=True)
-    parser.add_argument("--mode", choices=("analysis", "implementation"), required=True)
+    parser.add_argument("--mode", choices=("analysis", "implementation"), default="implementation")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument(
@@ -80,6 +85,8 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_THINKING,
     )
     parser.add_argument("--context-mode", action="store_true")
+    parser.add_argument("--firecrawl", action="store_true")
+    parser.add_argument("--playwright", action="store_true")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--worktree-path", type=Path, default=None)
@@ -141,7 +148,14 @@ def git_changes(cwd: Path) -> list[str]:
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         check=False,
     )
-    return completed.stdout.splitlines() if completed.returncode == 0 else []
+    if completed.returncode != 0:
+        return []
+    return [line for line in completed.stdout.splitlines() if not is_generated_path(line[3:])]
+
+
+def is_generated_path(value: str) -> bool:
+    normalized = value.replace("\\", "/")
+    return normalized.endswith(".pyc") or bool(GENERATED_PATH_PARTS.intersection(normalized.split("/")))
 
 
 def compact_event(raw: bytes) -> bytes | None:
@@ -164,6 +178,11 @@ def compact_event(raw: bytes) -> bytes | None:
             "toolName": event.get("toolName"),
             "isError": bool(event.get("isError")),
         }
+        if compact["isError"]:
+            encoded = redact_credentials(
+                json.dumps(event.get("result"), ensure_ascii=False, default=str).encode("utf-8")
+            )
+            compact["errorSummary"] = encoded[:MAX_TOOL_ERROR_BYTES].decode("utf-8", errors="ignore")
     elif event_type == "message_end":
         message = event.get("message") or {}
         if message.get("role") != "assistant":
@@ -203,7 +222,11 @@ def write_patch(cwd: Path, output_dir: Path, base_commit: str) -> dict[str, obje
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         check=False,
     ).stdout.split(b"\0")
-    untracked_paths = [path.decode("utf-8", errors="surrogateescape") for path in untracked if path]
+    untracked_paths = [
+        decoded
+        for path in untracked
+        if path and not is_generated_path(decoded := path.decode("utf-8", errors="surrogateescape"))
+    ]
     for start in range(0, len(untracked_paths), 100):
         subprocess.run(
             ["git", "add", "-N", "--", *untracked_paths[start : start + 100]],
@@ -214,7 +237,19 @@ def write_patch(cwd: Path, output_dir: Path, base_commit: str) -> dict[str, obje
             check=False,
         )
     completed = subprocess.run(
-        ["git", "diff", "--binary", "--no-ext-diff", base_commit, "--"],
+        [
+            "git",
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            base_commit,
+            "--",
+            ".",
+            ":(exclude)**/__pycache__/**",
+            ":(exclude)**/.pytest_cache/**",
+            ":(exclude)**/.playwright-cli/**",
+            ":(exclude)**/*.pyc",
+        ],
         cwd=cwd,
         capture_output=True,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
@@ -269,7 +304,10 @@ def parse_events(path: Path) -> dict[str, object]:
         if event_type == "agent_end":
             agent_ended = True
         elif event_type == "tool_execution_end":
-            tools.append({"name": event.get("toolName"), "error": bool(event.get("isError"))})
+            tool = {"name": event.get("toolName"), "error": bool(event.get("isError"))}
+            if event.get("errorSummary"):
+                tool["errorSummary"] = event["errorSummary"]
+            tools.append(tool)
         elif event_type == "message_end":
             message = event.get("message", {})
             if message.get("role") != "assistant":
@@ -354,6 +392,9 @@ def main(args: argparse.Namespace | None = None) -> int:
         )
         set_attention_event(attention_handle)
 
+    enabled_tools = ANALYSIS_TOOLS if args.mode == "analysis" else BASE_TOOLS
+    if args.firecrawl:
+        enabled_tools += ",mcp"
     command = [
         pi,
         "--mode",
@@ -372,6 +413,8 @@ def main(args: argparse.Namespace | None = None) -> int:
         args.thinking,
         "--extension",
         str(Path(__file__).with_name("pi_worker_guard.mjs")),
+        "--tools",
+        enabled_tools,
     ]
     if args.context_mode:
         agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
@@ -381,8 +424,19 @@ def main(args: argparse.Namespace | None = None) -> int:
         if not context_extension.is_file() or not context_skills.is_dir():
             raise SystemExit(f"context-mode package is incomplete under {context_root}")
         command.extend(("--extension", str(context_extension), "--skill", str(context_skills)))
-    if args.mode == "analysis":
-        command.extend(("--exclude-tools", "bash,edit,write,ast_grep_replace"))
+    agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
+    if args.firecrawl:
+        adapter = agent_dir / "npm" / "node_modules" / "pi-mcp-adapter" / "index.ts"
+        if not adapter.is_file():
+            raise SystemExit(f"pi-mcp-adapter is not installed under {agent_dir}")
+        command.extend(("--extension", str(adapter)))
+    if args.playwright:
+        if args.mode != "implementation":
+            raise SystemExit("Playwright requires implementation mode")
+        playwright_skills = agent_dir / "npm" / "node_modules" / "pi-playwright" / "skills"
+        if not playwright_skills.is_dir():
+            raise SystemExit(f"pi-playwright is not installed under {agent_dir}")
+        command.extend(("--skill", str(playwright_skills)))
     flags = 0
     kwargs: dict[str, object] = {}
     if os.name == "nt":
@@ -530,7 +584,9 @@ def main(args: argparse.Namespace | None = None) -> int:
         "provider": parsed["provider"],
         "model": parsed["model"],
         "thinking": args.thinking,
-        "contextMode": args.context_mode,
+        "contextMode": bool(getattr(args, "context_mode", False)),
+        "firecrawl": bool(getattr(args, "firecrawl", False)),
+        "playwright": bool(getattr(args, "playwright", False)),
         "exitCode": exit_code,
         "timedOut": timed_out,
         "timeoutMode": "idle",
@@ -617,6 +673,9 @@ def write_runner_failure(args: argparse.Namespace, error: BaseException) -> int:
         "provider": args.provider,
         "model": args.model,
         "thinking": args.thinking,
+        "contextMode": bool(getattr(args, "context_mode", False)),
+        "firecrawl": bool(getattr(args, "firecrawl", False)),
+        "playwright": bool(getattr(args, "playwright", False)),
         "exitCode": None,
         "timedOut": False,
         "stopReason": "runner_error",
@@ -683,6 +742,9 @@ def failure_args_from_argv(argv: list[str]) -> argparse.Namespace | None:
         provider=value("--provider", DEFAULT_PROVIDER),
         model=value("--model", DEFAULT_MODEL),
         thinking=value("--thinking", DEFAULT_THINKING),
+        context_mode="--context-mode" in argv,
+        firecrawl="--firecrawl" in argv,
+        playwright="--playwright" in argv,
         session_id=value("--session-id", "unknown"),
         session_dir=Path(value("--session-dir", str(Path(runtime) / "sessions" / "unknown"))),
         turn_index=int(value("--turn-index", "1") or 1),

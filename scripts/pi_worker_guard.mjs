@@ -61,6 +61,27 @@ function outsideExecutionCwd(command, cwd) {
   });
 }
 
+function isTrustedToolExecution(command, cwd, home, policy) {
+  let quote = "";
+  for (const char of command) {
+    if ((char === "'" || char === '"') && (!quote || quote === char)) {
+      quote = quote ? "" : char;
+    } else if (!quote && ";&|<>".includes(char)) {
+      return false;
+    }
+  }
+  const tokens = command.match(/"(?:\\.|[^"])*"|'[^']*'|[^\s]+/g) || [];
+  const clean = tokens.map((token) => token.replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/, "$1$2"));
+  if (!/(?:^|[\\/])node(?:\.exe)?$/i.test(clean[0] || "")) return false;
+  const agentDir = policy.agentDir || process.env.PI_CODING_AGENT_DIR || path.join(home, ".pi", "agent");
+  const trusted = path.join(agentDir, "npm", "node_modules", "pi-playwright", "skills", "playwright-browser", "scripts");
+  if (!clean[1] || !isInside(clean[1], trusted)) return false;
+  return clean.slice(2).every((token) => {
+    const absolute = path.isAbsolute(token) || path.win32.isAbsolute(token);
+    return !absolute || isInside(token, cwd);
+  });
+}
+
 function literalDeleteTarget(command) {
   const patterns = [
     /^rm\s+-[a-z]*r[a-z]*\s+(?:--\s+)?(.+)$/i,
@@ -106,6 +127,7 @@ export function evaluateToolCall(toolName, input = {}, policy = {}) {
   if (DISK_DESTRUCTION.some((pattern) => pattern.test(command))) {
     return "Blocked destructive disk/system command";
   }
+  if (isTrustedToolExecution(command, cwd, home, policy)) return null;
   const protectedReference = referenced(command, sourceCwd)
     || referenced(command, home)
     || /(?:\$HOME|%USERPROFILE%|\$env:USERPROFILE)/i.test(command);

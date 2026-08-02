@@ -18,11 +18,14 @@ sys.path.insert(0, str(SCRIPTS))
 import start_pi_worker  # noqa: E402
 from run_pi_worker import (  # noqa: E402
     MAX_FINAL_TEXT_BYTES,
+    MAX_TOOL_ERROR_BYTES,
     classify_attention,
     compact_event,
+    git_changes,
     parse_events,
     redact_credentials,
     write_runner_failure,
+    write_patch,
 )
 from runtime_support import (  # noqa: E402
     atomic_json,
@@ -64,6 +67,52 @@ class WindowsEventTests(unittest.TestCase):
         self.assertEqual(event["toolName"], "read")
         self.assertIn("at", event)
 
+    def test_compact_tool_error_keeps_bounded_redacted_summary(self) -> None:
+        raw = json.dumps(
+            {
+                "type": "tool_execution_end",
+                "toolName": "read",
+                "isError": True,
+                "result": {"content": [{"type": "text", "text": "sk-1234567890 " + "x" * 4096}]},
+            }
+        ).encode()
+        event = json.loads(compact_event(raw))
+        self.assertNotIn("sk-1234567890", event["errorSummary"])
+        self.assertIn("[REDACTED]", event["errorSummary"])
+        self.assertLessEqual(len(event["errorSummary"].encode()), MAX_TOOL_ERROR_BYTES)
+
+    def test_generated_tool_artifacts_are_excluded_from_patch_and_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            root = temporary_root / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, check=True)
+            (root / "tracked.txt").write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, capture_output=True, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "base"],
+                cwd=root,
+                capture_output=True,
+                check=True,
+            )
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True
+            ).stdout.strip()
+            (root / "tracked.txt").write_text("after\n", encoding="utf-8")
+            (root / ".playwright-cli").mkdir()
+            (root / ".playwright-cli" / "page.yml").write_text("generated", encoding="utf-8")
+            (root / "__pycache__").mkdir()
+            (root / "__pycache__" / "x.pyc").write_bytes(b"generated")
+            output = temporary_root / "evidence"
+            output.mkdir()
+            patch = write_patch(root, output, base)
+            self.assertIsNotNone(patch)
+            patch_text = (output / "changes.patch").read_text(encoding="utf-8")
+            self.assertIn("tracked.txt", patch_text)
+            self.assertNotIn("playwright", patch_text)
+            self.assertNotIn("pycache", patch_text)
+            self.assertEqual(git_changes(root), [" M tracked.txt"])
+
     def test_compact_message_caps_repeated_stream_text(self) -> None:
         text = "x" * (MAX_FINAL_TEXT_BYTES + 1024)
         raw = json.dumps(
@@ -102,12 +151,20 @@ class WindowsEventTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as temporary,
             patch.dict(
                 os.environ,
-                {"JAVA_HOME": r"C:\Java", "EXA_API_KEY": "web-key", "UNRELATED_SECRET": "do-not-pass"},
+                {
+                    "JAVA_HOME": r"C:\Java",
+                    "EXA_API_KEY": "web-key",
+                    "FIRECRAWL_API_KEY": "crawl-key",
+                    "TAVILY_API_KEY": "search-key",
+                    "UNRELATED_SECRET": "do-not-pass",
+                },
             ),
         ):
             env, _ = worker_environment(Path(temporary), "safe-env")
         self.assertEqual(env["JAVA_HOME"], r"C:\Java")
         self.assertEqual(env["EXA_API_KEY"], "web-key")
+        self.assertEqual(env["FIRECRAWL_API_KEY"], "crawl-key")
+        self.assertEqual(env["TAVILY_API_KEY"], "search-key")
         self.assertNotIn("UNRELATED_SECRET", env)
 
     def test_cache_defaults_are_runtime_owned_and_metadata_cannot_redirect_gc(self) -> None:
