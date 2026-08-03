@@ -15,11 +15,10 @@ from runtime_support import (
     pid_alive,
     runtime_root,
     set_attention_event,
-    steer_event_name,
     steer_ack_event_name,
+    steer_event_name,
     wait_windows_event,
 )
-
 
 MAX_STEER_BYTES = 64 * 1024
 
