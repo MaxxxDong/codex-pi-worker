@@ -33,4 +33,13 @@ node --test "$HOME/.codex/skills/pi-worker/tests/events.test.mjs"
 $HOME/.codex/skills/pi-worker/bin/pi-worker cleanup --reviewed yes --run-id RUN_ID
 ```
 
+普通用户 Skill 默认加载。Context7、Lens、Context Mode 和 Playwright 必须按任务显式启用：
+
+```bash
+$HOME/.codex/skills/pi-worker/bin/pi-worker dispatch ... --capability docs -- ...
+$HOME/.codex/skills/pi-worker/bin/pi-worker dispatch ... --capability lens -- ...
+$HOME/.codex/skills/pi-worker/bin/pi-worker dispatch ... --capability context -- ...
+$HOME/.codex/skills/pi-worker/bin/pi-worker dispatch ... --capability browser -- ...
+```
+
 完整命令和模型默认值以 [`macos/SKILL.md`](../macos/SKILL.md) 为准。

@@ -62,14 +62,17 @@ ${successEvents}`);
   const env = testEnv(temporary, fake);
   env.PI_WORKER_TEST_PROFILE_MARKER = marker;
   writeFileSync(join(env.PI_WORKER_AGENT_SOURCE, "auth.json"), '{"provider":"configured"}\n');
-  writeFileSync(join(env.PI_WORKER_AGENT_SOURCE, "settings.json"), '{"skills":["coding"]}\n');
+  writeFileSync(join(env.PI_WORKER_AGENT_SOURCE, "settings.json"), JSON.stringify({
+    skills: ["coding"],
+    packages: ["npm:pi-lens", "npm:pi-playwright", "npm:context-mode", "npm:@upstash/context7-pi", "npm:keep-me"],
+  }));
   try {
     command(["dispatch", "--run-id", "profile", "--workdir", temporary, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash"], env);
     command(["wait", "--run-id", "profile", "--timeout", "10"], env);
     const profile = JSON.parse(readFileSync(marker, "utf8"));
     assert.equal(profile.agent, join(env.PI_WORKER_STATE_ROOT, "profile", "agent"));
     assert.deepEqual(profile.auth, { provider: "configured" });
-    assert.deepEqual(profile.settings, { skills: ["coding"] });
+    assert.deepEqual(profile.settings, { skills: ["coding"], packages: ["npm:keep-me"] });
     assert.equal(profile.npm, join(env.PI_WORKER_AGENT_SOURCE, "npm"));
     assert.ok(!existsSync(profile.agent));
     command(["cleanup", "--reviewed", "yes", "--run-id", "profile"], env);
@@ -372,8 +375,11 @@ test("runtime expands named capabilities and owns their tool allowlists", () => 
   const temporary = mkdtempSync(join(tmpdir(), "pi-worker-capability-"));
   const agent = join(temporary, "agent");
   const extension = join(agent, "npm", "node_modules", "@upstash", "context7-pi", "extensions", "context7.ts");
+  const skill = join(agent, "npm", "node_modules", "@upstash", "context7-pi", "skills", "context7-docs", "SKILL.md");
   mkdirSync(resolve(extension, ".."), { recursive: true });
+  mkdirSync(resolve(skill, ".."), { recursive: true });
   writeFileSync(extension, "export default function noop() {}\n");
+  writeFileSync(skill, "---\nname: context7-docs\ndescription: docs\n---\n");
   const fake = fakeLauncher(temporary, `
 console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"test",model:"fake",stopReason:"stop",content:[{type:"text",text:JSON.stringify(process.argv.slice(2))}]}}));
 console.log(JSON.stringify({type:"agent_settled"}));`);
@@ -388,7 +394,41 @@ console.log(JSON.stringify({type:"agent_settled"}));`);
     const sessionDir = args.indexOf("--session-dir");
     assert.equal(args[sessionDir + 1], result.sessionDir);
     assert.ok(args.includes(extension));
+    assert.ok(args.includes(skill));
     assert.deepEqual(result.capabilities, ["docs"]);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("optional package skills load only with their matching capability", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-optional-skills-"));
+  const agent = join(temporary, "agent");
+  const npm = join(agent, "npm", "node_modules");
+  const resources = {
+    lens: [join(npm, "pi-lens", "dist", "index.js"), join(npm, "pi-lens", "skills")],
+    context: [join(npm, "context-mode", "build", "adapters", "pi", "extension.js"), join(npm, "context-mode", "skills")],
+    browser: [join(npm, "pi-playwright", "skills", "playwright-browser", "SKILL.md")],
+  };
+  for (const paths of Object.values(resources)) for (const path of paths) {
+    if (path.endsWith("skills")) mkdirSync(path, { recursive: true });
+    else {
+      mkdirSync(resolve(path, ".."), { recursive: true });
+      writeFileSync(path, path.endsWith(".md") ? "---\nname: test\ndescription: test\n---\n" : "export default function noop() {}\n");
+    }
+  }
+  const fake = fakeLauncher(temporary, `
+console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"test",model:"fake",stopReason:"stop",content:[{type:"text",text:JSON.stringify(process.argv.slice(2))}]}}));
+console.log(JSON.stringify({type:"agent_settled"}));`);
+  const env = { ...testEnv(temporary, fake), PI_CODING_AGENT_DIR: agent };
+  try {
+    for (const [capability, paths] of Object.entries(resources)) {
+      command(["dispatch", "--run-id", capability, "--workdir", temporary, "--capability", capability, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash", "task"], env);
+      const result = command(["wait", "--run-id", capability, "--timeout", "10"], env).json.results[0];
+      const args = JSON.parse(result.finalText);
+      assert.ok(paths.every((path) => args.includes(path)));
+      assert.deepEqual(result.capabilities, [capability]);
+    }
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }

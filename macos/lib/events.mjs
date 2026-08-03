@@ -26,7 +26,6 @@ import { fileURLToPath } from "node:url";
 const SCRIPT = fileURLToPath(import.meta.url);
 const DEFAULT_ROOT = join(tmpdir(), `pi-worker-${process.getuid?.() ?? "user"}`);
 const FALLBACK_MS = 300_000;
-const RUN_TTL_MS = 24 * 60 * 60 * 1000;
 const CACHE_MAX_BYTES = 20 * 1024 * 1024 * 1024;
 const CACHE_STALE_MS = 90 * 24 * 60 * 60 * 1000;
 const FAILURE_TAIL_BYTES = 64 * 1024;
@@ -36,6 +35,7 @@ const BASE_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_
 const READ_TOOLS = ["read", "bash", "grep", "find", "ls", "web_search"];
 const READ_ONLY_PROMPT = "This is a read-only task. Do not modify repository files. Use bash only for inspection or commands known not to write project files.";
 const AGENT_PROFILE_FILES = ["auth.json", "models.json", "models-store.json", "settings.json"];
+const OPTIONAL_PACKAGES = ["@upstash/context7-pi", "context-mode", "pi-lens", "pi-playwright"];
 const PROFILES = new Map([
   ["opencode-go/deepseek-v4-flash", { defaultThinking: "max", allowed: ["high", "max"] }],
   ["krill/grok-4.5", { defaultThinking: "high", allowed: ["high"] }],
@@ -81,7 +81,7 @@ function parseArgs(argv) {
 function usage() {
   return `pi-worker commands:
   dispatch --run-id ID [--mode read|write|in-place] [--source DIR|--workdir DIR]
-           [--capability docs|lens|context] [--live] [--idle-timeout SECONDS]
+           [--capability docs|lens|context|browser] [--live] [--idle-timeout SECONDS]
            [--hard-timeout SECONDS] -- --provider NAME --model ID [--thinking LEVEL] PROMPT
   continue --run-id ID [--live] [--idle-timeout SECONDS] -- PROMPT
   steer --run-id ID [--timeout SECONDS] -- MESSAGE
@@ -201,19 +201,29 @@ function capabilityProfile(name) {
   const npm = join(agent, "npm", "node_modules");
   const profiles = {
     docs: {
-      flag: "--extension",
-      path: join(npm, "@upstash", "context7-pi", "extensions", "context7.ts"),
+      resources: [
+        ["--extension", join(npm, "@upstash", "context7-pi", "extensions", "context7.ts")],
+        ["--skill", join(npm, "@upstash", "context7-pi", "skills", "context7-docs", "SKILL.md")],
+      ],
       tools: ["resolve-library-id", "query-docs"],
     },
     lens: {
-      flag: "--extension",
-      path: join(npm, "pi-lens", "dist", "index.js"),
+      resources: [
+        ["--extension", join(npm, "pi-lens", "dist", "index.js")],
+        ["--skill", join(npm, "pi-lens", "skills")],
+      ],
       tools: ["lens_diagnostics", "lsp_diagnostics", "read_enclosing", "read_symbol", "symbol_search"],
     },
     context: {
-      flag: "--extension",
-      path: join(npm, "context-mode", "build", "adapters", "pi", "extension.js"),
+      resources: [
+        ["--extension", join(npm, "context-mode", "build", "adapters", "pi", "extension.js")],
+        ["--skill", join(npm, "context-mode", "skills")],
+      ],
       tools: ["ctx_execute", "ctx_execute_file", "ctx_batch_execute", "ctx_search"],
+    },
+    browser: {
+      resources: [["--skill", join(npm, "pi-playwright", "skills", "playwright-browser", "SKILL.md")]],
+      tools: [],
     },
   };
   return profiles[name] ?? null;
@@ -224,9 +234,11 @@ function applyCapabilities(piArgs, names, baseTools = BASE_TOOLS) {
   const tools = new Set(baseTools);
   for (const name of names) {
     const profile = capabilityProfile(name);
-    if (!profile) fail(`unsupported capability: ${name}; use docs, lens, or context`);
-    if (!existsSync(profile.path)) fail(`capability ${name} is not installed: ${profile.path}`);
-    args.unshift(profile.flag, profile.path);
+    if (!profile) fail(`unsupported capability: ${name}; use docs, lens, context, or browser`);
+    for (const [, path] of profile.resources) {
+      if (!existsSync(path)) fail(`capability ${name} is not installed: ${path}`);
+    }
+    args.unshift(...profile.resources.flat());
     profile.tools.forEach((tool) => tools.add(tool));
   }
   return ["--tools", [...tools].join(","), ...args];
@@ -555,29 +567,6 @@ function cacheGc(root) {
   }
 }
 
-function cleanOldRuns(root) {
-  if (!existsSync(root)) return;
-  const now = Date.now();
-  for (const name of readdirSync(root)) {
-    if (name.startsWith(".")) continue;
-    const directory = join(root, name);
-    let info;
-    try { info = lstatSync(directory); } catch { continue; }
-    if (!info.isDirectory() || info.isSymbolicLink()) continue;
-    const result = readJson(join(directory, "result.json"));
-    if (!result) {
-      const legacyMeta = readJson(join(directory, "meta.json"));
-      const legacyEvent = readJson(join(directory, "event.json"));
-      if (legacyMeta?.runId === name && legacyEvent && now - statSync(directory).mtimeMs > RUN_TTL_MS) {
-        rmSync(directory, { recursive: true, force: true });
-      }
-      continue;
-    }
-    // Result-bearing runs require explicit reviewed cleanup, regardless of age.
-    continue;
-  }
-}
-
 function stopProcessTree(child, signal) {
   try {
     if (process.platform === "win32") child.kill(signal);
@@ -607,7 +596,21 @@ function prepareAgentProfile(directory) {
   mkdirSync(target, { recursive: true, mode: 0o700 });
   for (const name of AGENT_PROFILE_FILES) {
     const from = join(source, name);
-    if (existsSync(from)) copyFileSync(from, join(target, name));
+    if (!existsSync(from)) continue;
+    if (name !== "settings.json") {
+      copyFileSync(from, join(target, name));
+      continue;
+    }
+    const settings = readJson(from);
+    if (!settings) throw new Error(`invalid Pi settings: ${from}`);
+    if (Array.isArray(settings.packages)) {
+      settings.packages = settings.packages.filter((entry) => {
+        const value = typeof entry === "string" ? entry : entry?.source ?? entry?.package ?? entry?.name ?? "";
+        const normalized = String(value).replace(/^npm:/, "");
+        return !OPTIONAL_PACKAGES.some((packageName) => normalized === packageName || normalized.startsWith(`${packageName}@`));
+      });
+    }
+    writeFileSync(join(target, name), `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
   }
   const npm = join(source, "npm");
   if (existsSync(npm)) symlinkSync(npm, join(target, "npm"), process.platform === "win32" ? "junction" : "dir");
@@ -838,7 +841,6 @@ function dispatch(options, piArgs) {
   const idleTimeoutSeconds = Number(one(options, "idle-timeout", "600"));
   if (!Number.isFinite(idleTimeoutSeconds) || idleTimeoutSeconds < 0) fail("--idle-timeout must be zero or positive");
   mkdirSync(root, { recursive: true, mode: 0o700 });
-  cleanOldRuns(root);
   const directory = runDirectory(root, runId);
   if (existsSync(directory)) fail(`run already exists: ${runId}`);
   mkdirSync(directory, { mode: 0o700 });
@@ -1152,6 +1154,6 @@ else if (command === "status") status(options);
 else if (command === "cache-status") console.log(JSON.stringify(cacheReport()));
 else if (command === "profiles") console.log(JSON.stringify({
   models: [...PROFILES].map(([id, profile]) => ({ id, ...profile })),
-  capabilities: ["docs", "lens", "context"],
+  capabilities: ["docs", "lens", "context", "browser"],
 }));
 else fail(usage());

@@ -85,6 +85,8 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker profiles
 
 ### 2026-08-04
 
+- macOS 默认保留普通用户 Skill，但将 Context7、Lens、Context Mode、Playwright 的 Skill 与 extension/MCP 一起改为 capability 按需加载；相同任务实测减少约 15% 输入 Token。
+- 删除 macOS 旧 `meta.json/event.json` 兼容扫描，新版只维护当前 result 生命周期。
 - 加入经过真实调用验证的 macOS JSON headless runtime，read 模式不再暴露 `edit/write`。
 - 整次运行聚合模型调用、cache read 与 reasoning usage；attention/failure 返回 `pending` 以便立即续接事件等待。
 - 共享缓存采用 90 天优先的 LRU 和 20 GiB 上限，不使用整库 purge；候选只在 Codex 明确审核后清理。

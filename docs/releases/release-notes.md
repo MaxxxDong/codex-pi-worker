@@ -1,5 +1,13 @@
 # 发布记录
 
+## v0.1.1 - 2026-08-04
+
+- macOS 临时 profile 保留全部普通用户 Skill，只过滤 Context7、Lens、Context Mode、Playwright 四个可选包的自动资源发现。
+- `--capability docs|lens|context|browser` 显式成对加载各自 extension/MCP 与 Skill；Playwright 使用 Skill + 受控 `bash`。
+- 相同 ShuaiAPI Sol Medium 请求 A/B 中，默认 input 从 9,374 降至 7,971，减少 1,403 Token（15.0%）；完成时间 3.8 秒与 3.9 秒，无可辨识延迟回归。
+- 删除旧 `meta.json/event.json` 兼容清理和 dispatch 前的旧状态目录扫描。
+- 默认真实探针确认 19 个普通 Skill 仍可见，四个可选包默认不可见；docs capability 实测恢复 `context7-docs`。
+
 ## v0.1.0 - 2026-08-04
 
 - 首个统一版本，保留 Windows Python runtime，并新增独立的 `macos/` Node.js runtime。

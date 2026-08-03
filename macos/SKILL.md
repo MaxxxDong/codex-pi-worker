@@ -5,7 +5,7 @@ description: Delegate implementation, repair, review, test, repository search, o
 
 # Pi Worker
 
-Use `$HOME/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `pi-worker profiles` for supported models, enforced thinking defaults, and optional capabilities; run `pi-worker help` for syntax.
+Use `/Users/max/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `pi-worker profiles` for supported models, enforced thinking defaults, and optional capabilities; run `pi-worker help` for syntax.
 
 ## Efficient execution
 
@@ -19,7 +19,7 @@ Use `$HOME/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `pi-wor
 - Each run gets a managed Pi session inside its run directory. `continue --run-id` reuses that session and the same worktree; review-gated cleanup deletes both. Private temporary files are still deleted before completion.
 - While Pi is running, it uses a small writable profile copied from the current host configuration and keeps installed packages shared. This avoids global settings-lock failures inside Codex sandboxes; the supervisor deletes the temporary profile at terminal.
 - All Workers reuse the same host npm, pnpm, uv, pip, and Poetry caches. Review cleanup performs GC only when no peer Worker is active: files unused for 90 days are removed first, then the oldest rebuildable files until the combined cache is at most 20 GiB. It never uses whole-cache purge commands.
-- Headless Workers load configured Pi Skills plus the coding runtime. Extensions remain explicit: add `--capability docs`, `lens`, or `context` before `--` only when needed; runtime owns their paths and tool allowlists.
+- Headless Workers load configured Pi Skills plus the coding runtime. Context7, Lens, Context Mode, and Playwright are removed from automatic package discovery and load their matching extension/MCP plus Skill only through `--capability docs`, `lens`, `context`, or `browser`; runtime owns their paths and tool allowlists.
 - Success requires process exit `0` and Pi's `agent_settled` event. The default hard timeout is 24 hours and the default no-event idle timeout is 10 minutes; pass `--hard-timeout 0` or `--idle-timeout 0` to disable either limit.
 - Normal dispatch and continuation use JSON headless mode. Add `--live` only when an active turn must accept `steer`; long ordinary tasks avoid RPC serialization overhead. Provider, transport, ignored-reasoning, repeated tool, extension, compaction, prompt, or RPC shutdown errors wake `wait` immediately with state `attention`.
 - `result.json.usage` aggregates every assistant model call in the run, including nested cost fields, cache reads, and reported reasoning tokens. `reportedReasoningTokens` is provider-reported evidence, while `thinking` remains the requested level.
@@ -27,7 +27,7 @@ Use `$HOME/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `pi-wor
 ## Commands
 
 ```bash
-PI_WORKER=$HOME/.codex/skills/pi-worker/bin/pi-worker
+PI_WORKER=/Users/max/.codex/skills/pi-worker/bin/pi-worker
 
 # Read/review directly; runtime supplies and validates thinking.
 $PI_WORKER dispatch --run-id review-1 --mode read --workdir /absolute/repo -- \
@@ -38,7 +38,7 @@ $PI_WORKER dispatch --run-id fix-1 --mode write --source /absolute/repo -- \
   --provider shuaiapi --model gpt-5.6-luna --thinking xhigh \
   "Implement the bounded fix and run focused tests."
 
-# Add extension capabilities before `--`; configured Pi Skills load automatically.
+# Add optional extension/MCP + Skill capabilities before `--`; other configured Pi Skills load automatically.
 $PI_WORKER dispatch --run-id docs-review --mode read --workdir /absolute/repo \
   --capability docs -- --provider krill-sol --model gpt-5.6-sol \
   "Verify against current library documentation."
