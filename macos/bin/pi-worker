@@ -1,0 +1,35 @@
+#!/bin/zsh
+set -euo pipefail
+
+case "${1:-}" in
+  dispatch|continue|steer|wait|cleanup|status|cache-status|profiles|help|--help|-h)
+    skill_root="${0:A:h:h}"
+    exec "$HOME/.local/node-lts/bin/node" \
+      "$skill_root/lib/events.mjs" "$@"
+    ;;
+esac
+
+unset ANTHROPIC_API_KEY OPENAI_API_KEY GOOGLE_API_KEY GEMINI_API_KEY GROQ_API_KEY
+unset DEEPSEEK_API_KEY DASHSCOPE_API_KEY OPENCODE_API_KEY OPENCODE_GO_API_KEY
+
+export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+
+output_args=(--print --mode json)
+previous=""
+for arg in "$@"; do
+  if [[ "$arg" == "--mode=rpc" || ( "$previous" == "--mode" && "$arg" == "rpc" ) ]]; then
+    output_args=()
+    break
+  fi
+  previous="$arg"
+done
+
+exec "$HOME/.local/node-lts/bin/pi" \
+  "${output_args[@]}" \
+  --tools read,bash,edit,write,grep,find,ls,web_search \
+  --no-extensions \
+  --extension "$HOME/.pi/agent/extensions/coding-runtime.ts" \
+  --append-system-prompt "Treat the current working directory as the task root. You may read external references, but write only inside the current working directory or TMPDIR; never switch to or edit a separate source checkout." \
+  --no-prompt-templates \
+  --no-approve \
+  "$@"

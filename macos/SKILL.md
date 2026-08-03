@@ -1,0 +1,62 @@
+---
+name: pi-worker
+description: Delegate implementation, repair, review, test, repository search, or web research to local Pi models while Codex reviews the result.
+---
+
+# Pi Worker
+
+Use `$HOME/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `pi-worker profiles` for supported models, enforced thinking defaults, and optional capabilities; run `pi-worker help` for syntax.
+
+## Efficient execution
+
+- Read/review tasks run directly in the existing repository with `--mode read --workdir`. They receive `read`, `grep`, `find`, `ls`, `web_search`, and `bash`, but not `edit` or `write`; `bash` is restricted by the run prompt to inspection and commands known not to write project files.
+- Write tasks use `--mode write --source`; the runner creates a lightweight detached Git worktree and carries the source's tracked dirty and non-ignored untracked files into its baseline. Dirty state is not a startup gate.
+- Worker instructions keep writes inside the current worktree or run-local `TMPDIR`; external paths remain readable when the task needs references.
+- Use `--mode in-place --workdir` only when direct writes are intentional. Never overlap writers in one directory.
+- Root may dispatch up to 10 independent Workers. One `wait` handles all run IDs and returns on attention, the first failure, or all-success completion; do not poll `status`. After attention or failure, handle the returned item and immediately call `wait` again for every ID in `pending` so the remaining Workers keep event-driven supervision.
+- Worker completion freezes `result.json`, optional `changes.patch`, and failure-only `failure.log`. Raw streaming JSONL is not retained.
+- Completion and later dispatches never delete a result-bearing run automatically. Codex reviews the result and patch first, then runs `cleanup --reviewed yes` to delete the run, session, and managed worktree.
+- Each run gets a managed Pi session inside its run directory. `continue --run-id` reuses that session and the same worktree; review-gated cleanup deletes both. Private temporary files are still deleted before completion.
+- While Pi is running, it uses a small writable profile copied from the current host configuration and keeps installed packages shared. This avoids global settings-lock failures inside Codex sandboxes; the supervisor deletes the temporary profile at terminal.
+- All Workers reuse the same host npm, pnpm, uv, pip, and Poetry caches. Review cleanup performs GC only when no peer Worker is active: files unused for 90 days are removed first, then the oldest rebuildable files until the combined cache is at most 20 GiB. It never uses whole-cache purge commands.
+- Headless Workers load configured Pi Skills plus the coding runtime. Extensions remain explicit: add `--capability docs`, `lens`, or `context` before `--` only when needed; runtime owns their paths and tool allowlists.
+- Success requires process exit `0` and Pi's `agent_settled` event. The default hard timeout is 24 hours and the default no-event idle timeout is 10 minutes; pass `--hard-timeout 0` or `--idle-timeout 0` to disable either limit.
+- Normal dispatch and continuation use JSON headless mode. Add `--live` only when an active turn must accept `steer`; long ordinary tasks avoid RPC serialization overhead. Provider, transport, ignored-reasoning, repeated tool, extension, compaction, prompt, or RPC shutdown errors wake `wait` immediately with state `attention`.
+- `result.json.usage` aggregates every assistant model call in the run, including nested cost fields, cache reads, and reported reasoning tokens. `reportedReasoningTokens` is provider-reported evidence, while `thinking` remains the requested level.
+
+## Commands
+
+```bash
+PI_WORKER=$HOME/.codex/skills/pi-worker/bin/pi-worker
+
+# Read/review directly; runtime supplies and validates thinking.
+$PI_WORKER dispatch --run-id review-1 --mode read --workdir /absolute/repo -- \
+  --provider opencode-go --model deepseek-v4-flash "Review the requested scope."
+
+# Write in a managed worktree.
+$PI_WORKER dispatch --run-id fix-1 --mode write --source /absolute/repo -- \
+  --provider shuaiapi --model gpt-5.6-luna --thinking xhigh \
+  "Implement the bounded fix and run focused tests."
+
+# Add extension capabilities before `--`; configured Pi Skills load automatically.
+$PI_WORKER dispatch --run-id docs-review --mode read --workdir /absolute/repo \
+  --capability docs -- --provider krill-sol --model gpt-5.6-sol \
+  "Verify against current library documentation."
+
+$PI_WORKER wait --run-id review-1 --run-id fix-1 --timeout 86400
+
+# Redirect an explicitly live turn without restarting it.
+$PI_WORKER dispatch --run-id live-fix --mode write --source /absolute/repo --live -- \
+  --provider krill --model grok-4.5 "Implement the bounded fix."
+$PI_WORKER steer --run-id live-fix -- "Stop broad searching; inspect the failing test and its direct caller."
+$PI_WORKER wait --run-id live-fix --timeout 86400
+
+# Continue a completed run with its managed session and worktree.
+$PI_WORKER continue --run-id fix-1 -- "Address the review findings and rerun focused tests."
+$PI_WORKER wait --run-id fix-1 --timeout 86400
+
+# After Codex has reviewed or integrated the result.
+$PI_WORKER cleanup --reviewed yes --run-id review-1 --run-id fix-1
+```
+
+Root reviews diffs and independently reruns risk-relevant tests. `cache-status` reports the shared npm, pnpm, uv, pip, Poetry, and Pi Lens cache total; `status` is diagnostic only.

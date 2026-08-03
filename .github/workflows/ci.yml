@@ -5,6 +5,17 @@ on:
   pull_request:
 
 jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: node --check macos/lib/events.mjs
+      - run: zsh -n macos/bin/pi-worker
+      - run: node --test macos/tests/events.test.mjs
+
   windows:
     runs-on: windows-latest
     steps:

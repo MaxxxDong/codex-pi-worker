@@ -1,5 +1,14 @@
 # 发布记录
 
+## v0.1.0 - 2026-08-04
+
+- 首个统一版本，保留 Windows Python runtime，并新增独立的 `macos/` Node.js runtime。
+- macOS analysis/read 模式移除 `edit/write`，保留只读工具、联网搜索和受提示约束的 `bash`；implementation/write 继续使用 detached worktree。
+- macOS result 聚合整次运行的 input/output/cache/reasoning/cost，记录调用次数与 provider-reported reasoning evidence。
+- failure/attention 输出 `pending`，要求 Root 立即为仍运行任务重新建立事件等待。
+- macOS 共享缓存按 90 天与最旧优先清理并限制为 20 GiB；禁止整库 purge，活跃 Worker 存在时跳过 GC。
+- result、session 和候选 worktree 不再按 24 小时自动删除，只允许 Codex 审核后的显式 cleanup。
+
 ### 2026-08-03
 
 - 后台传输切换为 Pi 0.83 原生 RPC，增加 receipt 绑定的运行中 `steer` 与 accepted 回执。
