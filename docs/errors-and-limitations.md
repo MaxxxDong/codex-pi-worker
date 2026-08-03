@@ -102,6 +102,10 @@ git -C '<repo>' config --show-origin --get core.longpaths
 
 runtime 默认把临时对象放在短根目录 `C:\piw`，并在自有目录清理时使用 Windows 扩展路径前缀。第三方构建工具仍可能不支持长路径，因此输出目录和仓库路径也应尽量短。
 
+### 2.6 `No project session found ... creating a new session`
+
+首次运行会把 runtime 分配的 run ID 作为 Pi 的精确 session ID。该 ID 尚不存在时，Pi 会创建它并在 stderr 写一行提示；这是 `--session-id` 的预期语义，不是 provider、模型或仓库错误。continuation 复用已有 session，不会再次出现该提示。
+
 ## 3. 等待、超时与 attention
 
 ### 3.1 watch 返回 `timeout`
@@ -150,7 +154,11 @@ runtime 会从 stderr 和 Pi RPC 事件中识别异常并尽早发出 attention�
 
 attention 不是终态。处理后应继续 watch 同一 receipt；只有 `terminal` 事件或存在 result 才表示本轮结束。
 
-### 3.4 `worker process is unavailable and has no result` / `worker exited without result`
+### 3.4 单次 `Path not found` / `ENOENT`
+
+单次 `Path not found` 或 `ENOENT` 通常表示 Worker 猜错了文件位置。如果随后通过 `find`/`grep` 找到真实文件并完成任务，应保留该错误作为证据，但不要把整轮判为失败。只有连续 3 次工具失败才触发 `repeated_tool_errors`；反复发生时再用 steer 纠正路径或缩小范围。
+
+### 3.5 `worker process is unavailable and has no result` / `worker exited without result`
 
 说明 watch 无法打开 PID，且 receipt 指向的 result 不存在，或进程退出时 runner 没有完成原子写入。
 
@@ -196,7 +204,7 @@ Get-Item $r.evidence.events,$r.evidence.stderr | Select-Object FullName,Length
 
 ### 5.2 `worker is already finalized`
 
-finalize 会删除自有 session，并可能删除 implementation worktree。settled receipt 不可继续，避免在已经清理的上下文上制造第二条历史。
+finalize 会删除自有 session，并可能删除 implementation worktree。settled receipt 不可继续，避免在已经清理的上下文上制造第二条历史。完成后 result 的 `reviewRequired` 和 `continuationAvailable` 均为 `false`。
 
 ### 5.3 continuation 被拒绝或并发分配
 

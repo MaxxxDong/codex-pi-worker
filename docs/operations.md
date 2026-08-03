@@ -4,7 +4,7 @@
 
 ### 1. 写任务文件
 
-任务应包含目标、允许范围、交付物和聚焦检查。不要写 Key、token、cookie 或私有配置内容。
+任务应包含目标、允许范围、交付物和聚焦检查。不要写 Key、token、cookie 或私有配置内容。路径不确定时让 Worker 先用 `find`/`grep` 定位，不要根据符号名或目录惯例猜测文件路径。
 
 ### 2. 启动
 
@@ -88,7 +88,7 @@ python scripts\finalize_pi_worker.py `
   --decision rejected
 ```
 
-`--changes-integrated` 是 Codex 的显式审核声明，不由 Worker 自己设置。finalize 删除 runtime 自有 worktree、session 和 run temp，但保留用户指定 output directory 作为证据；确认不再需要后由用户按项目策略清理 evidence。
+`--changes-integrated` 是 Codex 的显式审核声明，不由 Worker 自己设置。finalize 删除 runtime 自有 worktree、session 和 run temp，将 result 的 `reviewRequired`、`continuationAvailable` 设为 `false`，并保留用户指定 output directory 作为证据；确认不再需要后由用户按项目策略清理 evidence。
 
 ## 产物
 

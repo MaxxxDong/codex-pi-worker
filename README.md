@@ -75,13 +75,8 @@ python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\watch_pi_worker.py" `
 
 - 切换为 Pi 原生 RPC，支持运行中 steer、accepted 回执和多次异常 attention。
 - 连续工具失败、自动重试失败、扩展/压缩错误会提前唤醒；RPC 退出会排空 stdout，避免 Windows EPIPE。
-
-### 2026-08-02
-
-- 首次公开 Windows lifecycle runtime：事件通知、session continuation、review-gated cleanup、共享缓存、长路径与日志上限。
-- 发布前加固缓存所有权、成果删除门禁、结构化失败和 shell 路径逃逸检查。
-- 默认实现模式现已完整启用 `grep/find/ls`；Firecrawl 与 Playwright 改为按任务加载，并保留脱敏工具错误摘要。
-- 安装指南补充固定扩展版本、Firecrawl 环境变量配置及 `pi-playwright 0.1.1` Windows 准备脚本。
+- finalize 后会同步关闭 `reviewRequired` 与 `continuationAvailable`，避免已清理任务仍被误判为可审核或可续跑。
+- Worker 对不确定路径先执行 `find`/`grep`，减少根据 Kotlin/Java 符号名猜错文件路径的无效调用。
 
 完整记录见 [发布记录](docs/releases/release-notes.md)。
 
