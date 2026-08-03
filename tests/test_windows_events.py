@@ -540,7 +540,7 @@ class WindowsEventTests(unittest.TestCase):
                 self.assertEqual(watcher.returncode, 0, stderr)
                 self.assertLess(time.perf_counter() - started, 1.0)
                 self.assertEqual(json.loads(stdout)["event"], "attention")
-                self.assertTrue((root / "pi-attention-delivered.json").is_file())
+                self.assertTrue((root / "pi-attention-delivered-001.json").is_file())
             finally:
                 close_windows_handle(handle)
                 sleeper.terminate()
@@ -649,7 +649,8 @@ class WindowsEventTests(unittest.TestCase):
                 " print(json.dumps({'type':'tool_execution_start','toolName':name}), flush=True)\n"
                 " time.sleep(0.6)\n"
                 "print(json.dumps({'type':'message_end','message':{'role':'assistant','provider':'krill','model':'grok-4.5','stopReason':'stop','usage':{},'content':[{'type':'text','text':'done'}]}}), flush=True)\n"
-                "print(json.dumps({'type':'agent_end'}), flush=True)\n",
+                "print(json.dumps({'type':'agent_end'}), flush=True)\n"
+                "print(json.dumps({'type':'agent_settled'}), flush=True)\n",
                 encoding="utf-8",
             )
             (fake_bin / "pi.cmd").write_text(

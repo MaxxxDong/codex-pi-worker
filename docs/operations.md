@@ -47,7 +47,19 @@ python scripts\watch_pi_worker.py C:\absolute\evidence\pi-receipt.json --timeout
 
 最多可在一次 watch 中传入 32 个带 attention 的 receipt。
 
-### 4. 同任务续跑
+### 4. 运行中 steer
+
+Worker 仍在运行时，可通过 Pi 原生 RPC 在当前工具调用完成后、下一次模型调用前插入纠偏：
+
+```powershell
+python scripts\steer_pi_worker.py `
+  C:\absolute\evidence\pi-receipt.json `
+  --message-file C:\absolute\correction.md
+```
+
+命令只接受当前 latest receipt，等待 Pi 返回 accepted 回执，不记录消息正文。收到回执后继续 watch 同一 owner receipt。当前跨进程投递使用 Windows named event；若本轮已 terminal，应改用 continuation。
+
+### 5. 同任务续跑
 
 ```powershell
 python scripts\continue_pi_worker.py `
@@ -57,7 +69,7 @@ python scripts\continue_pi_worker.py `
 
 continuation 复用同一 session 和 implementation worktree，证据写入 `turns\turn-NNN`。并发申请同一 owner receipt 的下一 turn 会被 runtime lock 拒绝。
 
-### 5. 审核后 finalize
+### 6. 审核后 finalize
 
 接受且已把改动应用/提交到正式工作树：
 
@@ -88,7 +100,7 @@ python scripts\finalize_pi_worker.py `
 | `pi-stderr.log` | 脱敏并限长的 Pi stderr |
 | `runtime.*.log` | detached runner 自身 stdout/stderr |
 | `changes.patch` | implementation 相对 base commit 的 binary patch |
-| `pi-attention*.json` | 一次性运行中错误通知及已投递证据 |
+| `pi-attention*.json` | 按序号保存的运行中错误通知及已投递证据 |
 
 这些文件可能含源码、绝对路径和模型输出，不应上传公共 issue 或仓库。
 

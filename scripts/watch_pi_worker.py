@@ -58,7 +58,8 @@ def attention(receipt_path: Path, receipt: dict[str, object]) -> dict[str, objec
     if not attention_path.is_file():
         return None
     payload = read_json(attention_path)
-    delivered = attention_path.with_name("pi-attention-delivered.json")
+    sequence = int(payload.get("sequence") or 1)
+    delivered = attention_path.with_name(f"pi-attention-delivered-{sequence:03d}.json")
     attention_path.replace(delivered)
     return {
         "event": "attention",

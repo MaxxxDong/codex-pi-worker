@@ -15,7 +15,7 @@ import time
 import traceback
 import uuid
 from pathlib import Path
-from threading import Condition, Event, Thread
+from threading import Condition, Event, Lock, Thread
 
 from runtime_support import (
     DEFAULT_MODEL,
@@ -28,12 +28,16 @@ from runtime_support import (
     create_attention_event,
     emit_json,
     record_job,
+    reset_attention_event,
     release_cache,
     remove_run_temp,
     set_attention_event,
+    steer_ack_event_name,
+    steer_event_name,
     terminate_process_tree,
     utc_now,
     validate_route,
+    wait_windows_event,
     worker_environment,
 )
 
@@ -101,6 +105,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-index", type=int, default=1)
     parser.add_argument("--allow-existing-changes", action="store_true")
     parser.add_argument("--attention-event-name", default=None)
+    parser.add_argument("--steer-event-name", default=None)
+    parser.add_argument("--steer-queue-dir", type=Path, default=None)
     parser.add_argument("--launch-gated", action="store_true")
     return parser.parse_args()
 
@@ -210,6 +216,50 @@ def compact_event(raw: bytes) -> bytes | None:
         }
     elif event_type in {"agent_end", "agent_settled"}:
         compact = {"type": event_type}
+    elif event_type == "response":
+        compact = {
+            "type": event_type,
+            "id": event.get("id"),
+            "command": event.get("command"),
+            "success": bool(event.get("success")),
+        }
+        if event.get("error"):
+            compact["error"] = redact_credentials(str(event["error"]).encode())[:MAX_TOOL_ERROR_BYTES].decode(
+                errors="ignore"
+            )
+    elif event_type == "queue_update":
+        compact = {
+            "type": event_type,
+            "steeringCount": len(event.get("steering") or []),
+            "followUpCount": len(event.get("followUp") or []),
+        }
+    elif event_type in {"auto_retry_start", "auto_retry_end"}:
+        compact = {
+            "type": event_type,
+            "attempt": event.get("attempt"),
+            "maxAttempts": event.get("maxAttempts"),
+            "success": event.get("success"),
+        }
+        retry_error = event.get("errorMessage") or event.get("finalError")
+        if retry_error:
+            compact["errorSummary"] = redact_credentials(str(retry_error).encode())[:MAX_TOOL_ERROR_BYTES].decode(
+                errors="ignore"
+            )
+    elif event_type == "compaction_end" and not event.get("result") and not event.get("aborted"):
+        compact = {
+            "type": event_type,
+            "errorSummary": redact_credentials(str(event.get("errorMessage") or "").encode())[
+                :MAX_TOOL_ERROR_BYTES
+            ].decode(errors="ignore"),
+        }
+    elif event_type == "extension_error":
+        compact = {
+            "type": event_type,
+            "extensionPath": event.get("extensionPath"),
+            "errorSummary": redact_credentials(str(event.get("error") or "").encode())[:MAX_TOOL_ERROR_BYTES].decode(
+                errors="ignore"
+            ),
+        }
     else:
         return None
     compact["at"] = utc_now()
@@ -323,6 +373,7 @@ def parse_events(path: Path) -> dict[str, object]:
     model = None
     stop_reason = None
     agent_ended = False
+    agent_settled = False
     final_text_truncated = False
 
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -333,6 +384,8 @@ def parse_events(path: Path) -> dict[str, object]:
         event_type = event.get("type")
         if event_type == "agent_end":
             agent_ended = True
+        elif event_type == "agent_settled":
+            agent_settled = True
         elif event_type == "tool_execution_end":
             tool = {"name": event.get("toolName"), "error": bool(event.get("isError"))}
             if event.get("errorSummary"):
@@ -355,6 +408,7 @@ def parse_events(path: Path) -> dict[str, object]:
 
     return {
         "agentEnded": agent_ended,
+        "agentSettled": agent_settled,
         "provider": provider,
         "model": model,
         "stopReason": stop_reason,
@@ -379,6 +433,14 @@ def main(args: argparse.Namespace | None = None) -> int:
     worktree_path = args.worktree_path.resolve() if args.worktree_path else None
     prompt_file = args.prompt_file.resolve()
     output_dir = args.output_dir.resolve()
+    steer_queue_dir = args.steer_queue_dir.resolve() if args.steer_queue_dir else None
+    if bool(args.steer_event_name) != bool(steer_queue_dir):
+        raise SystemExit("steer event and queue directory must be configured together")
+    if steer_queue_dir and (
+        steer_queue_dir != (runtime / "runs" / run_id / "steer").resolve()
+        or args.steer_event_name != steer_event_name(run_id)
+    ):
+        raise SystemExit("steer control path does not match the current run")
     if not cwd.is_dir():
         raise SystemExit(f"cwd is not a directory: {cwd}")
     if not prompt_file.is_file():
@@ -398,7 +460,9 @@ def main(args: argparse.Namespace | None = None) -> int:
     result_path = output_dir / "pi-result.json"
     attention_path = output_dir / "pi-attention.json"
     attention_handle = create_attention_event(args.attention_event_name) if args.attention_event_name else None
-    attention_sent = Event()
+    attention_lock = Lock()
+    attention_times: dict[str, float] = {}
+    attention_sequence = 0
     event_log_bytes = 0
     stderr_log_bytes = 0
     event_log_truncated = False
@@ -407,20 +471,26 @@ def main(args: argparse.Namespace | None = None) -> int:
     reasoning_ignored_seen = False
 
     def notify_attention(category: str) -> None:
-        if attention_sent.is_set():
-            return
-        attention_sent.set()
-        atomic_json(
-            attention_path,
-            {
-                "runId": run_id,
-                "category": category,
-                "message": "Pi worker reported a runtime/provider error; inspect the redacted evidence log.",
-                "at": utc_now(),
-                "stderr": str(stderr_path),
-            },
-        )
-        set_attention_event(attention_handle)
+        nonlocal attention_sequence
+        with attention_lock:
+            now = time.monotonic()
+            previous = attention_times.get(category)
+            if attention_path.exists() or (previous is not None and now - previous < 30):
+                return
+            attention_sequence += 1
+            attention_times[category] = now
+            atomic_json(
+                attention_path,
+                {
+                    "runId": run_id,
+                    "sequence": attention_sequence,
+                    "category": category,
+                    "message": "Pi worker reported a runtime/provider error; inspect the redacted evidence log.",
+                    "at": utc_now(),
+                    "stderr": str(stderr_path),
+                },
+            )
+            set_attention_event(attention_handle)
 
     enabled_tools = ANALYSIS_TOOLS if args.mode == "analysis" else BASE_TOOLS
     if args.firecrawl:
@@ -433,8 +503,7 @@ def main(args: argparse.Namespace | None = None) -> int:
     command = [
         pi,
         "--mode",
-        "json",
-        "--print",
+        "rpc",
         "--session-id",
         args.session_id,
         "--session-dir",
@@ -484,10 +553,11 @@ def main(args: argparse.Namespace | None = None) -> int:
     started = time.perf_counter()
     timeout_event = Event()
     process_done = Event()
+    steer_stop = Event()
     activity = Condition()
     last_activity = time.monotonic()
     source_status_after: list[str] = []
-    prompt = prompt_file.read_bytes()
+    prompt = prompt_file.read_text(encoding="utf-8")
     worker_env, _ = worker_environment(runtime, run_id)
     worker_env.update(
         {
@@ -500,8 +570,13 @@ def main(args: argparse.Namespace | None = None) -> int:
     )
     cache_status: dict[str, object] = {}
     run_temp_cleanup: dict[str, object] = {"status": "pending"}
+    steer_handle: int | None = None
     try:
         with events_path.open("wb") as events_file, stderr_path.open("wb") as stderr_file:
+            if steer_queue_dir:
+                steer_queue_dir.mkdir(parents=True, exist_ok=True)
+                (steer_queue_dir / "acks").mkdir(exist_ok=True)
+                steer_handle = create_attention_event(args.steer_event_name)
             process = subprocess.Popen(
                 command,
                 cwd=cwd,
@@ -513,6 +588,55 @@ def main(args: argparse.Namespace | None = None) -> int:
                 **kwargs,
             )
             assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+            stdin_lock = Lock()
+
+            def send_rpc(command_value: dict[str, object]) -> None:
+                encoded = (json.dumps(command_value, ensure_ascii=False) + "\n").encode("utf-8")
+                with stdin_lock:
+                    if process.stdin.closed or process.poll() is not None:
+                        raise BrokenPipeError("Pi RPC stdin is closed")
+                    process.stdin.write(encoded)
+                    process.stdin.flush()
+
+            def acknowledge_steer(message_id: str, success: bool, error: object = None) -> None:
+                assert steer_queue_dir is not None
+                atomic_json(
+                    steer_queue_dir / "acks" / f"{message_id}.json",
+                    {
+                        "id": message_id,
+                        "success": success,
+                        "error": (
+                            redact_credentials(str(error).encode())[:MAX_TOOL_ERROR_BYTES].decode(errors="ignore")
+                            if error
+                            else None
+                        ),
+                    },
+                )
+                ack_handle = create_attention_event(steer_ack_event_name(message_id))
+                try:
+                    set_attention_event(ack_handle)
+                finally:
+                    close_windows_handle(ack_handle)
+
+            def dispatch_steer() -> None:
+                assert steer_handle is not None and steer_queue_dir is not None
+                while not steer_stop.is_set():
+                    wait_windows_event(steer_handle)
+                    reset_attention_event(steer_handle)
+                    if steer_stop.is_set():
+                        return
+                    for path in sorted(steer_queue_dir.glob("*.json")):
+                        message_id = path.stem
+                        try:
+                            value = json.loads(path.read_text(encoding="utf-8"))
+                            if value.get("id") != message_id or value.get("type") != "steer" or not value.get("message"):
+                                raise ValueError("invalid steer payload")
+                            send_rpc({"id": message_id, "type": "steer", "message": value["message"]})
+                        except BaseException as error:
+                            acknowledge_steer(message_id, False, error)
+                            notify_attention("steer_delivery_failed")
+                        finally:
+                            path.unlink(missing_ok=True)
 
             def mark_activity() -> None:
                 nonlocal last_activity
@@ -552,10 +676,21 @@ def main(args: argparse.Namespace | None = None) -> int:
 
             watchdog = Thread(target=watch_idle, name=f"pi-idle-{run_id}", daemon=True)
             watchdog.start()
+            steer_thread = (
+                Thread(target=dispatch_steer, name=f"pi-steer-{run_id}", daemon=True) if steer_handle is not None else None
+            )
+            if steer_thread:
+                steer_thread.start()
+            consecutive_tool_errors = 0
+
+            def enforce_rpc_shutdown() -> None:
+                if not process_done.wait(5):
+                    notify_attention("rpc_shutdown_timeout")
+                    terminate_process_tree(process)
+
             try:
                 try:
-                    process.stdin.write(prompt)
-                    process.stdin.close()
+                    send_rpc({"id": f"prompt-{run_id}", "type": "prompt", "message": prompt})
                 except BrokenPipeError:
                     notify_attention("broken_pipe")
                 for raw in process.stdout:
@@ -577,17 +712,74 @@ def main(args: argparse.Namespace | None = None) -> int:
                         event = json.loads(raw)
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         event = {}
-                    if event.get("type") in {"tool_execution_start", "tool_execution_end", "message_end", "agent_end"}:
+                    event_type = event.get("type")
+                    if event_type in {
+                        "tool_execution_start",
+                        "tool_execution_end",
+                        "message_end",
+                        "agent_end",
+                        "agent_settled",
+                        "auto_retry_start",
+                        "auto_retry_end",
+                        "queue_update",
+                    }:
                         mark_activity()
+                    if event_type == "tool_execution_end":
+                        consecutive_tool_errors = consecutive_tool_errors + 1 if event.get("isError") else 0
+                        if consecutive_tool_errors >= 3:
+                            notify_attention("repeated_tool_errors")
+                    elif event_type == "auto_retry_start" and int(event.get("attempt") or 0) >= 2:
+                        notify_attention("provider_retry")
+                    elif event_type == "auto_retry_end" and event.get("success") is False:
+                        notify_attention("provider_retry_failed")
+                    elif event_type == "extension_error":
+                        notify_attention("extension_error")
+                    elif event_type == "compaction_end" and not event.get("result") and not event.get("aborted"):
+                        notify_attention("compaction_error")
+                    elif event_type == "response" and str(event.get("id") or "").startswith("steer-"):
+                        acknowledge_steer(str(event["id"]), bool(event.get("success")), event.get("error"))
+                    elif event_type == "response" and event.get("id") == f"prompt-{run_id}" and not event.get("success"):
+                        notify_attention("prompt_rejected")
+                        with stdin_lock:
+                            if not process.stdin.closed:
+                                process.stdin.close()
+                    if event_type == "agent_settled":
+                        steer_stop.set()
+                        if steer_handle is not None:
+                            set_attention_event(steer_handle)
+                        if steer_thread:
+                            steer_thread.join(timeout=2)
+                        with stdin_lock:
+                            if not process.stdin.closed:
+                                process.stdin.close()
+                        Thread(target=enforce_rpc_shutdown, name=f"pi-shutdown-{run_id}", daemon=True).start()
                 process.stdout.close()
-                exit_code = process.wait()
+                process_done.set()
+                steer_stop.set()
+                if steer_handle is not None:
+                    set_attention_event(steer_handle)
+                if steer_thread:
+                    steer_thread.join(timeout=2)
+                with stdin_lock:
+                    if not process.stdin.closed:
+                        process.stdin.close()
+                try:
+                    exit_code = process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    notify_attention("rpc_shutdown_timeout")
+                    terminate_process_tree(process)
+                    exit_code = process.returncode or 1
                 stderr_thread.join(timeout=5)
             finally:
                 process_done.set()
+                steer_stop.set()
+                if steer_handle is not None:
+                    set_attention_event(steer_handle)
                 with activity:
                     activity.notify()
                 watchdog.join(timeout=1)
     finally:
+        close_windows_handle(steer_handle)
         close_windows_handle(attention_handle)
         try:
             run_temp_cleanup = cleanup_run_temp(runtime, run_id)
@@ -608,7 +800,7 @@ def main(args: argparse.Namespace | None = None) -> int:
     completed = (
         exit_code == 0
         and not timed_out
-        and parsed["agentEnded"]
+        and parsed["agentSettled"]
         and parsed["provider"] == args.provider
         and parsed["model"] == args.model
         and parsed["stopReason"] == "stop"

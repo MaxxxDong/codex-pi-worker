@@ -130,7 +130,7 @@ Get-Content $result.evidence.stderr -Tail 100 -Encoding UTF8
 
 ### 3.3 `attention` 类别
 
-runtime 会从 stderr 中识别并尽早发出一次 attention：
+runtime 会从 stderr 和 Pi RPC 事件中识别异常并尽早发出 attention。同类别 30 秒内去重；前一个通知投递后，后续不同类别或持续故障仍可再次唤醒：
 
 | 类别 | 常见原因 | 首要动作 |
 | --- | --- | --- |
@@ -141,6 +141,12 @@ runtime 会从 stderr 中识别并尽早发出一次 attention：
 | `reasoning_ignored` | provider 不支持或忽略所选 thinking effort | 查看 `reasoningWarning`；改用兼容 route 或降低 thinking |
 | `broken_pipe` | 子进程管道提前关闭 | 查看 runtime 与 Pi stderr，确认是否崩溃或被外部终止 |
 | `output_oversize` | 单事件或累计证据超限 | 依据 result 的截断字段检查最终结果，缩小任务或分轮执行 |
+| `repeated_tool_errors` | 连续 3 次工具调用失败 | 检查脱敏工具摘要，并用 steer 纠正路径、命令或任务范围 |
+| `provider_retry` / `provider_retry_failed` | 自动重试达到第 2 次或最终失败 | 先看 provider 错误；必要时 steer 缩小任务或等待终态后重试 |
+| `extension_error` / `compaction_error` | 扩展或上下文压缩失败 | 检查紧凑事件；禁用有问题的按需扩展或缩小上下文 |
+| `steer_delivery_failed` | RPC steer 未写入当前 Pi 进程 | 重新读取 latest receipt；若已终态则使用 continuation |
+| `prompt_rejected` | Pi RPC 在开始模型回合前拒绝初始 prompt | 检查 provider/model、会话和扩展初始化错误，不要等待 idle timeout |
+| `rpc_shutdown_timeout` | `agent_settled` 后 Pi 未在 5 秒内退出 | 保留 stderr，runtime 会终止该进程树并按失败交付 |
 
 attention 不是终态。处理后应继续 watch 同一 receipt；只有 `terminal` 事件或存在 result 才表示本轮结束。
 

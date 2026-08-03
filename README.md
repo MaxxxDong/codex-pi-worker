@@ -12,9 +12,10 @@
 | 事件优先等待 | named event + 进程句柄唤醒，不需要反复 `status`/日志轮询 |
 | 分析与实现分流 | 默认 `implementation`；只有明确只读任务才用 `analysis`，两者都有 `grep/find/ls` |
 | 同任务续跑 | receipt 绑定 Pi session、worktree 和 turn 序号 |
+| 运行中纠偏 | Pi 原生 RPC `steer`，receipt 绑定投递并等待 accepted 回执 |
 | 审核后清理 | Worker 结束只进入 `pending_review`；Codex 接受或拒绝后显式 finalize |
 | 并行执行 | 独立任务可共享 20 GiB 依赖下载缓存，写入范围不能重叠 |
-| 失败早通知 | 401/403、429、5xx、EPIPE、传输错误、reasoning 降级会发 `attention` |
+| 失败早通知 | provider/runtime 错误、连续工具失败和重试失败会立即发可重复 `attention` |
 | Windows 兼容 | UTF-8/CP936 安全 JSON、`CREATE_NO_WINDOW`、进程树终止、长路径清理 |
 | 证据控制 | JSON result、紧凑事件、stderr、binary patch 与日志容量上限 |
 
@@ -69,6 +70,11 @@ python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\watch_pi_worker.py" `
 - 清理必须发生在 Codex 审核之后；不要让 Worker 自己删除候选 worktree。
 
 ## 最新更新
+
+### 2026-08-03
+
+- 切换为 Pi 原生 RPC，支持运行中 steer、accepted 回执和多次异常 attention。
+- 连续工具失败、自动重试失败、扩展/压缩错误会提前唤醒；RPC 退出会排空 stdout，避免 Windows EPIPE。
 
 ### 2026-08-02
 

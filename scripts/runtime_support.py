@@ -19,6 +19,8 @@ CACHE_CHECK_INTERVAL_SECONDS = 3600
 RUN_TEMP_STALE_SECONDS = 3600
 JOB_HISTORY_RETENTION_SECONDS = 7 * 24 * 3600
 ATTENTION_EVENT_PREFIX = r"Local\pi-worker-attention-"
+STEER_EVENT_PREFIX = r"Local\pi-worker-steer-"
+STEER_ACK_EVENT_PREFIX = r"Local\pi-worker-steer-ack-"
 DEFAULT_PROVIDER = "opencode-go"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_THINKING = "max"
@@ -99,6 +101,14 @@ def attention_event_name(run_id: str) -> str:
     return f"{ATTENTION_EVENT_PREFIX}{run_id}"
 
 
+def steer_event_name(run_id: str) -> str:
+    return f"{STEER_EVENT_PREFIX}{run_id}"
+
+
+def steer_ack_event_name(message_id: str) -> str:
+    return f"{STEER_ACK_EVENT_PREFIX}{message_id}"
+
+
 def create_attention_event(name: str) -> int | None:
     if os.name != "nt":
         return None
@@ -136,6 +146,20 @@ def reset_attention_event(handle: int | None) -> None:
     kernel32.ResetEvent.restype = ctypes.c_int
     if not kernel32.ResetEvent(ctypes.c_void_p(handle)):
         raise OSError(ctypes.get_last_error(), "ResetEvent failed")
+
+
+def wait_windows_event(handle: int, timeout_seconds: float | None = None) -> bool:
+    if os.name != "nt":
+        raise OSError("named event waiting is only available on Windows")
+    import ctypes
+
+    timeout_ms = 0xFFFFFFFF if timeout_seconds is None else max(0, round(timeout_seconds * 1000))
+    result = ctypes.windll.kernel32.WaitForSingleObject(ctypes.c_void_p(handle), timeout_ms)
+    if result == 0:
+        return True
+    if result == 0x102:
+        return False
+    raise OSError(ctypes.get_last_error(), "WaitForSingleObject failed")
 
 
 def close_windows_handle(handle: int | None) -> None:

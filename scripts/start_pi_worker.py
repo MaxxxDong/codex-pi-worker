@@ -30,6 +30,7 @@ from runtime_support import (
     reserve_cache,
     runtime_root,
     shared_cache_paths,
+    steer_event_name,
     terminate_process_tree,
     validate_route,
 )
@@ -93,6 +94,7 @@ def main() -> int:
     reconciliation = reconcile_jobs(root)
     validate_route(args.provider, args.model)
     session_dir = (root / "sessions" / run_id).resolve()
+    steer_queue_dir = (root / "runs" / run_id / "steer").resolve()
     cache_roots = shared_cache_paths(root)
     worktree_path: Path | None = None
     execution_cwd = source_cwd
@@ -209,6 +211,10 @@ def main() -> int:
         "1",
         "--attention-event-name",
         attention_event_name(run_id),
+        "--steer-event-name",
+        steer_event_name(run_id),
+        "--steer-queue-dir",
+        str(steer_queue_dir),
         "--launch-gated",
     ]
     if worktree_path is not None:
@@ -252,6 +258,9 @@ def main() -> int:
         "resultPath": str(result_path),
         "attentionPath": str(output_dir / "pi-attention.json"),
         "attentionEventName": attention_event_name(run_id),
+        "steerEventName": steer_event_name(run_id),
+        "steerQueueDir": str(steer_queue_dir),
+        "steerAvailable": os.name == "nt",
         "outputDir": str(output_dir),
         "sourceRoot": str(source_root),
         "sourceCwd": str(source_cwd),

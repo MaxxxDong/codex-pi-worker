@@ -31,9 +31,16 @@ python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\watch_pi_worker.py" `
   C:\absolute\evidence\pi-receipt.json --timeout-seconds 1800
 ```
 
-An `attention` event needs handling, then one more watch on the same receipt.
-A terminal result needs Codex review. For a focused correction, reuse the same
-session and worktree:
+An `attention` event needs handling. While the turn is still running on Windows,
+send one focused correction through Pi's native RPC steer, then watch again:
+
+```powershell
+python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\steer_pi_worker.py" `
+  C:\absolute\evidence\pi-receipt.json --message-file C:\absolute\correction.md
+```
+
+A terminal result needs Codex review. For a correction after terminal, reuse the
+same session and worktree:
 
 ```powershell
 python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\continue_pi_worker.py" `
@@ -62,4 +69,4 @@ Use `--decision rejected` for discarded work. Finalize analysis runs too.
   Firecrawl task. Add `--playwright` only for browser work (implementation mode).
 - Treat `status=completed` as execution completion, not proof of correctness.
 - Never print or copy `~/.pi/agent/models.json`; it contains provider credentials.
-- Use grok-worker when strict schema gates or live mid-run steering is required.
+- Live steer is receipt-bound and Windows-only; after terminal use continuation.

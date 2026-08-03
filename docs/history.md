@@ -48,7 +48,7 @@ start -> receipt -> watch -> terminal/attention
 - Worker 进程句柄表示本轮退出。
 - `Local\pi-worker-attention-<run-id>` 命名 Event 表示需要提前介入。
 
-`watch_pi_worker.py` 用 `WaitForMultipleObjects` 一次阻塞等待，先检查已经落盘的 terminal/attention，之后才等待事件。attention 文件交付后改名为 `pi-attention-delivered.json`，防止同一告警被重复消费。
+`watch_pi_worker.py` 用 `WaitForMultipleObjects` 一次阻塞等待，先检查已经落盘的 terminal/attention，之后才等待事件。attention 文件交付后按序改名为 `pi-attention-delivered-NNN.json`，防止重复消费并保留多次告警证据。
 
 ### 结果与取舍
 
@@ -60,7 +60,9 @@ start -> receipt -> watch -> terminal/attention
 
 如果 Worker 的首轮实现接近正确但需要一个聚焦修正，重新创建任务会丢失模型 session，也可能重新创建 worktree、重新解释上下文并重复下载依赖。更糟的是，新旧输出之间没有明确所有权关系。
 
-### 修复：session continuation
+### 修复：RPC steer 与 session continuation
+
+运行中的 Worker 使用 Pi 原生 RPC `steer`：receipt 绑定的 Windows named event 唤醒 Runner，Pi 在当前工具调用结束、下一次模型调用前接收纠偏，并返回 accepted 回执。
 
 首轮启动创建稳定的 `sessionId` 和 runtime 自有 `sessionDir`。owner receipt 保存：
 
@@ -201,7 +203,7 @@ watchdog 只统计重要活动：tool start/end、assistant message end 和 agen
 
 ### 修复：provider attention
 
-runtime 流式读取 stderr 并分类：`provider_auth`、`provider_rate_limit`、`provider_unavailable`、`transport_error`、`reasoning_ignored`、`broken_pipe` 和输出超限。每轮最多发一次 attention，原子写文件后设置 Windows 命名 Event，使 watch 立即返回。
+runtime 流式读取 stderr 与 RPC 事件，覆盖 provider/runtime 错误、连续工具失败和自动重试失败。attention 按类别限频并按序保存；前一条投递后仍可发送后续异常，Windows 命名 Event 使 watch 立即返回。
 
 ### 结果与取舍
 

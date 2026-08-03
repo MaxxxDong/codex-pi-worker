@@ -27,6 +27,7 @@ from runtime_support import (
     reserve_cache,
     runtime_lock,
     runtime_root,
+    steer_event_name,
     terminate_process_tree,
 )
 
@@ -74,6 +75,7 @@ def main() -> int:
         raise SystemExit(f"execution cwd is missing: {execution_cwd}")
 
     run_id = str(uuid.uuid4())
+    steer_queue_dir = (root / "runs" / run_id / "steer").resolve()
     turn_index = int(owner.get("lastTurnIndex") or 1) + 1
     output_dir = Path(str(owner["outputDir"])).resolve() / "turns" / f"turn-{turn_index:03d}"
     receipt_path = output_dir / "pi-receipt.json"
@@ -137,6 +139,10 @@ def main() -> int:
         str(turn_index),
         "--attention-event-name",
         attention_event_name(run_id),
+        "--steer-event-name",
+        steer_event_name(run_id),
+        "--steer-queue-dir",
+        str(steer_queue_dir),
         "--launch-gated",
     ]
     worktree = owner.get("worktreePath")
@@ -210,6 +216,9 @@ def main() -> int:
         "resultPath": str(result_path),
         "attentionPath": str(output_dir / "pi-attention.json"),
         "attentionEventName": attention_event_name(run_id),
+        "steerEventName": steer_event_name(run_id),
+        "steerQueueDir": str(steer_queue_dir),
+        "steerAvailable": os.name == "nt",
         "outputDir": str(output_dir),
         "sourceRoot": str(owner["sourceRoot"]),
         "sourceCwd": str(owner["sourceCwd"]),

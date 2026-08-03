@@ -323,12 +323,14 @@ class SessionContinuationTests(unittest.TestCase):
                 "session_dir.mkdir(parents=True, exist_ok=True)\n"
                 "state=session_dir/'state.txt'\n"
                 "previous=state.read_text(encoding='utf-8') if state.exists() else 'NONE'\n"
-                "prompt=sys.stdin.read().strip()\n"
+                "command=json.loads(sys.stdin.readline())\n"
+                "prompt=command['message']\n"
                 "state.write_text(prompt, encoding='utf-8')\n"
                 "turn=1 if previous=='NONE' else 2\n"
                 "text=f'TURN={turn} PREV={previous} PROMPT={prompt}'\n"
                 "print(json.dumps({'type':'message_end','message':{'role':'assistant','provider':'krill','model':'grok-4.5','stopReason':'stop','usage':{},'content':[{'type':'text','text':text}]}}), flush=True)\n"
-                "print(json.dumps({'type':'agent_end'}), flush=True)\n",
+                "print(json.dumps({'type':'agent_end'}), flush=True)\n"
+                "print(json.dumps({'type':'agent_settled'}), flush=True)\n",
                 encoding="utf-8",
             )
             (fake_bin / "pi.cmd").write_text(
