@@ -103,6 +103,8 @@ def main() -> int:
             "reviewDecision": args.decision,
             "changesIntegrated": bool(args.changes_integrated),
             "settledAt": settled_at,
+            "reviewRequired": False,
+            "continuationAvailable": False,
             "nextAction": "none",
         }
     )

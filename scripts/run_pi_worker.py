@@ -28,9 +28,9 @@ from runtime_support import (
     create_attention_event,
     emit_json,
     record_job,
-    reset_attention_event,
     release_cache,
     remove_run_temp,
+    reset_attention_event,
     set_attention_event,
     steer_ack_event_name,
     steer_event_name,
@@ -51,7 +51,8 @@ BASE_TOOLS = "read,bash,edit,write,grep,find,ls,web_search,fetch_content,get_sea
 ANALYSIS_TOOLS = "read,grep,find,ls,web_search,fetch_content,get_search_content"
 IMPLEMENTATION_GUIDANCE = (
     "The current working directory is the isolated execution worktree. Use relative paths for edits and commands. "
-    "The source checkout and home may be inspected read-only, but never mutate or execute against them."
+    "The source checkout and home may be inspected read-only, but never mutate or execute against them. "
+    "Resolve uncertain paths with find or grep before targeting them; do not infer a file path from a symbol name."
 )
 
 CREDENTIAL_PATTERNS = (
@@ -498,7 +499,10 @@ def main(args: argparse.Namespace | None = None) -> int:
     guidance = (
         IMPLEMENTATION_GUIDANCE
         if args.mode == "implementation"
-        else "This is a read-only task. Inspect the current working directory without changing files or repository state."
+        else (
+            "This is a read-only task. Inspect the current working directory without changing files or repository state. "
+            "Resolve uncertain paths with find or grep before targeting them; do not infer a file path from a symbol name."
+        )
     )
     command = [
         pi,

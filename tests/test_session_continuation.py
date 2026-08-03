@@ -270,7 +270,15 @@ class SessionContinuationTests(unittest.TestCase):
             result_path = output / "pi-result.json"
             receipt_path = output / "pi-receipt.json"
             result_path.write_text(
-                json.dumps({"status": "failed", "cleanupStatus": "pending_review", "changedFiles": []}),
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "cleanupStatus": "pending_review",
+                        "changedFiles": [],
+                        "reviewRequired": True,
+                        "continuationAvailable": True,
+                    }
+                ),
                 encoding="utf-8",
             )
             receipt_path.write_text(
@@ -301,6 +309,9 @@ class SessionContinuationTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIsNone(json.loads(completed.stdout)["sessionRemoved"])
+            finalized = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertFalse(finalized["reviewRequired"])
+            self.assertFalse(finalized["continuationAvailable"])
 
     def test_terminal_followup_reuses_session_then_finalize_removes_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
