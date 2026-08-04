@@ -31,6 +31,11 @@ python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\watch_pi_worker.py" `
   C:\absolute\evidence\pi-receipt.json --timeout-seconds 1800
 ```
 
+For parallel runs in one Codex task, pass every live receipt to one watch. It
+returns on the first `attention` or terminal event; handle that run, remove only
+terminal receipts, then watch the remaining set. Never wait receipts sequentially.
+Different Codex tasks must not consume the same receipt.
+
 An `attention` event needs handling. While the turn is still running on Windows,
 send one focused correction through Pi's native RPC steer, then watch again:
 

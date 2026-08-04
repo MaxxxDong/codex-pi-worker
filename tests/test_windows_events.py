@@ -588,14 +588,19 @@ class WindowsEventTests(unittest.TestCase):
             self.assertFalse(any((runtime / "active").glob("*.json")))
 
     @unittest.skipUnless(os.name == "nt", "Windows event test")
-    def test_named_attention_wakes_watcher_without_polling(self) -> None:
+    def test_multi_receipt_watch_returns_first_attention_without_waiting_for_others(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             attention_path = root / "pi-attention.json"
             receipt_path = root / "pi-receipt.json"
+            other_receipt_path = root / "other-receipt.json"
             run_id = "test-attention"
             event_name = attention_event_name(run_id)
             sleeper = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            other_sleeper = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(10)"],
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
@@ -611,8 +616,23 @@ class WindowsEventTests(unittest.TestCase):
                         "attentionEventName": event_name,
                     },
                 )
+                atomic_json(
+                    other_receipt_path,
+                    {
+                        "runId": "still-running",
+                        "pid": other_sleeper.pid,
+                        "resultPath": str(root / "other-result.json"),
+                    },
+                )
                 watcher = subprocess.Popen(
-                    [sys.executable, str(SCRIPTS / "watch_pi_worker.py"), str(receipt_path), "--timeout-seconds", "5"],
+                    [
+                        sys.executable,
+                        str(SCRIPTS / "watch_pi_worker.py"),
+                        str(other_receipt_path),
+                        str(receipt_path),
+                        "--timeout-seconds",
+                        "5",
+                    ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -627,12 +647,17 @@ class WindowsEventTests(unittest.TestCase):
                 stdout, stderr = watcher.communicate(timeout=3)
                 self.assertEqual(watcher.returncode, 0, stderr)
                 self.assertLess(time.perf_counter() - started, 1.0)
-                self.assertEqual(json.loads(stdout)["event"], "attention")
+                event = json.loads(stdout)
+                self.assertEqual(event["event"], "attention")
+                self.assertEqual(Path(event["receipt"]), receipt_path)
+                self.assertIsNone(other_sleeper.poll())
                 self.assertTrue((root / "pi-attention-delivered-001.json").is_file())
             finally:
                 close_windows_handle(handle)
                 sleeper.terminate()
                 sleeper.wait(timeout=5)
+                other_sleeper.terminate()
+                other_sleeper.wait(timeout=5)
 
     @unittest.skipUnless(os.name == "nt", "Windows integration test")
     def test_runner_stderr_attention_arrives_before_terminal(self) -> None:

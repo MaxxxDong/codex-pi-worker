@@ -76,6 +76,7 @@ python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\watch_pi_worker.py" `
 - 修复 MSYS 工作树路径和 Gradle 文件名造成的 guard 误拦截。
 - 增加 receipt 绑定的安全取消；取消后保留结果、session 和 worktree，等待 Codex 审核再清理。
 - watch 返回 runtime job 的事实状态；重复工具错误直接携带最近三条脱敏摘要。
+- 并发 receipt 使用同一个 first-ready watch，任一任务完成、失败或异常都会立即唤醒。
 
 完整记录见 [发布记录](docs/releases/release-notes.md)。
 

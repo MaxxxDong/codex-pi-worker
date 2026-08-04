@@ -45,7 +45,17 @@ python scripts\watch_pi_worker.py C:\absolute\evidence\pi-receipt.json --timeout
 - `terminal`：`pi-result.json` 已存在；进入 Codex 审核。
 - `timeout`：watch 自己的等待窗口结束，不等于 Worker 已失败。
 
-最多可在一次 watch 中传入 32 个带 attention 的 receipt。
+同一 Codex 任务并行启动多个 Worker 时，把全部存活 receipt 传给一个 watch：
+
+```powershell
+python scripts\watch_pi_worker.py `
+  C:\evidence\worker-a\pi-receipt.json `
+  C:\evidence\worker-b\pi-receipt.json `
+  C:\evidence\worker-c\pi-receipt.json `
+  --timeout-seconds 1800
+```
+
+watch 在任意一个 receipt 首次出现 `attention`、`terminal` 或 `orphaned` 时立即返回，不等待其他 Worker。处理该事件后，terminal receipt 从下一次 watch 中移除；attention receipt 处理后继续保留。不同 Codex 对话各自保持自己的 watch，不要让两个对话消费同一个 receipt，否则其中一个可能先取走 attention 文件。一个 watch 最多接收 32 个带 attention 的 receipt；更多任务应按所有权拆成多组。
 
 ### 4. 运行中 steer
 
