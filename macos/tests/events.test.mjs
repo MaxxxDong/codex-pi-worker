@@ -241,11 +241,9 @@ test("dispatch requires a supported explicit model and Grok stays high", () => {
     const deepseek = command(["dispatch", "--run-id", "deepseek-low", "--workdir", temporary, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash", "--thinking", "low"], env, true);
     assert.equal(deepseek.status, 2);
     assert.match(deepseek.stderr, /one of: high, max/);
-    for (const [runId, provider, model] of [["official-low", "deepseek", "deepseek-v4-flash"], ["edge-low", "edgefn", "DeepSeek-V4-Flash-0731"]]) {
-      const result = command(["dispatch", "--run-id", runId, "--workdir", temporary, "--", "--provider", provider, "--model", model, "--thinking", "low"], env, true);
-      assert.equal(result.status, 2);
-      assert.match(result.stderr, /one of: high, max/);
-    }
+    const official = command(["dispatch", "--run-id", "official-low", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash", "--thinking", "low"], env, true);
+    assert.equal(official.status, 2);
+    assert.match(official.stderr, /one of: high, max/);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }

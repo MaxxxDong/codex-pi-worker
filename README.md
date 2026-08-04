@@ -85,6 +85,7 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker profiles
 
 ### 2026-08-04
 
+- macOS v0.1.5 移除不再使用的 EdgeFN provider 与 Worker profile，保留 DeepSeek 官方路由。
 - macOS v0.1.4 增加 DeepSeek 官方与 EdgeFN 0731 的同条件 Pi Worker profile，统一使用 High/Max 推理档位。
 - macOS v0.1.3 的批量 `wait` 在任一 Worker 完成、失败或异常时立即返回 `results/alerts/pending`，不再等待最慢任务；多个对话也可独立等待同一 run。
 - macOS v0.1.2 用单一轻量状态机明确 `starting/running/stopping/finalizing/terminal`，活动与进程存活信息保持独立，不扩展到业务任务或 Codex 线程判断。

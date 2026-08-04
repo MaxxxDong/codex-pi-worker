@@ -1,5 +1,9 @@
 # 发布记录
 
+## v0.1.5 - 2026-08-05
+
+- 按配置收敛要求移除 EdgeFN 凭据、模型目录和 Worker profile；DeepSeek 官方 profile 保持不变。
+
 ## v0.1.4 - 2026-08-04
 
 - macOS Pi Worker 增加官方 `deepseek/deepseek-v4-flash` 与 EdgeFN `edgefn/DeepSeek-V4-Flash-0731`，两者默认 Max，只允许 High/Max，便于同 runtime 对照测试。
