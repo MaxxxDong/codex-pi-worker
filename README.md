@@ -85,6 +85,9 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker profiles
 
 ### 2026-08-04
 
+- macOS v0.1.2 用单一轻量状态机明确 `starting/running/stopping/finalizing/terminal`，活动与进程存活信息保持独立，不扩展到业务任务或 Codex 线程判断。
+- 新增 supervisor 管理的取消命令；`status`/`wait` 能批量收口 supervisor 异常消失的运行，事件等待的本地兜底缩短到 15 秒。
+- 工具活动与续跑历史改为有界紧凑摘要，保留诊断所需的 reason、attention、模型和 usage，不保存工具参数或重复调用明细。
 - macOS 默认保留普通用户 Skill，但将 Context7、Lens、Context Mode、Playwright 的 Skill 与 extension/MCP 一起改为 capability 按需加载；相同任务实测减少约 15% 输入 Token。
 - 删除 macOS 旧 `meta.json/event.json` 兼容扫描，新版只维护当前 result 生命周期。
 - 加入经过真实调用验证的 macOS JSON headless runtime，read 模式不再暴露 `edit/write`。

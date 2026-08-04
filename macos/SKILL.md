@@ -14,6 +14,7 @@ Use `/Users/max/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `p
 - Worker instructions keep writes inside the current worktree or run-local `TMPDIR`; external paths remain readable when the task needs references.
 - Use `--mode in-place --workdir` only when direct writes are intentional. Never overlap writers in one directory.
 - Root may dispatch up to 10 independent Workers. One `wait` handles all run IDs and returns on attention, the first failure, or all-success completion; do not poll `status`. After attention or failure, handle the returned item and immediately call `wait` again for every ID in `pending` so the remaining Workers keep event-driven supervision.
+- `result.json.state` follows one lifecycle only: `starting -> running -> stopping -> finalizing -> success|failed|cancelled`. `activity` is independent and may be `waiting_event`, `waiting_model`, or `running_tools`; `activeTools` contains at most ten tool names/IDs and never arguments. These fields describe the Pi process, not whether the surrounding Codex task is complete.
 - Worker completion freezes `result.json`, optional `changes.patch`, and failure-only `failure.log`. Raw streaming JSONL is not retained.
 - Completion and later dispatches never delete a result-bearing run automatically. Codex reviews the result and patch first, then runs `cleanup --reviewed yes` to delete the run, session, and managed worktree.
 - Each run gets a managed Pi session inside its run directory. `continue --run-id` reuses that session and the same worktree; review-gated cleanup deletes both. Private temporary files are still deleted before completion.
@@ -21,6 +22,7 @@ Use `/Users/max/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `p
 - All Workers reuse the same host npm, pnpm, uv, pip, and Poetry caches. Review cleanup performs GC only when no peer Worker is active: files unused for 90 days are removed first, then the oldest rebuildable files until the combined cache is at most 20 GiB. It never uses whole-cache purge commands.
 - Headless Workers load configured Pi Skills plus the coding runtime. Context7, Lens, Context Mode, and Playwright are removed from automatic package discovery and load their matching extension/MCP plus Skill only through `--capability docs`, `lens`, `context`, or `browser`; runtime owns their paths and tool allowlists.
 - Success requires process exit `0` and Pi's `agent_settled` event. The default hard timeout is 24 hours and the default no-event idle timeout is 10 minutes; pass `--hard-timeout 0` or `--idle-timeout 0` to disable either limit.
+- `wait --timeout` limits only that waiting command. It never cancels a Worker. Use `cancel` to ask the supervisor to stop its child, finalize evidence, and return `cancelled`; never kill the supervisor directly.
 - Normal dispatch and continuation use JSON headless mode. Add `--live` only when an active turn must accept `steer`; long ordinary tasks avoid RPC serialization overhead. Provider, transport, ignored-reasoning, repeated tool, extension, compaction, prompt, or RPC shutdown errors wake `wait` immediately with state `attention`.
 - `result.json.usage` aggregates every assistant model call in the run, including nested cost fields, cache reads, and reported reasoning tokens. `reportedReasoningTokens` is provider-reported evidence, while `thinking` remains the requested level.
 
@@ -45,6 +47,9 @@ $PI_WORKER dispatch --run-id docs-review --mode read --workdir /absolute/repo \
 
 $PI_WORKER wait --run-id review-1 --run-id fix-1 --timeout 86400
 
+# Cancel through the supervisor so evidence and cleanup remain consistent.
+$PI_WORKER cancel --run-id fix-1 --reason "Task superseded" --timeout 30
+
 # Redirect an explicitly live turn without restarting it.
 $PI_WORKER dispatch --run-id live-fix --mode write --source /absolute/repo --live -- \
   --provider krill --model grok-4.5 "Implement the bounded fix."
@@ -59,4 +64,4 @@ $PI_WORKER wait --run-id fix-1 --timeout 86400
 $PI_WORKER cleanup --reviewed yes --run-id review-1 --run-id fix-1
 ```
 
-Root reviews diffs and independently reruns risk-relevant tests. `cache-status` reports the shared npm, pnpm, uv, pip, Poetry, and Pi Lens cache total; `status` is diagnostic only.
+Root reviews diffs and independently reruns risk-relevant tests. `cache-status` reports the shared npm, pnpm, uv, pip, Poetry, and Pi Lens cache total. `status` is diagnostic only; it derives process liveness and repairs every non-terminal run whose supervisor vanished, while `wait` keeps event-first behavior with a 15-second local process fallback.

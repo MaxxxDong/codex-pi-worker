@@ -1,5 +1,13 @@
 # 发布记录
 
+## v0.1.2 - 2026-08-04
+
+- macOS 增加单一轻量生命周期状态机和独立活动状态，只描述 Pi Worker 进程，不推断 Codex 任务或线程是否完成。
+- 新增 supervisor 管理的 `cancel`；取消后仍原子收口 result、patch、临时 profile 与 run-local 临时文件，结果保持待审核。
+- `status` 与 `wait` 会一次收口所有 supervisor 已消失的非终态运行；事件等待保留，纯本地兜底检查从 5 分钟缩短到 15 秒。
+- 运行中只保留有界 active tool 元数据，终态按工具名聚合计数；续跑历史继续保留失败原因、attention、模型与 usage，删除工具参数和重复事件。
+- 修复 dispatch/continue 启动窗口未立即持久化 supervisor PID，以及 xAI 并行回归测试漏等一个 Worker 的问题。
+
 ## v0.1.1 - 2026-08-04
 
 - macOS 临时 profile 保留全部普通用户 Skill，只过滤 Context7、Lens、Context Mode、Playwright 四个可选包的自动资源发现。

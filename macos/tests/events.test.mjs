@@ -86,16 +86,16 @@ test("parallel read workers notify once and retain only compact results", () => 
   const fake = fakeLauncher(temporary, successEvents);
   const env = testEnv(temporary, fake);
   try {
-    for (const [id, provider, model] of [["one", "krill-sol", "gpt-5.6-sol"], ["two", "shuaiapi", "gpt-5.6-luna"], ["three", "opencode-go", "deepseek-v4-flash"]]) {
+    for (const [id, provider, model] of [["one", "krill-sol", "gpt-5.6-sol"], ["two", "shuaiapi", "gpt-5.6-luna"], ["three", "opencode-go", "deepseek-v4-flash"], ["four", "xai", "grok-4.5"]]) {
       command(["dispatch", "--run-id", id, "--mode", "read", "--workdir", temporary, "--", "--provider", provider, "--model", model], env);
     }
-    const settled = command(["wait", "--run-id", "one", "--run-id", "two", "--run-id", "three", "--timeout", "10"], env).json;
-    assert.deepEqual(settled.results.map((result) => result.state), ["success", "success", "success"]);
-    assert.deepEqual(settled.results.map((result) => result.thinking), ["medium", "xhigh", "max"]);
+    const settled = command(["wait", "--run-id", "one", "--run-id", "two", "--run-id", "three", "--run-id", "four", "--timeout", "10"], env).json;
+    assert.deepEqual(settled.results.map((result) => result.state), ["success", "success", "success", "success"]);
+    assert.deepEqual(settled.results.map((result) => result.thinking), ["medium", "xhigh", "max", "high"]);
     assert.ok(settled.results.every((result) => result.finalText === "DONE"));
     assert.ok(!existsSync(join(env.PI_WORKER_STATE_ROOT, "one", "worker.jsonl")));
     assert.ok(!existsSync(join(env.PI_WORKER_STATE_ROOT, "one", "worker.stderr")));
-    command(["cleanup", "--reviewed", "yes", "--run-id", "one", "--run-id", "two"], env);
+    command(["cleanup", "--reviewed", "yes", "--run-id", "one", "--run-id", "two", "--run-id", "three", "--run-id", "four"], env);
     assert.ok(!existsSync(join(env.PI_WORKER_STATE_ROOT, "one")));
   } finally {
     rmSync(temporary, { recursive: true, force: true });
@@ -218,9 +218,11 @@ ${successEvents}`);
     assert.equal(alert.status, 4);
     assert.equal(alert.json.alerts[0].category, "repeated_tool_errors");
     const result = command(["wait", "--run-id", "tool-errors", "--timeout", "10"], env).json.results[0];
-    assert.equal(result.tools.length, 3);
-    assert.ok(result.tools.every((tool) => tool.errorSummary.length <= 2048));
-    assert.ok(result.tools.every((tool) => !tool.errorSummary.includes("sk-secret")));
+    assert.deepEqual(result.tools.map(({ name, count, errorCount }) => ({ name, count, errorCount })), [
+      { name: "read", count: 3, errorCount: 3 },
+    ]);
+    assert.ok(result.tools[0].lastError.length <= 2048);
+    assert.ok(!result.tools[0].lastError.includes("sk-secret"));
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -340,17 +342,117 @@ console.log(JSON.stringify({type:"agent_settled"}));`);
   }
 });
 
-test("wait converts a vanished supervisor into a durable failed result", () => {
+test("continuation preserves the prior failure diagnosis", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-session-failure-"));
+  const fake = fakeLauncher(temporary, `
+const continuing = process.argv.includes("--continue");
+if (!continuing) {
+  process.stderr.write("HTTP 503 service unavailable\\n");
+  process.exit(7);
+}
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "failed-session", "--workdir", temporary, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash", "first"], env);
+    const alert = command(["wait", "--run-id", "failed-session", "--timeout", "10"], env, true);
+    assert.equal(alert.status, 4);
+    const first = command(["wait", "--run-id", "failed-session", "--timeout", "10"], env, true).json.results[0];
+    assert.equal(first.reasonCode, "missing_settled");
+    assert.equal(first.attention.category, "provider_5xx");
+    command(["continue", "--run-id", "failed-session", "--", "retry"], env);
+    const second = command(["wait", "--run-id", "failed-session", "--timeout", "10"], env).json.results[0];
+    assert.equal(second.turns[0].reasonCode, "missing_settled");
+    assert.equal(second.turns[0].reason, "missing agent_settled");
+    assert.equal(second.turns[0].attention.category, "provider_5xx");
+    assert.equal(second.turns[0].assistantCalls, 0);
+    assert.equal(typeof second.turns[0].elapsedSeconds, "number");
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("status exposes bounded live activity without persisting process observations", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-activity-"));
+  const fake = fakeLauncher(temporary, `
+console.log(JSON.stringify({type:"tool_execution_start",toolCallId:"a",toolName:"read",args:{secret:"must-not-persist"}}));
+console.log(JSON.stringify({type:"tool_execution_start",toolCallId:"b",toolName:"bash",args:{command:"private"}}));
+await new Promise((resolve) => setTimeout(resolve, 800));
+console.log(JSON.stringify({type:"tool_execution_end",toolCallId:"a",toolName:"read",isError:false}));
+console.log(JSON.stringify({type:"tool_execution_end",toolCallId:"b",toolName:"bash",isError:false}));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "activity", "--workdir", temporary, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash", "task"], env);
+    let observed;
+    for (let index = 0; index < 40; index += 1) {
+      observed = command(["status", "--run-id", "activity"], env).json.runs[0].result;
+      if (observed.activeTools?.length === 2) break;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+    assert.equal(observed.state, "running");
+    assert.equal(observed.activity, "running_tools");
+    assert.deepEqual(observed.activeTools.map((tool) => tool.name).sort(), ["bash", "read"]);
+    assert.ok(observed.supervisorAlive);
+    assert.ok(observed.childAlive);
+    assert.doesNotMatch(JSON.stringify(observed.activeTools), /secret|private/);
+    const stored = JSON.parse(readFileSync(join(env.PI_WORKER_STATE_ROOT, "activity", "result.json"), "utf8"));
+    assert.equal(stored.supervisorAlive, undefined);
+    assert.equal(stored.childAlive, undefined);
+    const result = command(["wait", "--run-id", "activity", "--timeout", "10"], env).json.results[0];
+    assert.equal(result.state, "success");
+    assert.equal(result.activity, null);
+    assert.deepEqual(result.activeTools, []);
+    assert.ok(result.firstEventAt);
+    assert.ok(result.lastEventAt);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("cancel stops the child through the supervisor and produces a reviewable terminal result", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-cancel-"));
+  const fake = fakeLauncher(temporary, `
+process.on("SIGTERM", () => process.exit(0));
+console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"test",model:"fake",stopReason:"toolUse",content:[{type:"text",text:"WORKING"}]}}));
+await new Promise((resolve) => setTimeout(resolve, 5000));`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "cancelled", "--workdir", temporary, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash", "task"], env);
+    const response = command(["cancel", "--run-id", "cancelled", "--reason", "scope withdrawn", "--timeout", "10"], env).json;
+    assert.equal(response.state, "cancelled");
+    const cancelled = response.results[0];
+    assert.equal(cancelled.state, "cancelled");
+    assert.equal(cancelled.reasonCode, "user_cancelled");
+    assert.equal(cancelled.reason, "scope withdrawn");
+    assert.equal(cancelled.activity, null);
+    assert.equal(cancelled.cleanupRequired, true);
+    assert.ok(existsSync(cancelled.failureLogPath));
+    const waited = command(["wait", "--run-id", "cancelled", "--timeout", "1"], env, true);
+    assert.equal(waited.status, 3);
+    assert.equal(waited.json.results[0].state, "cancelled");
+    assert.equal(command(["cancel", "--run-id", "cancelled", "--timeout", "1"], env).json.state, "cancelled");
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("status converts every vanished supervisor into a durable failed result", () => {
   const temporary = mkdtempSync(join(tmpdir(), "pi-worker-orphan-"));
   const env = testEnv(temporary, process.execPath);
-  const directory = join(env.PI_WORKER_STATE_ROOT, "orphan");
-  mkdirSync(directory, { recursive: true });
-  writeFileSync(join(directory, "result.json"), JSON.stringify({schema:2,runId:"orphan",state:"running",supervisorPid:99999999,childPid:null,managedWorktree:false,workdir:temporary}));
+  for (const id of ["orphan-a", "orphan-b"]) {
+    const directory = join(env.PI_WORKER_STATE_ROOT, id);
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, "result.json"), JSON.stringify({schema:2,runId:id,state:"running",mode:"read",supervisorPid:99999999,childPid:null,managedWorktree:false,workdir:temporary,startedAt:new Date().toISOString()}));
+  }
   try {
-    const waited = command(["wait", "--run-id", "orphan", "--timeout", "10"], env, true);
+    const status = command(["status", "--run-id", "orphan-a", "--run-id", "orphan-b"], env).json;
+    assert.deepEqual(status.runs.map((item) => item.result.state), ["failed", "failed"]);
+    assert.ok(status.runs.every((item) => item.result.reasonCode === "supervisor_lost"));
+    assert.ok(status.runs.every((item) => item.result.schema === 3));
+    assert.ok(status.runs.every((item) => existsSync(item.result.failureLogPath)));
+    const waited = command(["wait", "--run-id", "orphan-a", "--run-id", "orphan-b", "--timeout", "1"], env, true);
     assert.equal(waited.status, 3);
-    assert.equal(waited.json.results[0].state, "failed");
-    assert.equal(waited.json.results[0].reason, "supervisor exited without a terminal result");
+    assert.equal(waited.json.results.length, 2);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }

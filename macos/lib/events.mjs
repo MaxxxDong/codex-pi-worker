@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const DEFAULT_ROOT = join(tmpdir(), `pi-worker-${process.getuid?.() ?? "user"}`);
-const FALLBACK_MS = 300_000;
+const FALLBACK_MS = 15_000;
 const CACHE_MAX_BYTES = 20 * 1024 * 1024 * 1024;
 const CACHE_STALE_MS = 90 * 24 * 60 * 60 * 1000;
 const FAILURE_TAIL_BYTES = 64 * 1024;
@@ -38,6 +38,7 @@ const AGENT_PROFILE_FILES = ["auth.json", "models.json", "models-store.json", "s
 const OPTIONAL_PACKAGES = ["@upstash/context7-pi", "context-mode", "pi-lens", "pi-playwright"];
 const PROFILES = new Map([
   ["opencode-go/deepseek-v4-flash", { defaultThinking: "max", allowed: ["high", "max"] }],
+  ["xai/grok-4.5", { defaultThinking: "high", allowed: ["low", "medium", "high"] }],
   ["krill/grok-4.5", { defaultThinking: "high", allowed: ["high"] }],
   ["shuaiapi-grok/grok-4.5", { defaultThinking: "high", allowed: ["high"] }],
   ["krill-sol/gpt-5.6-sol", { defaultThinking: "medium", allowed: ["low", "medium", "high", "xhigh", "max"] }],
@@ -85,6 +86,7 @@ function usage() {
            [--hard-timeout SECONDS] -- --provider NAME --model ID [--thinking LEVEL] PROMPT
   continue --run-id ID [--live] [--idle-timeout SECONDS] -- PROMPT
   steer --run-id ID [--timeout SECONDS] -- MESSAGE
+  cancel --run-id ID [--run-id ID...] [--reason TEXT] [--timeout SECONDS]
   wait --run-id ID [--run-id ID...] [--timeout SECONDS]
   cleanup --reviewed yes --run-id ID [--run-id ID...]
   status --run-id ID [--run-id ID...]
@@ -353,7 +355,7 @@ async function summarizeStream(stream, onActivity, onAttention, onResponse = () 
   for await (const line of lines) {
     try {
       const event = JSON.parse(line);
-      onActivity();
+      onActivity(event);
       if (event.type === "agent_settled") {
         summary.settled = true;
         onSettled();
@@ -361,13 +363,21 @@ async function summarizeStream(stream, onActivity, onAttention, onResponse = () 
       if (event.type === "tool_execution_start" && event.toolName === "bash") {
         summary.playwrightUsed ||= /(?:pi-playwright|playwright-browser|pw\.js)/.test(JSON.stringify(event));
       }
-      if (event.type === "tool_execution_end" && summary.tools.length < 1000) {
+      if (event.type === "tool_execution_end") {
         const error = Boolean(event.isError ?? event.result?.isError);
-        const tool = { name: event.toolName ?? null, error };
-        if (error) tool.errorSummary = redactText(JSON.stringify(event.result ?? event.error ?? "tool failed")).slice(0, TOOL_ERROR_BYTES);
-        summary.tools.push(tool);
+        const name = event.toolName ?? null;
+        let tool = summary.tools.find((entry) => entry.name === name);
+        if (!tool) {
+          tool = { name, count: 0, errorCount: 0 };
+          summary.tools.push(tool);
+        }
+        tool.count += 1;
+        if (error) {
+          tool.errorCount += 1;
+          tool.lastError = redactText(JSON.stringify(event.result ?? event.error ?? "tool failed")).slice(0, TOOL_ERROR_BYTES);
+        }
         summary.consecutiveToolErrors = error ? summary.consecutiveToolErrors + 1 : 0;
-        if (summary.consecutiveToolErrors >= 3) onAttention("repeated_tool_errors", tool.errorSummary);
+        if (summary.consecutiveToolErrors >= 3) onAttention("repeated_tool_errors", tool.lastError);
       }
       if (event.type === "auto_retry_start" && Number(event.attempt ?? 0) >= 2) onAttention("provider_retry", JSON.stringify(event));
       if (event.type === "auto_retry_end" && event.success === false) onAttention("provider_retry_failed", JSON.stringify(event));
@@ -400,7 +410,7 @@ function collectTail(stream, onActivity, onAttention) {
     let tail = "";
     stream.setEncoding("utf8");
     stream.on("data", (chunk) => {
-      onActivity();
+      onActivity(null);
       tail = (tail + chunk).slice(-FAILURE_TAIL_BYTES);
       const attention = classifyAttention(chunk);
       if (attention) onAttention(attention, chunk);
@@ -495,7 +505,7 @@ function activeWorkers(root) {
   return readdirSync(root).flatMap((name) => {
     if (name.startsWith(".")) return [];
     const result = readJson(join(root, name, "result.json"));
-    return result && !terminal(result) && processAlive(result.supervisorPid) ? [name] : [];
+    return result && !terminal(result) && (processAlive(result.supervisorPid) || processAlive(result.childPid)) ? [name] : [];
   });
 }
 
@@ -624,18 +634,23 @@ async function supervise(options, piArgs) {
   const resultPath = join(directory, "result.json");
   const initial = readJson(resultPath);
   if (!initial) fail(`missing run metadata: ${runId}`);
+  let earlyCancelRequested = false;
+  const earlyCancelSignal = () => { earlyCancelRequested = true; };
+  process.on("SIGTERM", earlyCancelSignal);
   const live = initial.live === true;
   const { prompt, args: launchArgs } = extractPrompt(piArgs);
   const launcher = process.env.PI_WORKER_LAUNCHER ?? resolve(dirname(SCRIPT), "../bin/pi-worker");
   const tmp = join(directory, "tmp");
   mkdirSync(tmp, { recursive: true, mode: 0o700 });
-  atomicJson(resultPath, { ...initial, state: "starting", supervisorPid: process.pid, startedAt: new Date().toISOString() });
+  atomicJson(resultPath, { ...initial, state: "starting", activity: "waiting_event", supervisorPid: process.pid, startedAt: new Date().toISOString() });
   const startedMs = Date.now();
   let exitCode = null;
   let signal = null;
   let launchError = null;
   let timedOut = false;
   let timeoutType = null;
+  let cancelRequested = false;
+  let cancelReason = null;
   let summary = { settled: false, lastAssistant: null, usage: {}, assistantCalls: 0, tools: [], playwrightUsed: false };
   let stderr = "";
   let attention = initial.attention ?? null;
@@ -654,23 +669,70 @@ async function supervise(options, piArgs) {
   let rpcShutdownTimer = null;
   let steerFallback = null;
   let steerSignal = null;
+  let cancelSignal = null;
   let hardTimeout = null;
   let child;
+  const activeTools = new Map();
+  let firstEventAt = initial.firstEventAt ?? null;
+  const updateProgress = (event = undefined, forcedState = null) => {
+    const current = readJson(resultPath);
+    if (!current || terminal(current) || current.supervisorPid !== process.pid) return;
+    const at = new Date().toISOString();
+    if (event !== undefined) {
+      firstEventAt ??= at;
+      if (event?.type === "tool_execution_start") {
+        const id = String(event.toolCallId ?? event.id ?? `${event.toolName ?? "tool"}-${at}`);
+        activeTools.set(id, { id, name: event.toolName ?? null, startedAt: at });
+      } else if (event?.type === "tool_execution_end") {
+        const id = event.toolCallId ?? event.id;
+        if (id !== undefined) activeTools.delete(String(id));
+        else {
+          const match = [...activeTools].find(([, tool]) => tool.name === (event.toolName ?? null));
+          if (match) activeTools.delete(match[0]);
+        }
+      }
+    }
+    let state = forcedState ?? current.state;
+    if (!forcedState && !["stopping", "finalizing"].includes(state)) {
+      state = event?.type === "agent_settled" ? "finalizing" : "running";
+    }
+    const activity = ["stopping", "finalizing"].includes(state)
+      ? null
+      : (activeTools.size > 0 ? "running_tools" : (firstEventAt ? "waiting_model" : "waiting_event"));
+    atomicJson(resultPath, {
+      ...current,
+      state,
+      activity,
+      firstEventAt,
+      lastEventAt: event === undefined ? current.lastEventAt ?? null : at,
+      activeTools: [...activeTools.values()].slice(0, 10),
+    });
+  };
   try {
+    const stopChild = () => {
+      if (!child) return;
+      stopProcessTree(child, "SIGTERM");
+      if (forceTimer) clearTimeout(forceTimer);
+      forceTimer = setTimeout(() => stopProcessTree(child, "SIGKILL"), 5_000);
+      forceTimer.unref();
+    };
     const stopForTimeout = (kind) => {
       if (timedOut || !child) return;
       timedOut = true;
       timeoutType = kind;
       if (kind === "rpc_shutdown") markAttention("rpc_shutdown_timeout", "Pi did not exit after agent_settled");
-      stopProcessTree(child, "SIGTERM");
-      forceTimer = setTimeout(() => stopProcessTree(child, "SIGKILL"), 5_000);
-      forceTimer.unref();
+      updateProgress(undefined, "stopping");
+      stopChild();
     };
-    const markActivity = () => {
+    const resetIdle = () => {
       if (initial.idleTimeoutSeconds <= 0 || timedOut) return;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => stopForTimeout("idle"), initial.idleTimeoutSeconds * 1000);
       idleTimer.unref();
+    };
+    const markActivity = (event) => {
+      resetIdle();
+      updateProgress(event);
     };
     const markAttention = (category, detail) => {
       if (attention) return;
@@ -685,6 +747,18 @@ async function supervise(options, piArgs) {
     };
     const steerDir = join(directory, "steer");
     const ackDir = join(steerDir, "acks");
+    const cancelPath = join(directory, "cancel.json");
+    cancelSignal = () => {
+      if (cancelRequested) return;
+      const request = readJson(cancelPath);
+      cancelRequested = true;
+      cancelReason = request?.reason || "cancel requested";
+      updateProgress(undefined, "stopping");
+      stopChild();
+    };
+    process.off("SIGTERM", earlyCancelSignal);
+    process.on("SIGTERM", cancelSignal);
+    if (earlyCancelRequested || existsSync(cancelPath)) cancelSignal();
     if (live) mkdirSync(ackDir, { recursive: true, mode: 0o700 });
     child = spawn(launcher, live ? ["--mode", "rpc", ...launchArgs] : [...launchArgs, prompt], {
       cwd: initial.workdir,
@@ -741,8 +815,12 @@ async function supervise(options, piArgs) {
       steerFallback = setInterval(drainSteer, 5_000);
       steerFallback.unref();
     }
-    atomicJson(resultPath, { ...readJson(resultPath), state: "running", supervisorPid: process.pid, childPid: child.pid });
-    markActivity();
+    atomicJson(resultPath, { ...readJson(resultPath), state: "running", activity: "waiting_event", supervisorPid: process.pid, childPid: child.pid });
+    resetIdle();
+    if (cancelRequested) {
+      updateProgress(undefined, "stopping");
+      stopChild();
+    }
     const summaryPromise = summarizeStream(child.stdout, markActivity, markAttention, onResponse, onSettled);
     const stderrPromise = collectTail(child.stderr, markActivity, markAttention);
     hardTimeout = initial.hardTimeoutSeconds > 0 ? setTimeout(() => {
@@ -756,6 +834,7 @@ async function supervise(options, piArgs) {
       child.once("error", (error) => resolveExit({ exitCode: null, signal: null, launchError: error.message }));
       child.once("close", (code, childSignal) => resolveExit({ exitCode: code, signal: childSignal, launchError: null }));
     }));
+    updateProgress(undefined, "finalizing");
     [summary, stderr] = await Promise.all([summaryPromise, stderrPromise]);
   } catch (error) {
     launchError = error.message;
@@ -766,6 +845,8 @@ async function supervise(options, piArgs) {
     if (rpcShutdownTimer) clearTimeout(rpcShutdownTimer);
     if (steerFallback) clearInterval(steerFallback);
     if (steerSignal) process.off("SIGUSR2", steerSignal);
+    if (cancelSignal) process.off("SIGTERM", cancelSignal);
+    process.off("SIGTERM", earlyCancelSignal);
     if (child?.stdin?.writable) child.stdin.end();
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -777,10 +858,21 @@ async function supervise(options, piArgs) {
   try { patch = capturePatch(initial, directory); } catch (error) { patchError = error.message; }
   const assistantFailed = summary.lastAssistant?.stopReason === "error" || summary.lastAssistant?.error;
   const emptyFinal = !summary.lastAssistant?.text?.trim();
-  const success = exitCode === 0 && summary.settled && !assistantFailed && !emptyFinal && !launchError && !timedOut && !patchError && !playwrightCleanupError;
+  const success = !cancelRequested && exitCode === 0 && summary.settled && !assistantFailed && !emptyFinal && !launchError && !timedOut && !patchError && !playwrightCleanupError;
   const reason = success ? null : (
-    patchError ?? playwrightCleanupError ?? launchError ?? (timedOut ? `${timeoutType} timeout` : null) ?? summary.lastAssistant?.error
+    (cancelRequested ? cancelReason : null) ?? patchError ?? playwrightCleanupError ?? launchError
+    ?? (timedOut ? `${timeoutType} timeout` : null) ?? summary.lastAssistant?.error
     ?? (!summary.settled ? "missing agent_settled" : null) ?? (emptyFinal ? "empty final response" : `exit ${exitCode}`)
+  );
+  const reasonCode = success ? null : (
+    cancelRequested ? "user_cancelled"
+      : patchError ? "patch_error"
+        : playwrightCleanupError ? "cleanup_error"
+          : launchError ? "launch_error"
+            : timedOut ? `${timeoutType}_timeout`
+              : summary.lastAssistant?.error ? "provider_error"
+                : !summary.settled ? "missing_settled"
+                  : emptyFinal ? "empty_final" : "process_exit"
   );
   let failureLogPath = null;
   if (!success) {
@@ -788,12 +880,15 @@ async function supervise(options, piArgs) {
     writeFileSync(failureLogPath, `${redactText([reason, stderr].filter(Boolean).join("\n\n")).slice(-FAILURE_TAIL_BYTES)}\n`, { mode: 0o600 });
   }
   atomicJson(resultPath, {
-    ...initial,
-    state: success ? "success" : "failed",
+    ...(readJson(resultPath) ?? initial),
+    state: success ? "success" : (cancelRequested ? "cancelled" : "failed"),
+    activity: null,
+    activeTools: [],
     exitCode,
     signal,
     agentSettled: summary.settled,
     reason,
+    reasonCode,
     timeoutType,
     provider: initial.provider,
     model: initial.model,
@@ -813,6 +908,7 @@ async function supervise(options, piArgs) {
     finishedAt: new Date().toISOString(),
     elapsedSeconds: Math.round((Date.now() - startedMs) / 100) / 10,
   });
+  try { unlinkSync(join(directory, "cancel.json")); } catch {}
   notifyWaiter(directory);
 }
 
@@ -866,9 +962,10 @@ function dispatch(options, piArgs) {
   }
 
   atomicJson(join(directory, "result.json"), {
-    schema: 2,
+    schema: 3,
     runId,
     state: "starting",
+    activity: "waiting_event",
     mode,
     sourceRoot: workspace.sourceRoot,
     workdir: workspace.worktree,
@@ -876,6 +973,9 @@ function dispatch(options, piArgs) {
     sessionDir,
     agentDir,
     turnIndex: 1,
+    firstEventAt: null,
+    lastEventAt: null,
+    activeTools: [],
     baseCommit: workspace.baseCommit,
     baselineTree: workspace.baselineTree,
     provider: selection.provider,
@@ -888,6 +988,7 @@ function dispatch(options, piArgs) {
     dispatchedAt: new Date().toISOString(),
   });
   const supervisorPid = startSupervisor(root, runId, ["--session-dir", sessionDir, ...effectiveArgs]);
+  atomicJson(join(directory, "result.json"), { ...readJson(join(directory, "result.json")), supervisorPid });
   console.log(JSON.stringify({ runId, state: "running", mode, live: options.has("live"), supervisorPid, workdir: workspace.worktree, sessionDir, directory }));
 }
 
@@ -916,6 +1017,15 @@ function continueRun(options, promptArgs) {
     state: previous.state,
     finalText: previous.finalText,
     usage: previous.usage,
+    reasonCode: previous.reasonCode ?? null,
+    reason: previous.reason ?? null,
+    attention: previous.attention ?? null,
+    observedProvider: previous.observedProvider ?? null,
+    observedModel: previous.observedModel ?? null,
+    assistantCalls: previous.assistantCalls ?? 0,
+    reportedReasoningTokens: previous.reportedReasoningTokens ?? null,
+    elapsedSeconds: previous.elapsedSeconds ?? null,
+    tools: previous.tools ?? [],
     finishedAt: previous.finishedAt,
   }];
   let supervisorPid;
@@ -927,15 +1037,20 @@ function continueRun(options, promptArgs) {
       atomicJson(resultPath, {
         ...previous,
         state: "starting",
+        activity: "waiting_event",
         supervisorPid: null,
         childPid: null,
         agentDir,
         turnIndex: (previous.turnIndex ?? 1) + 1,
         turns,
+        firstEventAt: null,
+        lastEventAt: null,
+        activeTools: [],
         exitCode: null,
         signal: null,
         agentSettled: false,
         reason: null,
+        reasonCode: null,
         timeoutType: null,
         finalText: "",
         usage: null,
@@ -949,7 +1064,9 @@ function continueRun(options, promptArgs) {
       });
       try { unlinkSync(join(directory, "attention.json")); } catch {}
       try { unlinkSync(join(directory, "failure.log")); } catch {}
-      return startSupervisor(root, runId, ["--session-dir", previous.sessionDir, ...effectiveArgs]);
+      const pid = startSupervisor(root, runId, ["--session-dir", previous.sessionDir, ...effectiveArgs]);
+      atomicJson(resultPath, { ...readJson(resultPath), supervisorPid: pid });
+      return pid;
     });
   } catch (error) {
     fail(error.message, 3);
@@ -1011,7 +1128,105 @@ function currentResults(root, ids) {
 }
 
 function terminal(result) {
-  return result && ["success", "failed"].includes(result.state);
+  return result && ["success", "failed", "cancelled"].includes(result.state);
+}
+
+function reconcileVanished(root, ids) {
+  const reconciled = [];
+  for (const runId of ids) {
+    const directory = runDirectory(root, runId);
+    const observed = readJson(join(directory, "result.json"));
+    if (!observed || terminal(observed) || !observed.supervisorPid || processAlive(observed.supervisorPid)) continue;
+    try {
+      withRunLock(directory, () => {
+        const path = join(directory, "result.json");
+        const current = readJson(path);
+        if (!current || terminal(current) || processAlive(current.supervisorPid)) return;
+        if (processAlive(current.childPid)) {
+          stopPidTree(current.childPid, "SIGTERM");
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+          if (processAlive(current.childPid)) stopPidTree(current.childPid, "SIGKILL");
+        }
+        rmSync(join(directory, "tmp"), { recursive: true, force: true });
+        rmSync(join(directory, "agent"), { recursive: true, force: true });
+        let patch = { patchPath: null, patchBytes: 0 };
+        let patchError = null;
+        try { patch = capturePatch(current, directory); } catch (error) { patchError = error.message; }
+        const reason = "supervisor exited without a terminal result";
+        const failureLogPath = join(directory, "failure.log");
+        writeFileSync(failureLogPath, `${redactText([reason, patchError].filter(Boolean).join("\n\n"))}\n`, { mode: 0o600 });
+        const started = Date.parse(current.startedAt ?? current.dispatchedAt ?? "");
+        atomicJson(path, {
+          ...current,
+          schema: 3,
+          state: "failed",
+          activity: null,
+          activeTools: [],
+          reason,
+          reasonCode: "supervisor_lost",
+          exitCode: null,
+          signal: null,
+          ...patch,
+          failureLogPath,
+          reviewPending: current.mode !== "read",
+          cleanupRequired: true,
+          finishedAt: new Date().toISOString(),
+          elapsedSeconds: Number.isFinite(started) ? Math.round((Date.now() - started) / 100) / 10 : null,
+        });
+        try { unlinkSync(join(directory, "cancel.json")); } catch {}
+        reconciled.push(runId);
+        notifyWaiter(directory);
+      });
+    } catch {
+      // Another lifecycle operation owns this run; its next observation retries.
+    }
+  }
+  return reconciled;
+}
+
+function statusView(result) {
+  if (!result) return null;
+  const last = Date.parse(result.lastEventAt ?? "");
+  return {
+    ...result,
+    supervisorAlive: !terminal(result) && processAlive(result.supervisorPid),
+    childAlive: !terminal(result) && processAlive(result.childPid),
+    eventAgeSeconds: Number.isFinite(last) ? Math.round((Date.now() - last) / 100) / 10 : null,
+  };
+}
+
+async function cancelRun(options) {
+  const root = stateRoot(options);
+  const ids = runIds(options);
+  if (ids.length === 0) fail("cancel requires at least one --run-id");
+  const timeoutSeconds = Number(one(options, "timeout", "15"));
+  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) fail("--timeout must be positive");
+  const reason = redactText(one(options, "reason", "cancel requested")).slice(0, 512);
+  for (const runId of ids) {
+    const directory = runDirectory(root, runId);
+    const result = readJson(join(directory, "result.json"));
+    if (!result) fail(`unknown run: ${runId}`);
+    if (terminal(result)) continue;
+    atomicJson(join(directory, "cancel.json"), { reason, requestedAt: new Date().toISOString() });
+    if (processAlive(result.supervisorPid)) {
+      try { process.kill(result.supervisorPid, "SIGTERM"); } catch {}
+    }
+  }
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  while (Date.now() < deadline) {
+    reconcileVanished(root, ids);
+    if (currentResults(root, ids).every((item) => terminal(item.result))) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  reconcileVanished(root, ids);
+  const results = currentResults(root, ids).map((item) => item.result);
+  const pending = results.filter((result) => !terminal(result)).map((result) => result.runId);
+  if (pending.length > 0) fail(`cancel timed out: ${pending.join(", ")}`, 3);
+  for (const result of results) try { unlinkSync(join(runDirectory(root, result.runId), "cancel.json")); } catch {}
+  const states = new Set(results.map((result) => result.state));
+  const state = states.size === 1 ? results[0].state : "settled";
+  console.log(JSON.stringify({ state, results }));
+  if (results.some((result) => result.state === "failed")) process.exitCode = 3;
 }
 
 function pendingAttention(root, ids) {
@@ -1029,8 +1244,9 @@ async function waitForResults(options) {
   const timeoutSeconds = Number(one(options, "timeout", "0"));
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) fail("--timeout must be zero or positive");
   for (const id of ids) if (!existsSync(runDirectory(root, id))) fail(`unknown run: ${id}`);
+  reconcileVanished(root, ids);
   const allTerminal = () => currentResults(root, ids).every((item) => terminal(item.result));
-  const failedReady = () => currentResults(root, ids).some((item) => item.result?.state === "failed");
+  const failedReady = () => currentResults(root, ids).some((item) => ["failed", "cancelled"].includes(item.result?.state));
   const ready = () => allTerminal() || failedReady();
   const attentionReady = () => pendingAttention(root, ids).length > 0;
   if (!ready() && !attentionReady()) {
@@ -1053,27 +1269,15 @@ async function waitForResults(options) {
         error ? rejectWait(error) : resolveWait();
       }
       function check() {
+        reconcileVanished(root, ids);
         if (ready() || attentionReady()) return finish();
-        for (const item of currentResults(root, ids)) {
-          if (!terminal(item.result) && item.result?.supervisorPid && !processAlive(item.result.supervisorPid)) {
-            if (processAlive(item.result.childPid)) stopPidTree(item.result.childPid, "SIGTERM");
-            atomicJson(join(runDirectory(root, item.runId), "result.json"), {
-              ...item.result,
-              state: "failed",
-              reason: "supervisor exited without a terminal result",
-              exitCode: null,
-              finishedAt: new Date().toISOString(),
-              cleanupRequired: true,
-            });
-            return finish();
-          }
-        }
       }
       check();
     }).catch((error) => fail(error.message, 3));
   }
+  reconcileVanished(root, ids);
   const snapshot = currentResults(root, ids);
-  const failures = snapshot.filter((item) => item.result?.state === "failed");
+  const failures = snapshot.filter((item) => ["failed", "cancelled"].includes(item.result?.state));
   if (failures.length > 0) {
     console.log(JSON.stringify({
       state: "failed",
@@ -1135,7 +1339,8 @@ function status(options) {
   const root = stateRoot(options);
   const ids = runIds(options);
   if (ids.length === 0) fail("status requires at least one --run-id");
-  console.log(JSON.stringify({ runs: currentResults(root, ids) }));
+  reconcileVanished(root, ids);
+  console.log(JSON.stringify({ runs: currentResults(root, ids).map((item) => ({ ...item, result: statusView(item.result) })) }));
 }
 
 const [command, ...argv] = process.argv.slice(2);
@@ -1147,6 +1352,7 @@ const { options, passthrough } = parseArgs(argv);
 if (command === "dispatch") dispatch(options, passthrough);
 else if (command === "continue") continueRun(options, passthrough);
 else if (command === "steer") await steerRun(options, passthrough);
+else if (command === "cancel") await cancelRun(options);
 else if (command === "supervise") await supervise(options, passthrough);
 else if (command === "wait") await waitForResults(options);
 else if (command === "cleanup") cleanup(options);
