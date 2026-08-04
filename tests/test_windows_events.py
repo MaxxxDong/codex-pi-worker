@@ -649,7 +649,7 @@ class WindowsEventTests(unittest.TestCase):
                 self.assertLess(time.perf_counter() - started, 1.0)
                 event = json.loads(stdout)
                 self.assertEqual(event["event"], "attention")
-                self.assertEqual(Path(event["receipt"]), receipt_path)
+                self.assertTrue(Path(event["receipt"]).samefile(receipt_path))
                 self.assertIsNone(other_sleeper.poll())
                 self.assertTrue((root / "pi-attention-delivered-001.json").is_file())
             finally:
