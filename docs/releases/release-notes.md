@@ -1,5 +1,12 @@
 # 发布记录
 
+## v0.1.3 - 2026-08-04
+
+- macOS 多任务 `wait` 改为任一 success、failed、cancelled 或 attention 即返回，不再被最慢 Worker 阻塞；响应同时包含 `results`、`alerts` 与 `pending`。
+- 后续等待只需传入 `pending`，避免短超时健康轮询及重复状态解读。
+- 每个 run 从单一 `waiter.json` 改为独立 waiter 文件，多个 Codex 任务等待同一 Worker 时不会互相覆盖；仍使用原有 POSIX 通知与 15 秒本地兜底，没有新增服务或数据库。
+- 修复多个 Worker 近同时完成时，迟到的第二个 SIGUSR1 可能让 wait 进程无输出退出的竞态。
+
 ## v0.1.2 - 2026-08-04
 
 - macOS 增加单一轻量生命周期状态机和独立活动状态，只描述 Pi Worker 进程，不推断 Codex 任务或线程是否完成。

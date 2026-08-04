@@ -35,6 +35,8 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker cleanup --reviewed yes --run-id RUN_
 
 `result.json` 只有一套轻量生命周期：`starting -> running -> stopping -> finalizing -> success|failed|cancelled`。`activity` 单独表示 `waiting_event`、`waiting_model` 或 `running_tools`；它不判断 Codex 任务是否完成。`status` 会派生进程存活信息并收口所有已消失 supervisor，运行时不需要额外数据库或心跳进程。
 
+`wait` 会在任一 Worker 成功、失败、取消或出现 attention 时立即返回，并同时给出已完成的 `results`、异常 `alerts` 和仍运行的 `pending`。后续只对 `pending` 再执行一次长等待；不要用 1–2 分钟短超时或 `status` 做健康轮询。同一 run 支持多个独立等待者，互不覆盖。
+
 `wait --timeout` 只限制当前等待命令，不会停止 Worker。要终止任务时必须经过 supervisor：
 
 ```bash

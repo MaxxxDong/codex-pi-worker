@@ -420,12 +420,20 @@ function collectTail(stream, onActivity, onAttention) {
 }
 
 function notifyWaiter(directory) {
-  const waiter = readJson(join(directory, "waiter.json"));
-  if (!processAlive(waiter?.pid)) return;
-  try {
-    process.kill(waiter.pid, "SIGUSR1");
-  } catch {
-    // result.json is durable; the fallback check still sees it.
+  const waiters = join(directory, "waiters");
+  if (!existsSync(waiters)) return;
+  for (const name of readdirSync(waiters).filter((entry) => entry.endsWith(".json"))) {
+    const path = join(waiters, name);
+    const waiter = readJson(path);
+    if (!processAlive(waiter?.pid)) {
+      try { unlinkSync(path); } catch {}
+      continue;
+    }
+    try {
+      process.kill(waiter.pid, "SIGUSR1");
+    } catch {
+      // result.json is durable; the fallback check still sees it.
+    }
   }
 }
 
@@ -1245,61 +1253,70 @@ async function waitForResults(options) {
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) fail("--timeout must be zero or positive");
   for (const id of ids) if (!existsSync(runDirectory(root, id))) fail(`unknown run: ${id}`);
   reconcileVanished(root, ids);
-  const allTerminal = () => currentResults(root, ids).every((item) => terminal(item.result));
-  const failedReady = () => currentResults(root, ids).some((item) => ["failed", "cancelled"].includes(item.result?.state));
-  const ready = () => allTerminal() || failedReady();
+  const terminalReady = () => currentResults(root, ids).some((item) => terminal(item.result));
   const attentionReady = () => pendingAttention(root, ids).length > 0;
-  if (!ready() && !attentionReady()) {
+  if (!terminalReady() && !attentionReady()) {
     await new Promise((resolveWait, rejectWait) => {
       let finished = false;
       const fallback = setInterval(check, FALLBACK_MS);
       const timeout = timeoutSeconds > 0 ? setTimeout(() => finish(new Error("wait timed out")), timeoutSeconds * 1000) : null;
       process.on("SIGUSR1", check);
-      for (const id of ids) atomicJson(join(runDirectory(root, id), "waiter.json"), { pid: process.pid, registeredAt: new Date().toISOString() });
+      const waiterPaths = ids.map((id) => {
+        const directory = join(runDirectory(root, id), "waiters");
+        mkdirSync(directory, { recursive: true, mode: 0o700 });
+        const path = join(directory, `${process.pid}.json`);
+        atomicJson(path, { pid: process.pid, registeredAt: new Date().toISOString() });
+        return path;
+      });
       function finish(error = null) {
         if (finished) return;
         finished = true;
-        process.off("SIGUSR1", check);
         clearInterval(fallback);
         if (timeout) clearTimeout(timeout);
-        for (const id of ids) {
-          const path = join(runDirectory(root, id), "waiter.json");
-          if (readJson(path)?.pid === process.pid) try { unlinkSync(path); } catch {}
-        }
+        for (const path of waiterPaths) try { unlinkSync(path); } catch {}
         error ? rejectWait(error) : resolveWait();
       }
       function check() {
+        if (finished) return;
         reconcileVanished(root, ids);
-        if (ready() || attentionReady()) return finish();
+        if (terminalReady() || attentionReady()) return finish();
       }
       check();
     }).catch((error) => fail(error.message, 3));
   }
   reconcileVanished(root, ids);
   const snapshot = currentResults(root, ids);
+  const results = snapshot.filter((item) => terminal(item.result)).map((item) => item.result);
+  const pending = snapshot.filter((item) => !terminal(item.result)).map((item) => item.runId);
   const failures = snapshot.filter((item) => ["failed", "cancelled"].includes(item.result?.state));
+  const alerts = pendingAttention(root, ids);
+  for (const alert of alerts) atomicJson(alert.path, { ...alert.attention, delivered: true, deliveredAt: new Date().toISOString() });
   if (failures.length > 0) {
     console.log(JSON.stringify({
       state: "failed",
-      results: failures.map((item) => item.result),
-      pending: snapshot.filter((item) => !terminal(item.result)).map((item) => item.runId),
+      results,
+      alerts: alerts.map(({ runId, attention }) => ({ runId, ...attention })),
+      pending,
     }));
     process.exitCode = 3;
     return;
   }
-  if (!allTerminal()) {
-    const alerts = pendingAttention(root, ids);
-    for (const alert of alerts) atomicJson(alert.path, { ...alert.attention, delivered: true, deliveredAt: new Date().toISOString() });
+  if (alerts.length > 0 && pending.length > 0) {
     console.log(JSON.stringify({
       state: "attention",
+      results,
       alerts: alerts.map(({ runId, attention }) => ({ runId, ...attention })),
-      pending: snapshot.filter((item) => !terminal(item.result)).map((item) => item.runId),
+      pending,
     }));
     process.exitCode = 4;
     return;
   }
-  const results = snapshot.map((item) => item.result);
-  console.log(JSON.stringify({ state: "settled", results }));
+  console.log(JSON.stringify({
+    state: pending.length > 0 ? "completed" : "settled",
+    results,
+    alerts: alerts.map(({ runId, attention }) => ({ runId, ...attention })),
+    pending,
+  }));
 }
 
 function cleanup(options) {

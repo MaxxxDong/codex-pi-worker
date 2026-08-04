@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
@@ -12,6 +12,28 @@ function command(args, env, allowFailure = false) {
   const result = spawnSync(process.execPath, [events, ...args], { encoding: "utf8", env });
   if (!allowFailure && result.status !== 0) throw new Error(result.stderr || result.stdout);
   return { ...result, json: result.stdout ? JSON.parse(result.stdout) : null };
+}
+
+function commandAsync(args, env) {
+  return new Promise((resolveCommand) => {
+    const child = spawn(process.execPath, [events, ...args], { env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.on("close", (status) => resolveCommand({ status, stderr, json: stdout ? JSON.parse(stdout) : null }));
+  });
+}
+
+function waitAll(ids, env) {
+  const byId = new Map();
+  let pending = ids;
+  while (pending.length > 0) {
+    const waited = command(["wait", ...pending.flatMap((id) => ["--run-id", id]), "--timeout", "10"], env).json;
+    for (const result of waited.results) byId.set(result.runId, result);
+    pending = waited.pending;
+  }
+  return ids.map((id) => byId.get(id));
 }
 
 function testEnv(temporary, launcher) {
@@ -81,7 +103,7 @@ ${successEvents}`);
   }
 });
 
-test("parallel read workers notify once and retain only compact results", () => {
+test("parallel read workers return independently and retain only compact results", () => {
   const temporary = mkdtempSync(join(tmpdir(), "pi-worker-read-"));
   const fake = fakeLauncher(temporary, successEvents);
   const env = testEnv(temporary, fake);
@@ -89,14 +111,55 @@ test("parallel read workers notify once and retain only compact results", () => 
     for (const [id, provider, model] of [["one", "krill-sol", "gpt-5.6-sol"], ["two", "shuaiapi", "gpt-5.6-luna"], ["three", "opencode-go", "deepseek-v4-flash"], ["four", "xai", "grok-4.5"]]) {
       command(["dispatch", "--run-id", id, "--mode", "read", "--workdir", temporary, "--", "--provider", provider, "--model", model], env);
     }
-    const settled = command(["wait", "--run-id", "one", "--run-id", "two", "--run-id", "three", "--run-id", "four", "--timeout", "10"], env).json;
-    assert.deepEqual(settled.results.map((result) => result.state), ["success", "success", "success", "success"]);
-    assert.deepEqual(settled.results.map((result) => result.thinking), ["medium", "xhigh", "max", "high"]);
-    assert.ok(settled.results.every((result) => result.finalText === "DONE"));
+    const results = waitAll(["one", "two", "three", "four"], env);
+    assert.deepEqual(results.map((result) => result.state), ["success", "success", "success", "success"]);
+    assert.deepEqual(results.map((result) => result.thinking), ["medium", "xhigh", "max", "high"]);
+    assert.ok(results.every((result) => result.finalText === "DONE"));
     assert.ok(!existsSync(join(env.PI_WORKER_STATE_ROOT, "one", "worker.jsonl")));
     assert.ok(!existsSync(join(env.PI_WORKER_STATE_ROOT, "one", "worker.stderr")));
     command(["cleanup", "--reviewed", "yes", "--run-id", "one", "--run-id", "two", "--run-id", "three", "--run-id", "four"], env);
     assert.ok(!existsSync(join(env.PI_WORKER_STATE_ROOT, "one")));
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("wait returns when one run succeeds while peers continue", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-success-fast-"));
+  const fake = fakeLauncher(temporary, `
+const prompt = process.argv.at(-1);
+await new Promise((resolve) => setTimeout(resolve, prompt === "fast" ? 100 : 1200));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "fast-success", "--workdir", temporary, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash", "fast"], env);
+    command(["dispatch", "--run-id", "slow-success", "--workdir", temporary, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash", "slow"], env);
+    const started = Date.now();
+    const first = command(["wait", "--run-id", "fast-success", "--run-id", "slow-success", "--timeout", "10"], env).json;
+    assert.equal(first.state, "completed");
+    assert.deepEqual(first.results.map((result) => result.runId), ["fast-success"]);
+    assert.deepEqual(first.pending, ["slow-success"]);
+    assert.ok(Date.now() - started < 1000);
+    assert.equal(command(["wait", "--run-id", "slow-success", "--timeout", "10"], env).json.state, "settled");
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("independent waiters on the same run are both notified", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-multi-waiter-"));
+  const fake = fakeLauncher(temporary, `
+await new Promise((resolve) => setTimeout(resolve, 500));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "shared", "--workdir", temporary, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash", "task"], env);
+    const args = ["wait", "--run-id", "shared", "--timeout", "3"];
+    const [first, second] = await Promise.all([commandAsync(args, env), commandAsync(args, env)]);
+    assert.equal(first.status, 0, first.stderr);
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(first.json.results[0].state, "success");
+    assert.equal(second.json.results[0].state, "success");
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -666,7 +729,7 @@ console.log(JSON.stringify({type:"agent_settled"}));`);
   const env = testEnv(temporary, fake);
   try {
     for (const id of ["cache-a", "cache-b"]) command(["dispatch", "--run-id", id, "--workdir", temporary, "--", "--provider", "krill-sol", "--model", "gpt-5.6-sol"], env);
-    const results = command(["wait", "--run-id", "cache-a", "--run-id", "cache-b", "--timeout", "10"], env).json.results;
+    const results = waitAll(["cache-a", "cache-b"], env);
     assert.equal(results[0].finalText, results[1].finalText);
     const paths = JSON.parse(results[0].finalText);
     assert.equal(paths.npm, join(temporary, ".npm"));

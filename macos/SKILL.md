@@ -13,7 +13,7 @@ Use `/Users/max/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `p
 - Write tasks use `--mode write --source`; the runner creates a lightweight detached Git worktree and carries the source's tracked dirty and non-ignored untracked files into its baseline. Dirty state is not a startup gate.
 - Worker instructions keep writes inside the current worktree or run-local `TMPDIR`; external paths remain readable when the task needs references.
 - Use `--mode in-place --workdir` only when direct writes are intentional. Never overlap writers in one directory.
-- Root may dispatch up to 10 independent Workers. One `wait` handles all run IDs and returns on attention, the first failure, or all-success completion; do not poll `status`. After attention or failure, handle the returned item and immediately call `wait` again for every ID in `pending` so the remaining Workers keep event-driven supervision.
+- Root may dispatch up to 10 independent Workers. One `wait` handles all run IDs and returns when any run succeeds, fails, is cancelled, or raises attention. Process `results` and `alerts`, then immediately call one new long `wait` with only the IDs in `pending`; do not poll `status` or use short wait timeouts as health checks. Independent Codex tasks may wait on the same run without overwriting each other.
 - `result.json.state` follows one lifecycle only: `starting -> running -> stopping -> finalizing -> success|failed|cancelled`. `activity` is independent and may be `waiting_event`, `waiting_model`, or `running_tools`; `activeTools` contains at most ten tool names/IDs and never arguments. These fields describe the Pi process, not whether the surrounding Codex task is complete.
 - Worker completion freezes `result.json`, optional `changes.patch`, and failure-only `failure.log`. Raw streaming JSONL is not retained.
 - Completion and later dispatches never delete a result-bearing run automatically. Codex reviews the result and patch first, then runs `cleanup --reviewed yes` to delete the run, session, and managed worktree.
@@ -45,6 +45,7 @@ $PI_WORKER dispatch --run-id docs-review --mode read --workdir /absolute/repo \
   --capability docs -- --provider krill-sol --model gpt-5.6-sol \
   "Verify against current library documentation."
 
+# Returns on the first terminal/attention event; repeat only with `pending` IDs.
 $PI_WORKER wait --run-id review-1 --run-id fix-1 --timeout 86400
 
 # Cancel through the supervisor so evidence and cleanup remain consistent.

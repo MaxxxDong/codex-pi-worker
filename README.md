@@ -85,6 +85,7 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker profiles
 
 ### 2026-08-04
 
+- macOS v0.1.3 的批量 `wait` 在任一 Worker 完成、失败或异常时立即返回 `results/alerts/pending`，不再等待最慢任务；多个对话也可独立等待同一 run。
 - macOS v0.1.2 用单一轻量状态机明确 `starting/running/stopping/finalizing/terminal`，活动与进程存活信息保持独立，不扩展到业务任务或 Codex 线程判断。
 - 新增 supervisor 管理的取消命令；`status`/`wait` 能批量收口 supervisor 异常消失的运行，事件等待的本地兜底缩短到 15 秒。
 - 工具活动与续跑历史改为有界紧凑摘要，保留诊断所需的 reason、attention、模型和 usage，不保存工具参数或重复调用明细。
