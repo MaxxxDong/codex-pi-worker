@@ -71,12 +71,11 @@ python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\watch_pi_worker.py" `
 
 ## 最新更新
 
-### 2026-08-03
+### 2026-08-04
 
-- 切换为 Pi 原生 RPC，支持运行中 steer、accepted 回执和多次异常 attention。
-- 连续工具失败、自动重试失败、扩展/压缩错误会提前唤醒；RPC 退出会排空 stdout，避免 Windows EPIPE。
-- finalize 后会同步关闭 `reviewRequired` 与 `continuationAvailable`，避免已清理任务仍被误判为可审核或可续跑。
-- Worker 对不确定路径先执行 `find`/`grep`，减少根据 Kotlin/Java 符号名猜错文件路径的无效调用。
+- 修复 MSYS 工作树路径和 Gradle 文件名造成的 guard 误拦截。
+- 增加 receipt 绑定的安全取消；取消后保留结果、session 和 worktree，等待 Codex 审核再清理。
+- watch 返回 runtime job 的事实状态；重复工具错误直接携带最近三条脱敏摘要。
 
 完整记录见 [发布记录](docs/releases/release-notes.md)。
 

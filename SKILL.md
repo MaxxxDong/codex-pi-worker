@@ -39,6 +39,9 @@ python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\steer_pi_worker.py" `
   C:\absolute\evidence\pi-receipt.json --message-file C:\absolute\correction.md
 ```
 
+To stop a bad run, use `cancel_pi_worker.py <receipt>` and then watch once for
+the reviewable `cancelled` result. Never kill the PID directly.
+
 A terminal result needs Codex review. For a correction after terminal, reuse the
 same session and worktree:
 

@@ -90,6 +90,29 @@ test("keeps mutation and execution paths inside the execution worktree", () => {
   assert.equal(evaluateToolCall("bash", { command: `rg TODO "${p.home}"` }, p), null);
 });
 
+test("accepts MSYS paths that resolve inside the Windows worktree", { skip: process.platform !== "win32" }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
+  const p = policy(root);
+  fs.mkdirSync(p.cwd, { recursive: true });
+  const msysCwd = `/${p.cwd[0].toLowerCase()}${p.cwd.slice(2).replaceAll("\\", "/")}`;
+
+  assert.equal(evaluateToolCall("bash", { command: `cd "${msysCwd}" && ./gradlew test` }, p), null);
+});
+
+test("does not treat build filenames as executable commands", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
+  const p = policy(root);
+  const outside = path.join(root, "toolchain");
+  fs.mkdirSync(p.cwd, { recursive: true });
+  fs.mkdirSync(path.join(outside, "gradle", "wrapper"), { recursive: true });
+
+  assert.equal(evaluateToolCall("bash", { command: `cat "${path.join(outside, "build.gradle.kts")}"` }, p), null);
+  assert.equal(evaluateToolCall("bash", { command: `ls "${path.join(outside, "gradle", "wrapper")}"` }, p), null);
+  assert.equal(evaluateToolCall("bash", { command: `cat "${path.join(outside, "copy.txt")}"` }, p), null);
+  assert.match(evaluateToolCall("bash", { command: `node "${path.join(outside, "check.mjs")}"` }, p), /outside/i);
+  assert.match(evaluateToolCall("bash", { command: `cp "${path.join(outside, "copy.txt")}" .` }, p), /outside/i);
+});
+
 test("allows shell syntax that is not an outside path", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
   const p = policy(root);

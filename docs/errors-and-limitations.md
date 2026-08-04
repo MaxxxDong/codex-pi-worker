@@ -15,6 +15,8 @@
 
 续跑输出位于 `turns/turn-NNN/`，但 owner receipt 仍是首轮的 `pi-receipt.json`。不要只看首轮 `pi-result.json` 判断最新状态；应从 owner receipt 的 `latestReceiptPath` 继续追踪。
 
+receipt 中的 `status=running` 是启动时快照，不会持续同步；不要用它判断 Worker 是否仍存活。`watch_pi_worker.py` 返回的 `lifecycleState` 来自 `C:\piw\jobs`，才是运行、待审核、异常或已清理状态。需要停止时使用 receipt 绑定的 `cancel_pi_worker.py`，不要直接杀 PID。
+
 常用 PowerShell 检查：
 
 ```powershell

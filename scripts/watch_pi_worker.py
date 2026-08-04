@@ -38,6 +38,17 @@ def latest_receipt(path: Path) -> tuple[Path, dict[str, object]]:
     return latest_path, read_json(latest_path)
 
 
+def lifecycle_state(receipt: dict[str, object]) -> str | None:
+    try:
+        owner_path = receipt.get("ownerReceiptPath")
+        owner = read_json(Path(str(owner_path)).resolve()) if owner_path else receipt
+        root = Path(str(owner["runtimeRoot"])).resolve()
+        job = read_json(root / "jobs" / f"{owner['runId']}.json")
+        return str(job["state"])
+    except (KeyError, OSError, ValueError):
+        return None
+
+
 def terminal(receipt_path: Path, receipt: dict[str, object]) -> dict[str, object] | None:
     result_path = Path(str(receipt["resultPath"]))
     if not result_path.is_file():
@@ -46,6 +57,7 @@ def terminal(receipt_path: Path, receipt: dict[str, object]) -> dict[str, object
         "event": "terminal",
         "receipt": str(receipt_path),
         "result": read_json(result_path),
+        "lifecycleState": lifecycle_state(receipt),
         "watchDeliveryLatencySeconds": round(max(0.0, time.time() - result_path.stat().st_mtime), 3),
     }
 
@@ -65,6 +77,7 @@ def attention(receipt_path: Path, receipt: dict[str, object]) -> dict[str, objec
         "event": "attention",
         "receipt": str(receipt_path),
         "attention": payload,
+        "lifecycleState": lifecycle_state(receipt),
         "evidence": str(delivered),
     }
 
@@ -98,6 +111,7 @@ def orphaned(receipt_path: Path, receipt: dict[str, object]) -> dict[str, object
             "runtimeStderr": str(output_dir / "runtime.stderr.log"),
         },
         "runtimeReconciliation": reconciliation,
+        "lifecycleState": reconciliation["state"] if reconciliation else "orphaned",
     }
 
 

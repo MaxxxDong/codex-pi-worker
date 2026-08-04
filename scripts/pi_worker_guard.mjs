@@ -47,7 +47,12 @@ const DISK_DESTRUCTION = [
   /\bdiskpart(?:\.exe)?\b/i,
 ];
 
-const MUTATION_OR_EXECUTION = /\b(?:rm|remove-item|del|erase|rd|rmdir|mv|move|cp|copy|touch|mkdir|new-item|set-content|add-content|out-file|tee|sed\s+-i|git\s+(?:add|apply|checkout|restore|reset|clean|commit)|python|py|node|npm|npx|pnpm|yarn|uv|pip|pytest|cargo|gradle|gradlew|mvn|dotnet)\b|(?:^|[^<])>{1,2}(?!>)/i;
+const MUTATION = /(?:^|[\s;&|()])(?:(?:rm|remove-item|del|erase|rd|rmdir|mv|move|cp|copy|touch|mkdir|new-item|set-content|add-content|out-file|tee)(?:\.exe|\.cmd|\.bat)?(?=$|[\s;&|()])|sed\s+-i\b|git(?:\.exe)?\s+(?:add|apply|checkout|restore|reset|clean|commit)\b)|(?:^|[^<])>{1,2}(?!>)/i;
+const EXECUTION = /(?:^|[\s;&|()])(?:"?[^"'\s;&|()<>]*[\\/])?(?:python|py|node|npm|npx|pnpm|yarn|uv|pip|pytest|cargo|gradle|gradlew|mvn|dotnet)(?:\.exe|\.cmd|\.bat)?"?(?=$|[\s;&|()])/i;
+
+function mutatesOrExecutes(command) {
+  return MUTATION.test(command) || EXECUTION.test(command);
+}
 
 function outsideExecutionCwd(command, cwd) {
   const tokens = command.match(/"(?:\\.|[^"])*"|'[^']*'|[^\s;&|<>]+/g) || [];
@@ -57,7 +62,9 @@ function outsideExecutionCwd(command, cwd) {
     if (equals >= 0) token = token.slice(equals + 1);
     const previous = (tokens[index - 1] || "").replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/, "$1$2");
     if (/^(?:\\|\/dev\/null|nul)$/i.test(token) || (token === "/" && previous === "tr")) return false;
-    const absolute = path.isAbsolute(token) || path.win32.isAbsolute(token);
+    const msys = process.platform === "win32" && /^\/[a-z](?:\/|$)/i.test(token);
+    if (msys) token = `${token[1]}:${token.slice(2)}`;
+    const absolute = msys || path.isAbsolute(token) || path.win32.isAbsolute(token);
     const traverses = /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(token);
     return (absolute || traverses) && !isInside(path.resolve(cwd, token), cwd);
   });
@@ -133,11 +140,11 @@ export function evaluateToolCall(toolName, input = {}, policy = {}) {
   const protectedReference = referenced(command, sourceCwd)
     || referenced(command, home)
     || /(?:\$HOME|%USERPROFILE%|\$env:USERPROFILE)/i.test(command);
-  if (protectedReference && MUTATION_OR_EXECUTION.test(command)) {
+  if (protectedReference && mutatesOrExecutes(command)) {
     return "Blocked mutation or command execution against source checkout/home; read-only inspection is allowed";
   }
   // This is a narrow policy guard for obvious paths, not an OS sandbox or shell parser.
-  if (MUTATION_OR_EXECUTION.test(command) && outsideExecutionCwd(command, cwd)) {
+  if (mutatesOrExecutes(command) && outsideExecutionCwd(command, cwd)) {
     return "Blocked mutation or command execution outside the execution worktree";
   }
   return null;

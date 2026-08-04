@@ -1,5 +1,11 @@
 # 发布记录
 
+### 2026-08-04
+
+- 修复 Windows/MSYS `/c/...` 工作树路径被误判为越界，以及 `build.gradle.kts`、`gradle/wrapper` 等只读路径被误判为执行命令。
+- 增加 receipt 绑定的命名事件取消：runner 自行终止进程树、写 `cancelled` 结果并保留候选，等待 Codex 审核后再清理。
+- watch 明确返回 runtime job 的 `lifecycleState`；连续工具错误 attention 附带最近三条限长脱敏摘要，减少再次读取大日志。
+
 ### 2026-08-03
 
 - 后台传输切换为 Pi 0.83 原生 RPC，增加 receipt 绑定的运行中 `steer` 与 accepted 回执。

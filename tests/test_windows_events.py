@@ -448,10 +448,98 @@ class WindowsEventTests(unittest.TestCase):
             )
 
             self.assertEqual(watched.returncode, 0, watched.stderr)
-            self.assertEqual(json.loads(watched.stdout)["event"], "orphaned")
+            orphan = json.loads(watched.stdout)
+            self.assertEqual(orphan["event"], "orphaned")
+            self.assertEqual(orphan["lifecycleState"], "orphaned")
             job = json.loads((runtime / "jobs" / f"{run_id}.json").read_text(encoding="utf-8"))
             self.assertEqual(job["state"], "orphaned")
             self.assertFalse((runtime / "active" / f"{run_id}.json").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows integration test")
+    def test_receipt_bound_cancel_preserves_review_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            source = root / "source"
+            output = root / "output"
+            fake_bin.mkdir()
+            source.mkdir()
+            prompt = root / "task.md"
+            prompt.write_text("test", encoding="utf-8")
+            fake = fake_bin / "fake_pi.py"
+            fake.write_text("import time; time.sleep(30)\n", encoding="utf-8")
+            (fake_bin / "pi.cmd").write_text(
+                f'@echo off\r\n"{sys.executable}" "{fake}" %*\r\n',
+                encoding="utf-8",
+            )
+            runtime = root / "runtime"
+            env = {
+                **os.environ,
+                "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                "PI_WORKER_ROOT": str(runtime),
+                "PI_WORKER_DISABLE_CACHE_GC": "1",
+                "PYTHONIOENCODING": "utf-8",
+            }
+            started = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "start_pi_worker.py"),
+                    "--cwd",
+                    str(source),
+                    "--prompt-file",
+                    str(prompt),
+                    "--mode",
+                    "analysis",
+                    "--output-dir",
+                    str(output),
+                    "--timeout-seconds",
+                    "30",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False,
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+
+            cancelled = subprocess.run(
+                [sys.executable, str(SCRIPTS / "cancel_pi_worker.py"), str(output / "pi-receipt.json")],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False,
+            )
+            self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
+            self.assertEqual(json.loads(cancelled.stdout)["event"], "cancel_requested")
+
+            watched = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "watch_pi_worker.py"),
+                    str(output / "pi-receipt.json"),
+                    "--timeout-seconds",
+                    "10",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False,
+            )
+            self.assertEqual(watched.returncode, 0, watched.stderr)
+            terminal = json.loads(watched.stdout)
+            self.assertEqual(terminal["event"], "terminal")
+            self.assertEqual(terminal["result"]["status"], "cancelled")
+            self.assertEqual(terminal["result"]["stopReason"], "cancelled")
+            self.assertEqual(terminal["lifecycleState"], "pending_review")
+            self.assertTrue((output / "pi-result.json").is_file())
+            self.assertTrue(Path(terminal["result"]["sessionDir"]).is_dir())
+            self.assertFalse((runtime / "active" / f"{terminal['result']['runId']}.json").exists())
 
     @unittest.skipUnless(os.name == "nt", "Windows integration test")
     def test_start_rolls_back_when_receipt_write_fails(self) -> None:

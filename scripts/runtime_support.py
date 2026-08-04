@@ -19,6 +19,7 @@ CACHE_CHECK_INTERVAL_SECONDS = 3600
 RUN_TEMP_STALE_SECONDS = 3600
 JOB_HISTORY_RETENTION_SECONDS = 7 * 24 * 3600
 ATTENTION_EVENT_PREFIX = r"Local\pi-worker-attention-"
+CANCEL_EVENT_PREFIX = r"Local\pi-worker-cancel-"
 STEER_EVENT_PREFIX = r"Local\pi-worker-steer-"
 STEER_ACK_EVENT_PREFIX = r"Local\pi-worker-steer-ack-"
 DEFAULT_PROVIDER = "opencode-go"
@@ -99,6 +100,10 @@ def emit_json(value: dict[str, object]) -> None:
 
 def attention_event_name(run_id: str) -> str:
     return f"{ATTENTION_EVENT_PREFIX}{run_id}"
+
+
+def cancel_event_name(run_id: str) -> str:
+    return f"{CANCEL_EVENT_PREFIX}{run_id}"
 
 
 def steer_event_name(run_id: str) -> str:

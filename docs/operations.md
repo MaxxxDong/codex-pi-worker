@@ -59,7 +59,15 @@ python scripts\steer_pi_worker.py `
 
 命令只接受当前 latest receipt，等待 Pi 返回 accepted 回执，不记录消息正文。收到回执后继续 watch 同一 owner receipt。当前跨进程投递使用 Windows named event；若本轮已 terminal，应改用 continuation。
 
-### 5. 同任务续跑
+### 5. 主动取消
+
+```powershell
+python scripts\cancel_pi_worker.py C:\absolute\evidence\pi-receipt.json
+```
+
+取消请求只作用于 receipt 当前拥有的 run。runner 自己终止 Pi 进程树并写 `status=cancelled`，worktree、session 和 result 保留给 Codex 审核；随后继续 watch，审核后再 finalize。不要直接按 receipt PID 执行 `taskkill`。
+
+### 6. 同任务续跑
 
 ```powershell
 python scripts\continue_pi_worker.py `
@@ -69,7 +77,7 @@ python scripts\continue_pi_worker.py `
 
 continuation 复用同一 session 和 implementation worktree，证据写入 `turns\turn-NNN`。并发申请同一 owner receipt 的下一 turn 会被 runtime lock 拒绝。
 
-### 6. 审核后 finalize
+### 7. 审核后 finalize
 
 接受且已把改动应用/提交到正式工作树：
 
@@ -103,6 +111,8 @@ python scripts\finalize_pi_worker.py `
 | `pi-attention*.json` | 按序号保存的运行中错误通知及已投递证据 |
 
 这些文件可能含源码、绝对路径和模型输出，不应上传公共 issue 或仓库。
+
+receipt 是启动和所有权凭据，不是生命周期真相源；其中早期的 `status=running` 只是启动快照。以 watch 返回的 `lifecycleState` 和 runtime job 为准，持续态只有 `starting`、`running`、`pending_review`、`settled`，异常进程为 `orphaned`；`attention` 是事件，`cancelled` 是 result 的执行结果。
 
 ## 成功判定
 

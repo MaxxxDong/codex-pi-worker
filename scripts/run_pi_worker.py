@@ -14,6 +14,7 @@ import sys
 import time
 import traceback
 import uuid
+from collections import deque
 from pathlib import Path
 from threading import Condition, Event, Lock, Thread
 
@@ -24,6 +25,7 @@ from runtime_support import (
     MODEL_CHOICES,
     PROVIDER_MODELS,
     atomic_json,
+    cancel_event_name,
     close_windows_handle,
     create_attention_event,
     emit_json,
@@ -69,6 +71,11 @@ def redact_credentials(raw: bytes) -> bytes:
     return CREDENTIAL_PATTERNS[2].sub(b"[REDACTED]", redacted)
 
 
+def tool_error_summary(event: dict[str, object]) -> str:
+    encoded = redact_credentials(json.dumps(event.get("result"), ensure_ascii=False, default=str).encode("utf-8"))
+    return encoded[:MAX_TOOL_ERROR_BYTES].decode("utf-8", errors="ignore")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cwd", type=Path, required=True)
@@ -106,6 +113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-index", type=int, default=1)
     parser.add_argument("--allow-existing-changes", action="store_true")
     parser.add_argument("--attention-event-name", default=None)
+    parser.add_argument("--cancel-event-name", default=None)
     parser.add_argument("--steer-event-name", default=None)
     parser.add_argument("--steer-queue-dir", type=Path, default=None)
     parser.add_argument("--launch-gated", action="store_true")
@@ -190,10 +198,7 @@ def compact_event(raw: bytes) -> bytes | None:
             "isError": bool(event.get("isError")),
         }
         if compact["isError"]:
-            encoded = redact_credentials(
-                json.dumps(event.get("result"), ensure_ascii=False, default=str).encode("utf-8")
-            )
-            compact["errorSummary"] = encoded[:MAX_TOOL_ERROR_BYTES].decode("utf-8", errors="ignore")
+            compact["errorSummary"] = tool_error_summary(event)
     elif event_type == "message_end":
         message = event.get("message") or {}
         if message.get("role") != "assistant":
@@ -442,6 +447,8 @@ def main(args: argparse.Namespace | None = None) -> int:
         or args.steer_event_name != steer_event_name(run_id)
     ):
         raise SystemExit("steer control path does not match the current run")
+    if args.cancel_event_name and args.cancel_event_name != cancel_event_name(run_id):
+        raise SystemExit("cancel event does not match the current run")
     if not cwd.is_dir():
         raise SystemExit(f"cwd is not a directory: {cwd}")
     if not prompt_file.is_file():
@@ -461,6 +468,7 @@ def main(args: argparse.Namespace | None = None) -> int:
     result_path = output_dir / "pi-result.json"
     attention_path = output_dir / "pi-attention.json"
     attention_handle = create_attention_event(args.attention_event_name) if args.attention_event_name else None
+    cancel_handle = create_attention_event(args.cancel_event_name) if args.cancel_event_name else None
     attention_lock = Lock()
     attention_times: dict[str, float] = {}
     attention_sequence = 0
@@ -470,6 +478,7 @@ def main(args: argparse.Namespace | None = None) -> int:
     stderr_log_truncated = False
     oversize_event_count = 0
     reasoning_ignored_seen = False
+    recent_tool_errors: deque[str] = deque(maxlen=3)
 
     def notify_attention(category: str) -> None:
         nonlocal attention_sequence
@@ -480,17 +489,17 @@ def main(args: argparse.Namespace | None = None) -> int:
                 return
             attention_sequence += 1
             attention_times[category] = now
-            atomic_json(
-                attention_path,
-                {
-                    "runId": run_id,
-                    "sequence": attention_sequence,
-                    "category": category,
-                    "message": "Pi worker reported a runtime/provider error; inspect the redacted evidence log.",
-                    "at": utc_now(),
-                    "stderr": str(stderr_path),
-                },
-            )
+            payload: dict[str, object] = {
+                "runId": run_id,
+                "sequence": attention_sequence,
+                "category": category,
+                "message": "Pi worker reported a runtime/provider error; inspect the redacted evidence log.",
+                "at": utc_now(),
+                "stderr": str(stderr_path),
+            }
+            if category == "repeated_tool_errors":
+                payload["recentToolErrors"] = list(recent_tool_errors)
+            atomic_json(attention_path, payload)
             set_attention_event(attention_handle)
 
     enabled_tools = ANALYSIS_TOOLS if args.mode == "analysis" else BASE_TOOLS
@@ -556,6 +565,7 @@ def main(args: argparse.Namespace | None = None) -> int:
 
     started = time.perf_counter()
     timeout_event = Event()
+    cancelled_event = Event()
     process_done = Event()
     steer_stop = Event()
     activity = Condition()
@@ -575,6 +585,7 @@ def main(args: argparse.Namespace | None = None) -> int:
     cache_status: dict[str, object] = {}
     run_temp_cleanup: dict[str, object] = {"status": "pending"}
     steer_handle: int | None = None
+    cancel_thread: Thread | None = None
     try:
         with events_path.open("wb") as events_file, stderr_path.open("wb") as stderr_file:
             if steer_queue_dir:
@@ -593,6 +604,17 @@ def main(args: argparse.Namespace | None = None) -> int:
             )
             assert process.stdin is not None and process.stdout is not None and process.stderr is not None
             stdin_lock = Lock()
+
+            def watch_cancel() -> None:
+                assert cancel_handle is not None
+                wait_windows_event(cancel_handle)
+                if not process_done.is_set():
+                    cancelled_event.set()
+                    terminate_process_tree(process)
+
+            if cancel_handle is not None:
+                cancel_thread = Thread(target=watch_cancel, name=f"pi-cancel-{run_id}", daemon=True)
+                cancel_thread.start()
 
             def send_rpc(command_value: dict[str, object]) -> None:
                 encoded = (json.dumps(command_value, ensure_ascii=False) + "\n").encode("utf-8")
@@ -729,6 +751,8 @@ def main(args: argparse.Namespace | None = None) -> int:
                     }:
                         mark_activity()
                     if event_type == "tool_execution_end":
+                        if event.get("isError"):
+                            recent_tool_errors.append(tool_error_summary(event))
                         consecutive_tool_errors = consecutive_tool_errors + 1 if event.get("isError") else 0
                         if consecutive_tool_errors >= 3:
                             notify_attention("repeated_tool_errors")
@@ -777,6 +801,10 @@ def main(args: argparse.Namespace | None = None) -> int:
             finally:
                 process_done.set()
                 steer_stop.set()
+                if cancel_handle is not None:
+                    set_attention_event(cancel_handle)
+                if cancel_thread:
+                    cancel_thread.join(timeout=2)
                 if steer_handle is not None:
                     set_attention_event(steer_handle)
                 with activity:
@@ -784,6 +812,7 @@ def main(args: argparse.Namespace | None = None) -> int:
                 watchdog.join(timeout=1)
     finally:
         close_windows_handle(steer_handle)
+        close_windows_handle(cancel_handle)
         close_windows_handle(attention_handle)
         try:
             run_temp_cleanup = cleanup_run_temp(runtime, run_id)
@@ -791,6 +820,7 @@ def main(args: argparse.Namespace | None = None) -> int:
             cache_status = release_cache(runtime, run_id)
 
     timed_out = timeout_event.is_set()
+    cancelled = cancelled_event.is_set()
 
     parsed = parse_events(events_path)
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
@@ -804,6 +834,7 @@ def main(args: argparse.Namespace | None = None) -> int:
     completed = (
         exit_code == 0
         and not timed_out
+        and not cancelled
         and parsed["agentSettled"]
         and parsed["provider"] == args.provider
         and parsed["model"] == args.model
@@ -815,7 +846,7 @@ def main(args: argparse.Namespace | None = None) -> int:
     cache_gc_scheduled = bool(cache_status.get("gcEligible")) and schedule_cache_gc(runtime)
     result = {
         "runId": run_id,
-        "status": "completed" if completed else "failed",
+        "status": "cancelled" if cancelled else ("completed" if completed else "failed"),
         "mode": args.mode,
         "provider": parsed["provider"],
         "model": parsed["model"],
@@ -827,7 +858,7 @@ def main(args: argparse.Namespace | None = None) -> int:
         "timedOut": timed_out,
         "timeoutMode": "idle",
         "elapsedSeconds": round(time.perf_counter() - started, 3),
-        "stopReason": parsed["stopReason"],
+        "stopReason": "cancelled" if cancelled else parsed["stopReason"],
         "reasoningWarning": reasoning_warning,
         "evidenceTruncated": (
             event_log_truncated
