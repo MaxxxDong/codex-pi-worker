@@ -2,7 +2,7 @@
 set -euo pipefail
 
 case "${1:-}" in
-  dispatch|continue|steer|wait|cleanup|status|cache-status|profiles|help|--help|-h)
+  dispatch|continue|steer|cancel|wait|cleanup|status|cache-status|profiles|help|--help|-h)
     skill_root="${0:A:h:h}"
     exec "$HOME/.local/node-lts/bin/node" \
       "$skill_root/lib/events.mjs" "$@"

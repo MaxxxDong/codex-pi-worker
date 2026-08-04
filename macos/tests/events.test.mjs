@@ -241,6 +241,11 @@ test("dispatch requires a supported explicit model and Grok stays high", () => {
     const deepseek = command(["dispatch", "--run-id", "deepseek-low", "--workdir", temporary, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash", "--thinking", "low"], env, true);
     assert.equal(deepseek.status, 2);
     assert.match(deepseek.stderr, /one of: high, max/);
+    for (const [runId, provider, model] of [["official-low", "deepseek", "deepseek-v4-flash"], ["edge-low", "edgefn", "DeepSeek-V4-Flash-0731"]]) {
+      const result = command(["dispatch", "--run-id", runId, "--workdir", temporary, "--", "--provider", provider, "--model", model, "--thinking", "low"], env, true);
+      assert.equal(result.status, 2);
+      assert.match(result.stderr, /one of: high, max/);
+    }
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -658,6 +663,13 @@ test("the public wrapper executes its adjacent staged runtime", () => {
     assert.match(help.stdout, /--capability/);
     const profiles = spawnSync(join(root, "bin", "pi-worker"), ["profiles"], { encoding: "utf8" });
     assert.ok(JSON.parse(profiles.stdout).models.some((profile) => profile.id === "opencode-go/deepseek-v4-flash"));
+    const cancel = spawnSync(join(root, "bin", "pi-worker"), ["cancel", "--run-id", "missing"], {
+      encoding: "utf8",
+      env: { ...process.env, PI_WORKER_STATE_ROOT: temporary },
+    });
+    assert.equal(cancel.status, 2);
+    assert.match(cancel.stderr, /unknown run/);
+    assert.doesNotMatch(cancel.stderr, /startup session lookup/);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }

@@ -38,6 +38,8 @@ const AGENT_PROFILE_FILES = ["auth.json", "models.json", "models-store.json", "s
 const OPTIONAL_PACKAGES = ["@upstash/context7-pi", "context-mode", "pi-lens", "pi-playwright"];
 const PROFILES = new Map([
   ["opencode-go/deepseek-v4-flash", { defaultThinking: "max", allowed: ["high", "max"] }],
+  ["deepseek/deepseek-v4-flash", { defaultThinking: "max", allowed: ["high", "max"] }],
+  ["edgefn/DeepSeek-V4-Flash-0731", { defaultThinking: "max", allowed: ["high", "max"] }],
   ["xai/grok-4.5", { defaultThinking: "high", allowed: ["low", "medium", "high"] }],
   ["krill/grok-4.5", { defaultThinking: "high", allowed: ["high"] }],
   ["shuaiapi-grok/grok-4.5", { defaultThinking: "high", allowed: ["high"] }],
