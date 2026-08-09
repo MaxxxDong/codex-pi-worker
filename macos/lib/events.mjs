@@ -28,6 +28,7 @@ const DEFAULT_ROOT = join(tmpdir(), `pi-worker-${process.getuid?.() ?? "user"}`)
 const FALLBACK_MS = 15_000;
 const CACHE_MAX_BYTES = 20 * 1024 * 1024 * 1024;
 const CACHE_STALE_MS = 90 * 24 * 60 * 60 * 1000;
+const CACHE_GC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const FAILURE_TAIL_BYTES = 64 * 1024;
 const TOOL_ERROR_BYTES = 2 * 1024;
 const STEER_MAX_BYTES = 16 * 1024;
@@ -36,6 +37,7 @@ const READ_TOOLS = ["read", "bash", "grep", "find", "ls", "web_search"];
 const READ_ONLY_PROMPT = "This is a read-only task. Do not modify repository files. Use bash only for inspection or commands known not to write project files.";
 const AGENT_PROFILE_FILES = ["auth.json", "models.json", "models-store.json", "settings.json"];
 const OPTIONAL_PACKAGES = ["@upstash/context7-pi", "context-mode", "pi-lens", "pi-playwright"];
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const PROFILES = new Map([
   ["opencode-go/deepseek-v4-flash", { defaultThinking: "max", allowed: ["high", "max"] }],
   ["deepseek/deepseek-v4-flash", { defaultThinking: "max", allowed: ["high", "max"] }],
@@ -185,10 +187,11 @@ function applyDispatchProfile(piArgs) {
   if (!provider || !model) fail("dispatch requires explicit --provider, --model");
   const key = `${provider}/${model}`;
   const profile = PROFILES.get(key);
-  if (!profile) fail(`unsupported Pi Worker profile: ${key}`);
   const supplied = piOptionValues(piArgs, "thinking");
-  const thinking = supplied.at(-1) ?? profile.defaultThinking;
-  if (!profile.allowed.includes(thinking)) {
+  const thinking = supplied.at(-1) ?? profile?.defaultThinking;
+  if (!thinking) fail(`unknown Pi Worker profile ${key} requires explicit --thinking`);
+  if (!THINKING_LEVELS.includes(thinking)) fail(`thinking must be one of: ${THINKING_LEVELS.join(", ")}`);
+  if (profile && !profile.allowed.includes(thinking)) {
     fail(`${key} thinking must be one of: ${profile.allowed.join(", ")}`);
   }
   return {
@@ -538,8 +541,8 @@ function cacheGc(root) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const receiptPath = join(root, ".cache-gc.json");
   const previous = readJson(receiptPath);
-  if (previous && Date.now() - Date.parse(previous.checkedAt) < 60 * 60 * 1000) {
-    return { skipped: "checked within the last hour", ...previous };
+  if (previous && Date.now() - Date.parse(previous.checkedAt) < CACHE_GC_INTERVAL_MS) {
+    return { skipped: "checked within the last day", ...previous };
   }
   const lock = join(root, ".cache-gc.lock");
   let handle;
@@ -941,9 +944,9 @@ function dispatch(options, piArgs) {
   const capabilities = options.get("capability") ?? [];
   const taskArgs = mode === "read" ? ["--append-system-prompt", READ_ONLY_PROMPT, ...selection.args] : selection.args;
   const effectiveArgs = applyCapabilities(taskArgs, capabilities, mode === "read" ? READ_TOOLS : BASE_TOOLS);
-  const hardTimeoutSeconds = Number(one(options, "hard-timeout", "86400"));
+  const hardTimeoutSeconds = Number(one(options, "hard-timeout", "0"));
   if (!Number.isFinite(hardTimeoutSeconds) || hardTimeoutSeconds < 0) fail("--hard-timeout must be zero or positive");
-  const idleTimeoutSeconds = Number(one(options, "idle-timeout", "600"));
+  const idleTimeoutSeconds = Number(one(options, "idle-timeout", "0"));
   if (!Number.isFinite(idleTimeoutSeconds) || idleTimeoutSeconds < 0) fail("--idle-timeout must be zero or positive");
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const directory = runDirectory(root, runId);
@@ -1019,7 +1022,7 @@ function continueRun(options, promptArgs) {
   ]);
   const taskArgs = previous.mode === "read" ? ["--append-system-prompt", READ_ONLY_PROMPT, "--continue", ...selection.args] : ["--continue", ...selection.args];
   const effectiveArgs = applyCapabilities(taskArgs, previous.capabilities ?? [], previous.mode === "read" ? READ_TOOLS : BASE_TOOLS);
-  const idleTimeoutSeconds = Number(one(options, "idle-timeout", String(previous.idleTimeoutSeconds ?? 600)));
+  const idleTimeoutSeconds = Number(one(options, "idle-timeout", String(previous.idleTimeoutSeconds ?? 0)));
   if (!Number.isFinite(idleTimeoutSeconds) || idleTimeoutSeconds < 0) fail("--idle-timeout must be zero or positive");
   const turns = [...(previous.turns ?? []), {
     turnIndex: previous.turnIndex ?? 1,

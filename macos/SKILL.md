@@ -22,7 +22,7 @@ Use `/Users/max/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `p
 - All Workers reuse the same host npm, pnpm, uv, pip, and Poetry caches. Review cleanup performs GC only when no peer Worker is active: files unused for 90 days are removed first, then the oldest rebuildable files until the combined cache is at most 20 GiB. It never uses whole-cache purge commands.
 - Headless Workers load configured Pi Skills plus the coding runtime. Context7, Lens, Context Mode, and Playwright are removed from automatic package discovery and load their matching extension/MCP plus Skill only through `--capability docs`, `lens`, `context`, or `browser`; runtime owns their paths and tool allowlists.
 - Headless Workers pass Pi's native `--offline` switch so startup skips version, package, telemetry, and remote catalog checks; configured model requests still use the network normally.
-- Success requires process exit `0` and Pi's `agent_settled` event. The default hard timeout is 24 hours and the default no-event idle timeout is 10 minutes; pass `--hard-timeout 0` or `--idle-timeout 0` to disable either limit.
+- Success requires process exit `0` and Pi's `agent_settled` event. Hard and no-event idle timeouts are disabled by default; use `--hard-timeout` or `--idle-timeout` only when a task needs an explicit limit.
 - `wait --timeout` limits only that waiting command. It never cancels a Worker. Use `cancel` to ask the supervisor to stop its child, finalize evidence, and return `cancelled`; never kill the supervisor directly.
 - Normal dispatch and continuation use JSON headless mode. Add `--live` only when an active turn must accept `steer`; long ordinary tasks avoid RPC serialization overhead. Provider, transport, ignored-reasoning, repeated tool, extension, compaction, prompt, or RPC shutdown errors wake `wait` immediately with state `attention`.
 - `result.json.usage` aggregates every assistant model call in the run, including nested cost fields, cache reads, and reported reasoning tokens. `reportedReasoningTokens` is provider-reported evidence, while `thinking` remains the requested level.
@@ -67,3 +67,5 @@ $PI_WORKER cleanup --reviewed yes --run-id review-1 --run-id fix-1
 ```
 
 Root reviews diffs and independently reruns risk-relevant tests. `cache-status` reports the shared npm, pnpm, uv, pip, Poetry, and Pi Lens cache total. `status` is diagnostic only; it derives process liveness and repairs every non-terminal run whose supervisor vanished, while `wait` keeps event-first behavior with a 15-second local process fallback.
+
+Known model profiles retain their documented thinking defaults and constraints. A newly configured provider/model may run without a Worker release when dispatch supplies an explicit valid `--thinking` level; Pi remains responsible for resolving the model and credentials.

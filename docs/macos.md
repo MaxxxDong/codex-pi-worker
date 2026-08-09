@@ -56,4 +56,6 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker dispatch ... --capability browser --
 
 Headless Worker 默认使用 Pi 原生 `--offline`，只跳过启动期版本、包、遥测和远程模型目录检查，不会禁用实际模型请求。Pi 0.84.1 的 JSON/RPC `message_update` 已改为纯增量；runtime 只以完整 `message_end` 和 `agent_settled` 判定终态，因此无需累计流式消息。
 
+Worker 默认不设置 hard timeout 或无事件 idle timeout；有明确期限的任务再显式传入。已知模型继续使用既定思考默认值和限制，新 provider/model 只要显式传入合法 `--thinking` 即可交给 Pi 原生目录验证。共享缓存深度检查最多每天一次，运行级 TMP、session 和 worktree 仍在审核后立即清理。
+
 完整命令和模型默认值以 [`macos/SKILL.md`](../macos/SKILL.md) 为准。

@@ -90,7 +90,9 @@ ${successEvents}`);
   }));
   try {
     command(["dispatch", "--run-id", "profile", "--workdir", temporary, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash"], env);
-    command(["wait", "--run-id", "profile", "--timeout", "10"], env);
+    const result = command(["wait", "--run-id", "profile", "--timeout", "10"], env).json.results[0];
+    assert.equal(result.hardTimeoutSeconds, 0);
+    assert.equal(result.idleTimeoutSeconds, 0);
     const profile = JSON.parse(readFileSync(marker, "utf8"));
     assert.equal(profile.agent, join(env.PI_WORKER_STATE_ROOT, "profile", "agent"));
     assert.deepEqual(profile.auth, { provider: "configured" });
@@ -219,9 +221,9 @@ console.log(JSON.stringify({type:"agent_settled"}));`);
   }
 });
 
-test("dispatch requires a supported explicit model and Grok stays high", () => {
+test("dispatch requires an explicit model, preserves known guards, and accepts explicit new profiles", () => {
   const temporary = mkdtempSync(join(tmpdir(), "pi-worker-profile-"));
-  const env = testEnv(temporary, process.execPath);
+  const env = testEnv(temporary, fakeLauncher(temporary, successEvents));
   try {
     const implicit = command(["dispatch", "--run-id", "implicit", "--workdir", temporary, "--", "task"], env, true);
     assert.equal(implicit.status, 2);
@@ -244,6 +246,15 @@ test("dispatch requires a supported explicit model and Grok stays high", () => {
     const official = command(["dispatch", "--run-id", "official-low", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash", "--thinking", "low"], env, true);
     assert.equal(official.status, 2);
     assert.match(official.stderr, /one of: high, max/);
+    const unknownImplicit = command(["dispatch", "--run-id", "unknown-implicit", "--workdir", temporary, "--", "--provider", "new-provider", "--model", "new-model", "task"], env, true);
+    assert.equal(unknownImplicit.status, 2);
+    assert.match(unknownImplicit.stderr, /requires explicit --thinking/);
+    command(["dispatch", "--run-id", "unknown", "--workdir", temporary, "--", "--provider", "new-provider", "--model", "new-model", "--thinking", "high", "task"], env);
+    const unknown = command(["wait", "--run-id", "unknown", "--timeout", "10"], env).json.results[0];
+    assert.equal(unknown.provider, "new-provider");
+    assert.equal(unknown.model, "new-model");
+    assert.equal(unknown.thinking, "high");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "unknown"], env);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -336,7 +347,7 @@ console.log(JSON.stringify({type:"agent_settled"}));`);
     const result = command(["wait", "--run-id", "headless", "--timeout", "10"], env).json.results[0];
     const args = JSON.parse(result.finalText);
     assert.equal(result.live, false);
-    assert.equal(result.idleTimeoutSeconds, 600);
+    assert.equal(result.idleTimeoutSeconds, 0);
     assert.equal(args.includes("rpc"), false);
     assert.equal(args.at(-1), "plain task");
   } finally {
@@ -771,6 +782,10 @@ test("cache GC removes stale files without whole-cache purge", () => {
     assert.ok(cache.actions.every((action) => !/cache (?:clean --force|purge)|uv cache clean/.test(action.command)));
     assert.ok(!existsSync(old));
     assert.ok(existsSync(recent));
+    command(["dispatch", "--run-id", "gc-again", "--workdir", temporary, "--", "--provider", "krill-sol", "--model", "gpt-5.6-sol"], env);
+    command(["wait", "--run-id", "gc-again", "--timeout", "10"], env);
+    const repeated = command(["cleanup", "--reviewed", "yes", "--run-id", "gc-again"], env).json.cache;
+    assert.equal(repeated.skipped, "checked within the last day");
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }

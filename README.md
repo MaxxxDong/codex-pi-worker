@@ -85,6 +85,7 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker profiles
 
 ### 2026-08-09
 
+- macOS v0.1.7 默认取消 hard/idle 任务寿命门禁，允许显式 thinking 的新 provider/model，并把共享缓存深扫节流为每天一次。
 - macOS v0.1.6 验证 Pi 0.84.1，Headless Worker 改用原生 `--offline` 跳过启动期联网检查，同时保留实际 provider 请求。
 - 兼容 Pi 0.84 的纯增量 `message_update`；终态继续只依赖完整 `message_end` 与 `agent_settled`。
 - 建议将 Context7、Lens、Context Mode、Playwright 保留安装但过滤默认资源，由 Worker capability 按需显式加载。
