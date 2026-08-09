@@ -676,6 +676,7 @@ test("the public wrapper executes its adjacent staged runtime", () => {
 test("the headless wrapper keeps optional extensions out of the default path", () => {
   const wrapper = readFileSync(join(root, "bin", "pi-worker"), "utf8");
   assert.match(wrapper, /--no-extensions/);
+  assert.match(wrapper, /--offline/);
   assert.doesNotMatch(wrapper, /--no-skills/);
   assert.doesNotMatch(wrapper, /--no-session/);
   assert.match(wrapper, /previous.*--mode/s);

@@ -26,6 +26,7 @@ done
 
 exec "$HOME/.local/node-lts/bin/pi" \
   "${output_args[@]}" \
+  --offline \
   --tools read,bash,edit,write,grep,find,ls,web_search \
   --no-extensions \
   --extension "$HOME/.pi/agent/extensions/coding-runtime.ts" \

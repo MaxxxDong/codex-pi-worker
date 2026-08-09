@@ -7,7 +7,7 @@ macOS 实现位于仓库的 `macos/`，使用 Node.js 运行，不依赖 Windows
 - macOS
 - Node.js 22.19+
 - Git
-- Pi CLI 0.83+
+- Pi CLI 0.83+；当前验证版本为 0.84.1
 - 已配置的 `~/.pi/agent/auth.json`、`models.json` 与 `settings.json`
 
 ## 安装
@@ -53,5 +53,7 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker dispatch ... --capability lens -- ..
 $HOME/.codex/skills/pi-worker/bin/pi-worker dispatch ... --capability context -- ...
 $HOME/.codex/skills/pi-worker/bin/pi-worker dispatch ... --capability browser -- ...
 ```
+
+Headless Worker 默认使用 Pi 原生 `--offline`，只跳过启动期版本、包、遥测和远程模型目录检查，不会禁用实际模型请求。Pi 0.84.1 的 JSON/RPC `message_update` 已改为纯增量；runtime 只以完整 `message_end` 和 `agent_settled` 判定终态，因此无需累计流式消息。
 
 完整命令和模型默认值以 [`macos/SKILL.md`](../macos/SKILL.md) 为准。

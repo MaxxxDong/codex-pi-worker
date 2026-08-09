@@ -1,5 +1,11 @@
 # 发布记录
 
+## v0.1.6 - 2026-08-09
+
+- macOS 真实链路验证 Pi 0.84.1 的 JSON Headless 事件、工具调用、会话落盘、`message_end` 与 `agent_settled`。
+- Headless wrapper 默认传入 Pi 原生 `--offline`，跳过版本、包、遥测和远程目录等启动期联网操作，不影响实际 provider 请求。
+- 保持四个可选能力默认不自动加载，继续通过 `--capability docs|lens|context|browser` 显式启用。
+
 ## v0.1.5 - 2026-08-05
 
 - 按配置收敛要求移除 EdgeFN 凭据、模型目录和 Worker profile；DeepSeek 官方 profile 保持不变。
