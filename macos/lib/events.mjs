@@ -465,7 +465,6 @@ function cacheEnvironment() {
   return Object.fromEntries(Object.entries({
     UV_CACHE_DIR: find("/.cache/uv", "/Library/Caches/uv"),
     npm_config_cache: find("/.npm"),
-    npm_config_store_dir: find("/pnpm/store"),
     PIP_CACHE_DIR: find("/Caches/pip", "/.cache/pip"),
     POETRY_CACHE_DIR: find("/.cache/pypoetry", "/Caches/pypoetry"),
   }).filter(([, value]) => value));
@@ -563,6 +562,7 @@ function cacheGc(root) {
     const before = cacheReport();
     const sharedEnv = cacheEnvironment();
     const env = { ...process.env, ...sharedEnv };
+    const pnpmStore = cacheCandidates().find((path) => path.endsWith("/pnpm/store") && existsSync(path));
     const actions = [];
     pruneCacheFiles(before, actions);
     if (actions.length === 0 && before.totalBytes <= before.maxBytes) {
@@ -572,7 +572,7 @@ function cacheGc(root) {
     }
     const commands = [
       ...(sharedEnv.UV_CACHE_DIR ? [["uv", ["cache", "prune"]]] : []),
-      ...(sharedEnv.npm_config_store_dir ? [["pnpm", ["store", "prune"]]] : []),
+      ...(pnpmStore ? [["pnpm", ["--store-dir", pnpmStore, "store", "prune"]]] : []),
       ...(sharedEnv.npm_config_cache ? [["npm", ["cache", "verify"]]] : []),
     ];
     for (const [command, args] of commands) {

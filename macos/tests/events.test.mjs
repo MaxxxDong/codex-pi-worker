@@ -746,7 +746,7 @@ test("production shared-cache discovery parses host paths", () => {
 test("workers receive the same shared dependency cache paths", () => {
   const temporary = mkdtempSync(join(tmpdir(), "pi-worker-cache-"));
   const fake = fakeLauncher(temporary, `
-console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"test",model:"fake",stopReason:"stop",content:[{type:"text",text:JSON.stringify({npm:process.env.npm_config_cache,uv:process.env.UV_CACHE_DIR})}]}}));
+console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"test",model:"fake",stopReason:"stop",content:[{type:"text",text:JSON.stringify({npm:process.env.npm_config_cache,uv:process.env.UV_CACHE_DIR,pnpmConfig:process.env.npm_config_store_dir??null})}]}}));
 console.log(JSON.stringify({type:"agent_settled"}));`);
   const env = testEnv(temporary, fake);
   try {
@@ -756,6 +756,7 @@ console.log(JSON.stringify({type:"agent_settled"}));`);
     const paths = JSON.parse(results[0].finalText);
     assert.equal(paths.npm, join(temporary, ".npm"));
     assert.equal(paths.uv, join(temporary, ".cache", "uv"));
+    assert.equal(paths.pnpmConfig, null);
     const status = command(["cache-status"], env).json;
     assert.equal(status.maxBytes, 1024 * 1024);
     assert.equal(status.entries.length, 2);

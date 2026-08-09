@@ -1,5 +1,10 @@
 # 发布记录
 
+## v0.1.8 - 2026-08-09
+
+- 不再向普通 Worker 子进程注入 `npm_config_store_dir`，避免 npm 24 对 pnpm 专用兼容变量持续产生 unknown config 警告。
+- 共享 pnpm 默认仍使用同一宿主 store；缓存 GC 调用 pnpm 时通过命令参数显式指定已发现的 store 路径。
+
 ## v0.1.7 - 2026-08-09
 
 - 默认关闭 hard timeout 和无事件 idle timeout，长时间模型调用、编译或测试不再因固定寿命门禁被终止；显式参数仍可按任务启用。
