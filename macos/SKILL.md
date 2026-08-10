@@ -17,7 +17,7 @@ Use `/Users/max/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `p
 - Worker instructions keep writes inside the current worktree or run-local `TMPDIR`; external paths remain readable when the task needs references.
 - Use `--mode in-place --workdir` only when direct writes are intentional. Never overlap writers in one directory.
 - Root may dispatch up to 10 independent Workers. One `wait` handles all run IDs and returns when any run succeeds, fails, is cancelled, or raises attention. Process `results` and `alerts`, then immediately call one new long `wait` with only the IDs in `pending`; do not poll `status` or use short wait timeouts as health checks. Independent Codex tasks may wait on the same run without overwriting each other.
-- `result.json.state` follows one lifecycle only: `starting -> running -> stopping -> finalizing -> success|failed|cancelled`. `activity` is independent and may be `waiting_event`, `waiting_model`, or `running_tools`; `activeTools` contains at most ten tool names/IDs and never arguments. These fields describe the Pi process, not whether the surrounding Codex task is complete.
+- `result.json.state` follows one lifecycle only: `starting -> running -> stopping -> finalizing -> success|failed|cancelled`. `activity` is independent and may be `waiting_event`, `waiting_model`, or `running_tools`; `waiting_model` only means that no tool is active while Pi awaits the model, not that the Worker is reading files or making useful progress. `activitySeconds`, `firstToolAt`, `lastToolAt`, `lastEventType`, and `activeTools` make that distinction observable without retaining prompts or tool arguments.
 - Worker completion freezes `result.json`, optional `changes.patch`, and failure-only `failure.log`. Raw streaming JSONL is not retained.
 - Completion and later dispatches never delete a result-bearing run automatically. Codex reviews the result and patch first, then runs `cleanup --reviewed yes` to delete the run, session, and managed worktree.
 - Each run gets a managed Pi session inside its run directory. `continue --run-id` reuses that session and the same worktree; review-gated cleanup deletes both. Private temporary files are still deleted before completion.
@@ -38,6 +38,9 @@ PI_WORKER=/Users/max/.codex/skills/pi-worker/bin/pi-worker
 # Read/review directly; runtime supplies and validates thinking.
 $PI_WORKER dispatch --run-id review-1 --mode read --workdir /absolute/repo -- \
   --provider opencode-go --model deepseek-v4-flash "Review the requested scope."
+
+# OpenCode Go DeepSeek is fixed to max. Any caller-supplied thinking level is
+# normalized to max by the runtime; if it makes no progress, use another model.
 
 # Write in a managed worktree.
 $PI_WORKER dispatch --run-id fix-1 --mode write --source /absolute/repo -- \

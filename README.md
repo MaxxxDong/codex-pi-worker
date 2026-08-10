@@ -83,6 +83,10 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker profiles
 
 ## 最新更新
 
+### 2026-08-10
+
+- macOS v0.1.11 增加实时模型/工具耗时字段，明确 `waiting_model` 只是模型请求在途而非仓库进展，并停止暴露离线环境中缺少 `fd` 而必然失败的 `find` 工具；OpenCode Go DeepSeek 固定为 Max，调用方传入其他强度也会被规范化为 Max。
+
 ### 2026-08-09
 
 - macOS v0.1.10 检测 Codex Seatbelt 无网络沙箱并在创建 run 前明确失败，要求以网络授权执行 `dispatch/continue`；复杂提示词改从文件安全传入，避免 shell 解释任务正文。

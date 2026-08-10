@@ -7,6 +7,7 @@ import test from "node:test";
 
 const root = resolve(import.meta.dirname, "..");
 const events = join(root, "lib/events.mjs");
+const THINKING_LEVELS_FOR_TEST = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 function command(args, env, allowFailure = false) {
   const result = spawnSync(process.execPath, [events, ...args], { encoding: "utf8", env });
@@ -221,9 +222,11 @@ console.log(JSON.stringify({type:"agent_settled"}));`);
   }
 });
 
-test("dispatch requires an explicit model, preserves known guards, and accepts explicit new profiles", () => {
+test("dispatch requires an explicit model, fixes DeepSeek to max, and accepts explicit new profiles", () => {
   const temporary = mkdtempSync(join(tmpdir(), "pi-worker-profile-"));
-  const env = testEnv(temporary, fakeLauncher(temporary, successEvents));
+  const env = testEnv(temporary, fakeLauncher(temporary, `
+console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"test",model:"fake",stopReason:"stop",content:[{type:"text",text:JSON.stringify(process.argv.slice(2))}]}}));
+console.log(JSON.stringify({type:"agent_settled"}));`));
   try {
     const implicit = command(["dispatch", "--run-id", "implicit", "--workdir", temporary, "--", "task"], env, true);
     assert.equal(implicit.status, 2);
@@ -241,8 +244,11 @@ test("dispatch requires an explicit model, preserves known guards, and accepts e
     assert.equal(sol.status, 2);
     assert.match(sol.stderr, /thinking must be one of/);
     const deepseek = command(["dispatch", "--run-id", "deepseek-low", "--workdir", temporary, "--", "--provider", "opencode-go", "--model", "deepseek-v4-flash", "--thinking", "low"], env, true);
-    assert.equal(deepseek.status, 2);
-    assert.match(deepseek.stderr, /one of: high, max/);
+    assert.equal(deepseek.status, 0);
+    const fixed = command(["wait", "--run-id", "deepseek-low", "--timeout", "10"], env).json.results[0];
+    const fixedArgs = JSON.parse(fixed.finalText);
+    assert.equal(fixed.thinking, "max");
+    assert.deepEqual(fixedArgs.filter((argument) => argument === "--thinking" || THINKING_LEVELS_FOR_TEST.has(argument)), ["--thinking", "max"]);
     const official = command(["dispatch", "--run-id", "official-low", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash", "--thinking", "low"], env, true);
     assert.equal(official.status, 2);
     assert.match(official.stderr, /one of: high, max/);
@@ -254,7 +260,7 @@ test("dispatch requires an explicit model, preserves known guards, and accepts e
     assert.equal(unknown.provider, "new-provider");
     assert.equal(unknown.model, "new-model");
     assert.equal(unknown.thinking, "high");
-    command(["cleanup", "--reviewed", "yes", "--run-id", "unknown"], env);
+    command(["cleanup", "--reviewed", "yes", "--run-id", "deepseek-low", "--run-id", "unknown"], env);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -391,6 +397,7 @@ const marker = join(sessionDir, "marker");
 const continuing = args.includes("--continue");
 if (continuing && !existsSync(marker)) process.exit(9);
 writeFileSync(marker, "saved");
+if (continuing) await new Promise((resolve) => setTimeout(resolve, 300));
 console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"test",model:"fake",stopReason:"stop",content:[{type:"text",text:continuing ? "CONTINUED" : "FIRST"}]}}));
 console.log(JSON.stringify({type:"agent_settled"}));`);
   const env = testEnv(temporary, fake);
@@ -407,6 +414,9 @@ console.log(JSON.stringify({type:"agent_settled"}));`);
     rmSync(lock);
     writeFileSync(lock, JSON.stringify({pid:99999999}));
     command(["continue", "--run-id", "session", "--", "second"], env);
+    const live = JSON.parse(readFileSync(join(env.PI_WORKER_STATE_ROOT, "session", "result.json"), "utf8"));
+    assert.equal(live.assistantCalls, 0);
+    assert.equal(live.firstToolAt, null);
     const second = command(["wait", "--run-id", "session", "--timeout", "10"], env).json.results[0];
     assert.equal(second.finalText, "CONTINUED");
     assert.equal(second.turnIndex, 2);
@@ -471,6 +481,10 @@ ${successEvents}`);
     assert.deepEqual(observed.activeTools.map((tool) => tool.name).sort(), ["bash", "read"]);
     assert.ok(observed.supervisorAlive);
     assert.ok(observed.childAlive);
+    assert.ok(observed.firstToolAt);
+    assert.ok(observed.lastToolAt);
+    assert.equal(observed.lastEventType, "tool_execution_start");
+    assert.equal(typeof observed.activitySeconds, "number");
     assert.doesNotMatch(JSON.stringify(observed.activeTools), /secret|private/);
     const stored = JSON.parse(readFileSync(join(env.PI_WORKER_STATE_ROOT, "activity", "result.json"), "utf8"));
     assert.equal(stored.supervisorAlive, undefined);
@@ -481,6 +495,8 @@ ${successEvents}`);
     assert.deepEqual(result.activeTools, []);
     assert.ok(result.firstEventAt);
     assert.ok(result.lastEventAt);
+    assert.ok(result.firstToolAt);
+    assert.ok(result.lastToolAt);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -568,7 +584,7 @@ console.log(JSON.stringify({type:"agent_settled"}));`);
     const result = command(["wait", "--run-id", "docs", "--timeout", "10"], env).json.results[0];
     const args = JSON.parse(result.finalText);
     const tools = args.indexOf("--tools");
-    assert.equal(args[tools + 1], "read,bash,grep,find,ls,web_search,resolve-library-id,query-docs");
+    assert.equal(args[tools + 1], "read,bash,grep,ls,web_search,resolve-library-id,query-docs");
     assert.ok(args.includes("This is a read-only task. Do not modify repository files. Use bash only for inspection or commands known not to write project files."));
     const sessionDir = args.indexOf("--session-dir");
     assert.equal(args[sessionDir + 1], result.sessionDir);
@@ -640,7 +656,7 @@ console.log(JSON.stringify({type:"agent_settled"}));`);
     assert.equal(initial.mode, "write");
     const args = JSON.parse(settled.finalText);
     const tools = args.indexOf("--tools");
-    assert.equal(args[tools + 1], "read,bash,edit,write,grep,find,ls,web_search");
+    assert.equal(args[tools + 1], "read,bash,edit,write,grep,ls,web_search");
     assert.ok(existsSync(receipt.workdir), "worktree must remain until Codex review");
     assert.ok(!existsSync(join(source, "worker.txt")));
     const patch = readFileSync(settled.patchPath, "utf8");

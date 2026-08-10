@@ -32,14 +32,14 @@ const CACHE_GC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const FAILURE_TAIL_BYTES = 64 * 1024;
 const TOOL_ERROR_BYTES = 2 * 1024;
 const STEER_MAX_BYTES = 16 * 1024;
-const BASE_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search"];
-const READ_TOOLS = ["read", "bash", "grep", "find", "ls", "web_search"];
+const BASE_TOOLS = ["read", "bash", "edit", "write", "grep", "ls", "web_search"];
+const READ_TOOLS = ["read", "bash", "grep", "ls", "web_search"];
 const READ_ONLY_PROMPT = "This is a read-only task. Do not modify repository files. Use bash only for inspection or commands known not to write project files.";
 const AGENT_PROFILE_FILES = ["auth.json", "models.json", "models-store.json", "settings.json"];
 const OPTIONAL_PACKAGES = ["@upstash/context7-pi", "context-mode", "pi-lens", "pi-playwright"];
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const PROFILES = new Map([
-  ["opencode-go/deepseek-v4-flash", { defaultThinking: "max", allowed: ["high", "max"] }],
+  ["opencode-go/deepseek-v4-flash", { defaultThinking: "max", allowed: ["max"], fixedThinking: "max" }],
   ["deepseek/deepseek-v4-flash", { defaultThinking: "max", allowed: ["high", "max"] }],
   ["xai/grok-4.5", { defaultThinking: "high", allowed: ["low", "medium", "high"] }],
   ["krill/grok-4.5", { defaultThinking: "high", allowed: ["high"] }],
@@ -178,6 +178,21 @@ function piOptionValues(piArgs, name) {
   return values;
 }
 
+function replacePiOption(piArgs, name, value) {
+  const flag = `--${name}`;
+  const args = [];
+  for (let index = 0; index < piArgs.length; index += 1) {
+    const argument = piArgs[index];
+    if (argument.startsWith(`${flag}=`)) continue;
+    if (argument === flag) {
+      if (piArgs[index + 1] && !piArgs[index + 1].startsWith("--")) index += 1;
+      continue;
+    }
+    args.push(argument);
+  }
+  return [flag, value, ...args];
+}
+
 function applyDispatchProfile(piArgs) {
   if (piArgs.some((argument) => /^--(?:session|session-id|session-dir|continue|resume|fork)(?:=|$)/.test(argument))) {
     fail("Pi Worker owns its managed session; use the continue command for another turn");
@@ -188,14 +203,17 @@ function applyDispatchProfile(piArgs) {
   const key = `${provider}/${model}`;
   const profile = PROFILES.get(key);
   const supplied = piOptionValues(piArgs, "thinking");
-  const thinking = supplied.at(-1) ?? profile?.defaultThinking;
-  if (!thinking) fail(`unknown Pi Worker profile ${key} requires explicit --thinking`);
-  if (!THINKING_LEVELS.includes(thinking)) fail(`thinking must be one of: ${THINKING_LEVELS.join(", ")}`);
-  if (profile && !profile.allowed.includes(thinking)) {
+  const requestedThinking = supplied.at(-1) ?? profile?.defaultThinking;
+  if (!requestedThinking) fail(`unknown Pi Worker profile ${key} requires explicit --thinking`);
+  if (!THINKING_LEVELS.includes(requestedThinking)) fail(`thinking must be one of: ${THINKING_LEVELS.join(", ")}`);
+  const thinking = profile?.fixedThinking ?? requestedThinking;
+  if (profile && !profile.fixedThinking && !profile.allowed.includes(thinking)) {
     fail(`${key} thinking must be one of: ${profile.allowed.join(", ")}`);
   }
   return {
-    args: supplied.length > 0 ? piArgs : ["--thinking", profile.defaultThinking, ...piArgs],
+    args: profile?.fixedThinking
+      ? replacePiOption(piArgs, "thinking", profile.fixedThinking)
+      : (supplied.length > 0 ? piArgs : ["--thinking", profile.defaultThinking, ...piArgs]),
     provider,
     model,
     thinking,
@@ -686,22 +704,32 @@ async function supervise(options, piArgs) {
   let child;
   const activeTools = new Map();
   let firstEventAt = initial.firstEventAt ?? null;
+  let firstToolAt = initial.firstToolAt ?? null;
+  let lastToolAt = initial.lastToolAt ?? null;
+  let lastEventType = initial.lastEventType ?? null;
+  let assistantCalls = Number(initial.assistantCalls ?? 0);
   const updateProgress = (event = undefined, forcedState = null) => {
     const current = readJson(resultPath);
     if (!current || terminal(current) || current.supervisorPid !== process.pid) return;
     const at = new Date().toISOString();
     if (event !== undefined) {
       firstEventAt ??= at;
+      lastEventType = event?.type ?? "stderr";
       if (event?.type === "tool_execution_start") {
+        firstToolAt ??= at;
+        lastToolAt = at;
         const id = String(event.toolCallId ?? event.id ?? `${event.toolName ?? "tool"}-${at}`);
         activeTools.set(id, { id, name: event.toolName ?? null, startedAt: at });
       } else if (event?.type === "tool_execution_end") {
+        lastToolAt = at;
         const id = event.toolCallId ?? event.id;
         if (id !== undefined) activeTools.delete(String(id));
         else {
           const match = [...activeTools].find(([, tool]) => tool.name === (event.toolName ?? null));
           if (match) activeTools.delete(match[0]);
         }
+      } else if (event?.type === "message_end" && event.message?.role === "assistant") {
+        assistantCalls += 1;
       }
     }
     let state = forcedState ?? current.state;
@@ -711,12 +739,18 @@ async function supervise(options, piArgs) {
     const activity = ["stopping", "finalizing"].includes(state)
       ? null
       : (activeTools.size > 0 ? "running_tools" : (firstEventAt ? "waiting_model" : "waiting_event"));
+    const activitySince = activity === current.activity ? (current.activitySince ?? at) : at;
     atomicJson(resultPath, {
       ...current,
       state,
       activity,
+      activitySince,
       firstEventAt,
       lastEventAt: event === undefined ? current.lastEventAt ?? null : at,
+      firstToolAt,
+      lastToolAt,
+      lastEventType,
+      assistantCalls,
       activeTools: [...activeTools.values()].slice(0, 10),
     });
   };
@@ -895,6 +929,7 @@ async function supervise(options, piArgs) {
     ...(readJson(resultPath) ?? initial),
     state: success ? "success" : (cancelRequested ? "cancelled" : "failed"),
     activity: null,
+    activitySince: null,
     activeTools: [],
     exitCode,
     signal,
@@ -987,6 +1022,10 @@ function dispatch(options, piArgs) {
     turnIndex: 1,
     firstEventAt: null,
     lastEventAt: null,
+    firstToolAt: null,
+    lastToolAt: null,
+    lastEventType: null,
+    assistantCalls: 0,
     activeTools: [],
     baseCommit: workspace.baseCommit,
     baselineTree: workspace.baselineTree,
@@ -1057,6 +1096,11 @@ function continueRun(options, promptArgs) {
         turns,
         firstEventAt: null,
         lastEventAt: null,
+        firstToolAt: null,
+        lastToolAt: null,
+        lastEventType: null,
+        assistantCalls: 0,
+        reportedReasoningTokens: null,
         activeTools: [],
         exitCode: null,
         signal: null,
@@ -1199,11 +1243,13 @@ function reconcileVanished(root, ids) {
 function statusView(result) {
   if (!result) return null;
   const last = Date.parse(result.lastEventAt ?? "");
+  const activitySince = Date.parse(result.activitySince ?? "");
   return {
     ...result,
     supervisorAlive: !terminal(result) && processAlive(result.supervisorPid),
     childAlive: !terminal(result) && processAlive(result.childPid),
     eventAgeSeconds: Number.isFinite(last) ? Math.round((Date.now() - last) / 100) / 10 : null,
+    activitySeconds: Number.isFinite(activitySince) ? Math.round((Date.now() - activitySince) / 100) / 10 : null,
   };
 }
 

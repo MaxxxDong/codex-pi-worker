@@ -1,5 +1,11 @@
 # 发布记录
 
+## v0.1.11 - 2026-08-10
+
+- `status` 增加 `activitySeconds`、`firstToolAt`、`lastToolAt` 和 `lastEventType`，避免把 `waiting_model` 误判为仓库读取或工具进展；续跑会清零上一轮实时计数。
+- OpenCode Go DeepSeek 固定为 Max；调用方显式传入其他有效强度时，runtime 仍只向 Pi 传递 Max。
+- 默认工具列表不再暴露离线 runtime 无法安装 `fd` 时必然失败的 Pi `find` 工具；`bash` 与 `grep` 继续覆盖文件搜索。
+
 ## v0.1.10 - 2026-08-10
 
 - `dispatch/continue` 检测到 Codex Seatbelt 禁止网络时立即以明确提示退出，不创建 run、worktree 或三次无效 Provider 重试；调用方必须使用 `sandbox_permissions="require_escalated"`。
