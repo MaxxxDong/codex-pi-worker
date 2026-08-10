@@ -85,6 +85,7 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker profiles
 
 ### 2026-08-09
 
+- macOS v0.1.10 检测 Codex Seatbelt 无网络沙箱并在创建 run 前明确失败，要求以网络授权执行 `dispatch/continue`；复杂提示词改从文件安全传入，避免 shell 解释任务正文。
 - macOS v0.1.9 默认从任务指定文件、失败测试和直接调用者开始，只在任务明确要求或定向证据不足时扩大到全仓搜索；纯输出和连通性检查不再调用工具。
 - macOS v0.1.8 停止向所有子进程注入 pnpm 的 npm 兼容变量，消除每次 `npm` 调用的未知配置警告；缓存 GC 改为只在调用 pnpm 时显式传入 store。
 - macOS v0.1.7 默认取消 hard/idle 任务寿命门禁，允许显式 thinking 的新 provider/model，并把共享缓存深扫节流为每天一次。

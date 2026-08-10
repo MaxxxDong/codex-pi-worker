@@ -1,6 +1,11 @@
 #!/bin/zsh
 set -euo pipefail
 
+if [[ ("${1:-}" == "dispatch" || "${1:-}" == "continue") && "${CODEX_SANDBOX:-}" == "seatbelt" && "${CODEX_SANDBOX_NETWORK_DISABLED:-}" == "1" ]]; then
+  print -u2 'Pi Worker provider network is blocked by the Codex sandbox. Re-run this command with sandbox_permissions="require_escalated".'
+  exit 69
+fi
+
 case "${1:-}" in
   dispatch|continue|steer|cancel|wait|cleanup|status|cache-status|profiles|help|--help|-h)
     skill_root="${0:A:h:h}"

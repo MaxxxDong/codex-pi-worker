@@ -9,6 +9,8 @@ Use `/Users/max/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `p
 
 ## Efficient execution
 
+- Run every `dispatch` and `continue` command through network-enabled `exec_command` with `sandbox_permissions="require_escalated"`; otherwise Pi inherits Codex's Seatbelt network block and reports misleading zero-Token `Connection error` retries. The wrapper now fails before creating a run when it detects that state.
+- For non-trivial prompts, write the task to a file and pass it as `"$(< /absolute/task.md)"`; do not embed backticks or other shell-significant task text directly inside a double-quoted command.
 - Read/review tasks run directly in the existing repository with `--mode read --workdir`. They receive `read`, `grep`, `find`, `ls`, `web_search`, and `bash`, but not `edit` or `write`; `bash` is restricted by the run prompt to inspection and commands known not to write project files.
 - Workers start from named files, failing tests, and direct callers. They expand to repository-wide search only when the task explicitly requires it or targeted evidence is insufficient; output-only and connectivity checks do not call tools.
 - Write tasks use `--mode write --source`; the runner creates a lightweight detached Git worktree and carries the source's tracked dirty and non-ignored untracked files into its baseline. Dirty state is not a startup gate.

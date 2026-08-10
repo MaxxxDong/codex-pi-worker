@@ -702,6 +702,16 @@ test("the headless wrapper keeps optional extensions out of the default path", (
   assert.doesNotMatch(wrapper, /node_modules\/context-mode/);
 });
 
+test("the public wrapper fails before dispatch when Codex blocks provider network", () => {
+  const blocked = spawnSync(join(root, "bin", "pi-worker"), ["dispatch"], {
+    encoding: "utf8",
+    env: { ...process.env, CODEX_SANDBOX: "seatbelt", CODEX_SANDBOX_NETWORK_DISABLED: "1" },
+  });
+  assert.equal(blocked.status, 69);
+  assert.match(blocked.stderr, /provider network is blocked by the Codex sandbox/);
+  assert.match(blocked.stderr, /sandbox_permissions="require_escalated"/);
+});
+
 test("Playwright runs get a unique session and supervisor-owned close", () => {
   const temporary = mkdtempSync(join(tmpdir(), "pi-worker-playwright-"));
   const agent = join(temporary, "agent");

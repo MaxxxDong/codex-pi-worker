@@ -1,5 +1,10 @@
 # 发布记录
 
+## v0.1.10 - 2026-08-10
+
+- `dispatch/continue` 检测到 Codex Seatbelt 禁止网络时立即以明确提示退出，不创建 run、worktree 或三次无效 Provider 重试；调用方必须使用 `sandbox_permissions="require_escalated"`。
+- 非平凡任务提示改为从文件读取后作为单一参数传入，避免反引号、`$()` 等 shell 语法篡改提示或产生启动错误。
+
 ## v0.1.9 - 2026-08-10
 
 - Headless Worker 默认从任务点名的文件、失败测试和直接调用者开始，避免无依据的全仓扫描；只有任务明确要求或定向证据不足时才扩大范围。
