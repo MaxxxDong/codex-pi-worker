@@ -693,6 +693,8 @@ test("the headless wrapper keeps optional extensions out of the default path", (
   assert.match(wrapper, /previous.*--mode/s);
   assert.match(wrapper, /--no-prompt-templates/);
   assert.match(wrapper, /write only inside the current working directory or TMPDIR/);
+  assert.match(wrapper, /Do not scan the whole repository unless the task explicitly requires it or targeted evidence is insufficient/);
+  assert.match(wrapper, /For output-only or connectivity checks, do not call tools/);
   assert.doesNotMatch(wrapper, /@upstash\/context7-pi/);
   assert.doesNotMatch(wrapper, /resolve-library-id|query-docs/);
   assert.doesNotMatch(wrapper, /node_modules\/pi-lens/);

@@ -85,6 +85,7 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker profiles
 
 ### 2026-08-09
 
+- macOS v0.1.9 默认从任务指定文件、失败测试和直接调用者开始，只在任务明确要求或定向证据不足时扩大到全仓搜索；纯输出和连通性检查不再调用工具。
 - macOS v0.1.8 停止向所有子进程注入 pnpm 的 npm 兼容变量，消除每次 `npm` 调用的未知配置警告；缓存 GC 改为只在调用 pnpm 时显式传入 store。
 - macOS v0.1.7 默认取消 hard/idle 任务寿命门禁，允许显式 thinking 的新 provider/model，并把共享缓存深扫节流为每天一次。
 - macOS v0.1.6 验证 Pi 0.84.1，Headless Worker 改用原生 `--offline` 跳过启动期联网检查，同时保留实际 provider 请求。

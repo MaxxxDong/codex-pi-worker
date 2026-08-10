@@ -31,6 +31,7 @@ exec "$HOME/.local/node-lts/bin/pi" \
   --no-extensions \
   --extension "$HOME/.pi/agent/extensions/coding-runtime.ts" \
   --append-system-prompt "Treat the current working directory as the task root. You may read external references, but write only inside the current working directory or TMPDIR; never switch to or edit a separate source checkout." \
+  --append-system-prompt "Follow the requested scope. Start with named files, failing tests, and direct callers. Do not scan the whole repository unless the task explicitly requires it or targeted evidence is insufficient. For output-only or connectivity checks, do not call tools." \
   --no-prompt-templates \
   --no-approve \
   "$@"
