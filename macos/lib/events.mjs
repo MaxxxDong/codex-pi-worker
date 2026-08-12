@@ -42,9 +42,7 @@ const PROFILES = new Map([
   ["opencode-go/deepseek-v4-flash", { defaultThinking: "max", allowed: ["max"], fixedThinking: "max" }],
   ["deepseek/deepseek-v4-flash", { defaultThinking: "max", allowed: ["high", "max"] }],
   ["xai/grok-4.5", { defaultThinking: "high", allowed: ["low", "medium", "high"] }],
-  ["krill/grok-4.5", { defaultThinking: "high", allowed: ["high"] }],
   ["shuaiapi-grok/grok-4.5", { defaultThinking: "high", allowed: ["high"] }],
-  ["krill-sol/gpt-5.6-sol", { defaultThinking: "medium", allowed: ["low", "medium", "high", "xhigh", "max"] }],
   ["shuaiapi/gpt-5.6-sol", { defaultThinking: "medium", allowed: ["low", "medium", "high", "xhigh", "max"] }],
   ["shuaiapi/gpt-5.6-luna", { defaultThinking: "xhigh", allowed: ["low", "medium", "high", "xhigh", "max"] }],
 ]);

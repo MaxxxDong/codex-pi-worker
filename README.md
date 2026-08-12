@@ -85,6 +85,7 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker profiles
 
 ### 2026-08-10
 
+- macOS v0.1.12 移除 Krill Grok/Sol Worker Profile、示例与配置入口；现有 ShuaiAPI、OpenCode Go、DeepSeek 和 XAI 路由不变。
 - macOS v0.1.11 增加实时模型/工具耗时字段，明确 `waiting_model` 只是模型请求在途而非仓库进展，并停止暴露离线环境中缺少 `fd` 而必然失败的 `find` 工具；OpenCode Go DeepSeek 固定为 Max，调用方传入其他强度也会被规范化为 Max。
 
 ### 2026-08-09

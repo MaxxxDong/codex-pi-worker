@@ -111,7 +111,7 @@ test("parallel read workers return independently and retain only compact results
   const fake = fakeLauncher(temporary, successEvents);
   const env = testEnv(temporary, fake);
   try {
-    for (const [id, provider, model] of [["one", "krill-sol", "gpt-5.6-sol"], ["two", "shuaiapi", "gpt-5.6-luna"], ["three", "opencode-go", "deepseek-v4-flash"], ["four", "xai", "grok-4.5"]]) {
+    for (const [id, provider, model] of [["one", "shuaiapi", "gpt-5.6-sol"], ["two", "shuaiapi", "gpt-5.6-luna"], ["three", "opencode-go", "deepseek-v4-flash"], ["four", "xai", "grok-4.5"]]) {
       command(["dispatch", "--run-id", id, "--mode", "read", "--workdir", temporary, "--", "--provider", provider, "--model", model], env);
     }
     const results = waitAll(["one", "two", "three", "four"], env);
@@ -192,7 +192,7 @@ test("failure produces a bounded failure log", () => {
   const fake = fakeLauncher(temporary, 'process.stderr.write("diagnostic Authorization: Bearer sk-secret0123456789012345\\n"); console.log(JSON.stringify({type:"agent_end"}));');
   const env = testEnv(temporary, fake);
   try {
-    command(["dispatch", "--run-id", "failed", "--workdir", temporary, "--", "--provider", "krill", "--model", "grok-4.5"], env);
+    command(["dispatch", "--run-id", "failed", "--workdir", temporary, "--", "--provider", "xai", "--model", "grok-4.5"], env);
     const waited = command(["wait", "--run-id", "failed", "--timeout", "10"], env, true);
     assert.equal(waited.status, 3);
     assert.equal(waited.json.results[0].reason, "missing agent_settled");
@@ -231,13 +231,10 @@ console.log(JSON.stringify({type:"agent_settled"}));`));
     const implicit = command(["dispatch", "--run-id", "implicit", "--workdir", temporary, "--", "task"], env, true);
     assert.equal(implicit.status, 2);
     assert.match(implicit.stderr, /--provider, --model/);
-    const grok = command(["dispatch", "--run-id", "wrong", "--workdir", temporary, "--", "--provider", "krill", "--model", "grok-4.5", "--thinking", "medium"], env, true);
-    assert.equal(grok.status, 2);
-    assert.match(grok.stderr, /one of: high/);
     const shuaiGrok = command(["dispatch", "--run-id", "wrong-shuai", "--workdir", temporary, "--", "--provider", "shuaiapi-grok", "--model", "grok-4.5", "--thinking", "medium"], env, true);
     assert.equal(shuaiGrok.status, 2);
     assert.match(shuaiGrok.stderr, /one of: high/);
-    const session = command(["dispatch", "--run-id", "session", "--workdir", temporary, "--", "--provider", "krill-sol", "--model", "gpt-5.6-sol", "--resume", "abc"], env, true);
+    const session = command(["dispatch", "--run-id", "session", "--workdir", temporary, "--", "--provider", "shuaiapi", "--model", "gpt-5.6-sol", "--resume", "abc"], env, true);
     assert.equal(session.status, 2);
     assert.match(session.stderr, /owns its managed session/);
     const sol = command(["dispatch", "--run-id", "sol", "--workdir", temporary, "--", "--provider", "shuaiapi", "--model", "gpt-5.6-sol", "--thinking", "invalid"], env, true);
@@ -647,7 +644,7 @@ console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provide
 console.log(JSON.stringify({type:"agent_settled"}));`);
   const env = testEnv(temporary, fake);
   try {
-    const receipt = command(["dispatch", "--run-id", "write", "--mode", "write", "--source", source, "--", "--provider", "krill-sol", "--model", "gpt-5.6-sol", "--thinking", "high"], env).json;
+    const receipt = command(["dispatch", "--run-id", "write", "--mode", "write", "--source", source, "--", "--provider", "shuaiapi", "--model", "gpt-5.6-sol", "--thinking", "high"], env).json;
     const settled = command(["wait", "--run-id", "write", "--timeout", "10"], env).json.results[0];
     assert.equal(settled.state, "success");
     assert.equal(settled.thinking, "high");
@@ -740,7 +737,7 @@ console.log(JSON.stringify({type:"tool_execution_start",toolName:"bash",args:{co
 ${successEvents}`);
   const env = { ...testEnv(temporary, fake), PI_WORKER_AGENT_SOURCE: agent, PI_WORKER_TEST_PLAYWRIGHT_MARKER: marker };
   try {
-    command(["dispatch", "--run-id", "browser", "--workdir", temporary, "--", "--provider", "krill", "--model", "grok-4.5"], env);
+    command(["dispatch", "--run-id", "browser", "--workdir", temporary, "--", "--provider", "xai", "--model", "grok-4.5"], env);
     const result = command(["wait", "--run-id", "browser", "--timeout", "10"], env).json.results[0];
     const closed = JSON.parse(readFileSync(marker, "utf8"));
     assert.equal(result.state, "success");
@@ -778,7 +775,7 @@ console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provide
 console.log(JSON.stringify({type:"agent_settled"}));`);
   const env = testEnv(temporary, fake);
   try {
-    for (const id of ["cache-a", "cache-b"]) command(["dispatch", "--run-id", id, "--workdir", temporary, "--", "--provider", "krill-sol", "--model", "gpt-5.6-sol"], env);
+    for (const id of ["cache-a", "cache-b"]) command(["dispatch", "--run-id", id, "--workdir", temporary, "--", "--provider", "shuaiapi", "--model", "gpt-5.6-sol"], env);
     const results = waitAll(["cache-a", "cache-b"], env);
     assert.equal(results[0].finalText, results[1].finalText);
     const paths = JSON.parse(results[0].finalText);
@@ -804,14 +801,14 @@ test("cache GC removes stale files without whole-cache purge", () => {
   const oldTime = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000);
   utimesSync(old, oldTime, oldTime);
   try {
-    command(["dispatch", "--run-id", "gc", "--workdir", temporary, "--", "--provider", "krill-sol", "--model", "gpt-5.6-sol"], env);
+    command(["dispatch", "--run-id", "gc", "--workdir", temporary, "--", "--provider", "shuaiapi", "--model", "gpt-5.6-sol"], env);
     command(["wait", "--run-id", "gc", "--timeout", "10"], env);
     const cache = command(["cleanup", "--reviewed", "yes", "--run-id", "gc"], env).json.cache;
     assert.ok(cache.actions.some((action) => action.command === "cache file remove" && action.path === old && action.stale));
     assert.ok(cache.actions.every((action) => !/cache (?:clean --force|purge)|uv cache clean/.test(action.command)));
     assert.ok(!existsSync(old));
     assert.ok(existsSync(recent));
-    command(["dispatch", "--run-id", "gc-again", "--workdir", temporary, "--", "--provider", "krill-sol", "--model", "gpt-5.6-sol"], env);
+    command(["dispatch", "--run-id", "gc-again", "--workdir", temporary, "--", "--provider", "shuaiapi", "--model", "gpt-5.6-sol"], env);
     command(["wait", "--run-id", "gc-again", "--timeout", "10"], env);
     const repeated = command(["cleanup", "--reviewed", "yes", "--run-id", "gc-again"], env).json.cache;
     assert.equal(repeated.skipped, "checked within the last day");
@@ -836,7 +833,7 @@ test("cache GC counts and prunes the oldest rebuildable Pi Lens data", () => {
     PI_WORKER_CACHE_MAX_BYTES: String(1024 * 1024),
   };
   try {
-    command(["dispatch", "--run-id", "lens-gc", "--workdir", temporary, "--", "--provider", "krill-sol", "--model", "gpt-5.6-sol"], env);
+    command(["dispatch", "--run-id", "lens-gc", "--workdir", temporary, "--", "--provider", "shuaiapi", "--model", "gpt-5.6-sol"], env);
     command(["wait", "--run-id", "lens-gc", "--timeout", "10"], env);
     const cache = command(["cleanup", "--reviewed", "yes", "--run-id", "lens-gc"], env).json.cache;
     assert.equal(cache.before.entries[0].path, lens);

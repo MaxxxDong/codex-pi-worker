@@ -49,7 +49,7 @@ $PI_WORKER dispatch --run-id fix-1 --mode write --source /absolute/repo -- \
 
 # Add optional extension/MCP + Skill capabilities before `--`; other configured Pi Skills load automatically.
 $PI_WORKER dispatch --run-id docs-review --mode read --workdir /absolute/repo \
-  --capability docs -- --provider krill-sol --model gpt-5.6-sol \
+  --capability docs -- --provider shuaiapi --model gpt-5.6-sol \
   "Verify against current library documentation."
 
 # Returns on the first terminal/attention event; repeat only with `pending` IDs.
@@ -60,7 +60,7 @@ $PI_WORKER cancel --run-id fix-1 --reason "Task superseded" --timeout 30
 
 # Redirect an explicitly live turn without restarting it.
 $PI_WORKER dispatch --run-id live-fix --mode write --source /absolute/repo --live -- \
-  --provider krill --model grok-4.5 "Implement the bounded fix."
+  --provider shuaiapi-grok --model grok-4.5 "Implement the bounded fix."
 $PI_WORKER steer --run-id live-fix -- "Stop broad searching; inspect the failing test and its direct caller."
 $PI_WORKER wait --run-id live-fix --timeout 86400
 

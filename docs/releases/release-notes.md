@@ -1,5 +1,10 @@
 # 发布记录
 
+## v0.1.12 - 2026-08-12
+
+- 移除 `krill/grok-4.5` 与 `krill-sol/gpt-5.6-sol` Profile、示例和测试引用。
+- Pi 用户配置中的对应 Provider 与凭据由安装侧同步删除；其余 Provider 不变。
+
 ## v0.1.11 - 2026-08-10
 
 - `status` 增加 `activitySeconds`、`firstToolAt`、`lastToolAt` 和 `lastEventType`，避免把 `waiting_model` 误判为仓库读取或工具进展；续跑会清零上一轮实时计数。

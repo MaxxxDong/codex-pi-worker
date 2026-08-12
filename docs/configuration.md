@@ -19,8 +19,6 @@ Pi provider 配置位于 `~/.pi/agent/models.json`。它通常包含明文 API K
 | `opencode-go` | `deepseek-v4-flash` |
 | `shuaiapi` | `gpt-5.6-luna`, `gpt-5.6-sol` |
 | `shuaiapi-grok` | `grok-4.5` |
-| `krill` | `grok-4.5` |
-| `krill-sol` | `gpt-5.6-sol` |
 
 默认路由为 `opencode-go/deepseek-v4-flash`，thinking 为 `max`。如需新增 provider，必须同时更新私有 `models.json`、`PROVIDER_MODELS` 和测试；不要通过静默 fallback 掩盖拼写或认证错误。
 
