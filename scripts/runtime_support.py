@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import stat
+import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, TypedDict
 
 CACHE_LIMIT_BYTES = 20 * 1024**3
 CACHE_TARGET_BYTES = 19 * 1024**3
@@ -18,10 +21,14 @@ CACHE_CHECK_INTERVAL_SECONDS = 3600
 RUN_TEMP_STALE_SECONDS = 3600
 JOB_HISTORY_RETENTION_SECONDS = 7 * 24 * 3600
 ATTENTION_EVENT_PREFIX = r"Local\pi-worker-attention-"
+CANCEL_EVENT_PREFIX = r"Local\pi-worker-cancel-"
+STEER_EVENT_PREFIX = r"Local\pi-worker-steer-"
+STEER_ACK_EVENT_PREFIX = r"Local\pi-worker-steer-ack-"
 DEFAULT_PROVIDER = "opencode-go"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_THINKING = "max"
 PROVIDER_MODELS = {
+    "deepseek": {"deepseek-v4-flash"},
     "opencode-go": {"deepseek-v4-flash"},
     "shuaiapi": {"gpt-5.6-luna", "gpt-5.6-sol"},
     "shuaiapi-grok": {"grok-4.5"},
@@ -29,6 +36,71 @@ PROVIDER_MODELS = {
     "krill-sol": {"gpt-5.6-sol"},
 }
 MODEL_CHOICES = tuple(sorted({model for models in PROVIDER_MODELS.values() for model in models}))
+
+
+class UntrackedSnapshot(TypedDict):
+    path: str
+    sha256: str
+    bytes: int
+
+
+class SourceSnapshot(TypedDict):
+    fingerprint: str
+    dirty: bool
+    status: list[str]
+    trackedPatch: bytes
+    trackedPatchSha256: str
+    untracked: list[UntrackedSnapshot]
+
+
+def _git_bytes(source: Path, *args: str) -> bytes:
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    completed = subprocess.run(
+        ["git", "-C", str(source), *args],
+        capture_output=True,
+        env=env,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(message or "git command failed")
+    return completed.stdout
+
+
+def capture_source_snapshot(source: Path) -> SourceSnapshot:
+    """Capture the non-ignored WIP fingerprint without mutating the source checkout."""
+    source = source.resolve()
+    head = _git_bytes(source, "rev-parse", "HEAD").strip()
+    status = _git_bytes(source, "status", "--porcelain=v1", "--untracked-files=all")
+    tracked_patch = _git_bytes(source, "diff", "--binary", "--no-ext-diff", "HEAD", "--", ".")
+    raw_paths = _git_bytes(source, "ls-files", "--others", "--exclude-standard", "-z")
+    untracked: list[UntrackedSnapshot] = []
+    digest = hashlib.sha256(head + b"\0tracked\0" + tracked_patch)
+    for raw_path in filter(None, raw_paths.split(b"\0")):
+        relative = os.fsdecode(raw_path)
+        candidate = source / relative
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(source)
+        except ValueError as exc:
+            raise RuntimeError(f"untracked path escapes source checkout: {relative}") from exc
+        mode = candidate.lstat().st_mode
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"unsupported untracked non-file in source snapshot: {relative}")
+        content_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        size = candidate.stat().st_size
+        untracked.append({"path": relative, "sha256": content_hash, "bytes": size})
+        digest.update(b"\0untracked\0" + raw_path + b"\0")
+        digest.update(content_hash.encode("ascii") + b"\0" + str(size).encode("ascii"))
+    return {
+        "fingerprint": digest.hexdigest(),
+        "dirty": bool(status),
+        "status": status.decode("utf-8", errors="replace").splitlines(),
+        "trackedPatch": tracked_patch,
+        "trackedPatchSha256": hashlib.sha256(tracked_patch).hexdigest(),
+        "untracked": untracked,
+    }
 SAFE_ENV_NAMES = {
     "ALLUSERSPROFILE",
     "APPDATA",
@@ -80,6 +152,7 @@ SAFE_ENV_NAMES = {
     "BRAVE_API_KEY",
     "CLOUDFLARE_API_KEY",
     "EXA_API_KEY",
+    "FIRECRAWL_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_GEMINI_BASE_URL",
     "PARALLEL_API_KEY",
@@ -95,6 +168,18 @@ def emit_json(value: dict[str, object]) -> None:
 
 def attention_event_name(run_id: str) -> str:
     return f"{ATTENTION_EVENT_PREFIX}{run_id}"
+
+
+def cancel_event_name(run_id: str) -> str:
+    return f"{CANCEL_EVENT_PREFIX}{run_id}"
+
+
+def steer_event_name(run_id: str) -> str:
+    return f"{STEER_EVENT_PREFIX}{run_id}"
+
+
+def steer_ack_event_name(message_id: str) -> str:
+    return f"{STEER_ACK_EVENT_PREFIX}{message_id}"
 
 
 def create_attention_event(name: str) -> int | None:
@@ -134,6 +219,20 @@ def reset_attention_event(handle: int | None) -> None:
     kernel32.ResetEvent.restype = ctypes.c_int
     if not kernel32.ResetEvent(ctypes.c_void_p(handle)):
         raise OSError(ctypes.get_last_error(), "ResetEvent failed")
+
+
+def wait_windows_event(handle: int, timeout_seconds: float | None = None) -> bool:
+    if os.name != "nt":
+        raise OSError("named event waiting is only available on Windows")
+    import ctypes
+
+    timeout_ms = 0xFFFFFFFF if timeout_seconds is None else max(0, round(timeout_seconds * 1000))
+    result = ctypes.windll.kernel32.WaitForSingleObject(ctypes.c_void_p(handle), timeout_ms)
+    if result == 0:
+        return True
+    if result == 0x102:
+        return False
+    raise OSError(ctypes.get_last_error(), "WaitForSingleObject failed")
 
 
 def close_windows_handle(handle: int | None) -> None:
@@ -206,9 +305,24 @@ def remove_owned_tree(path: Path, owned_root: Path) -> bool:
 
 def atomic_json(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            fd = -1
+            handle.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        for attempt in range(10):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 9:
+                    raise
+                time.sleep(0.005 * (attempt + 1))
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
 
 
 def validate_route(provider: str, model: str) -> None:
@@ -218,21 +332,22 @@ def validate_route(provider: str, model: str) -> None:
 
 def record_job(root: Path, job_id: str, **values: object) -> dict[str, object]:
     path = root / "jobs" / f"{job_id}.json"
-    try:
-        current = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        current = {"jobId": job_id, "createdAtEpoch": time.time()}
-    same_turn = current.get("latestRunId") == values.get("latestRunId")
-    if (
-        same_turn
-        and current.get("state") in {"pending_review", "settled"}
-        and values.get("state") in {"starting", "running"}
-    ):
-        values.pop("state", None)
-    current.update(values)
-    current["updatedAtEpoch"] = time.time()
-    atomic_json(path, current)
-    return current
+    with runtime_lock(root):
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            current = {"jobId": job_id, "createdAtEpoch": time.time()}
+        same_turn = current.get("latestRunId") == values.get("latestRunId")
+        if same_turn and current.get("state") in {"pending_review", "settled"} and values.get("state") in {
+            "starting",
+            "running",
+            "orphaned",
+        }:
+            return current
+        current.update(values)
+        current["updatedAtEpoch"] = time.time()
+        atomic_json(path, current)
+        return current
 
 
 def remove_job(root: Path, job_id: str) -> None:
@@ -544,7 +659,17 @@ def remove_run_temp(root: Path, run_id: str) -> None:
     run_dir = (root / "runs" / run_id).resolve()
     runs_root = (root / "runs").resolve()
     if run_dir.is_dir() and is_within(run_dir, runs_root):
-        remove_owned_tree(run_dir, runs_root)
+        delays = (0.1, 0.2, 0.4, 0.8) if os.name == "nt" else ()
+        for delay in (*delays, None):
+            try:
+                remove_owned_tree(run_dir, runs_root)
+                return
+            except OSError as error:
+                if delay is None or not (
+                    isinstance(error, PermissionError) or getattr(error, "winerror", None) in {5, 32}
+                ):
+                    raise
+                time.sleep(delay)
 
 
 def utc_now() -> str:

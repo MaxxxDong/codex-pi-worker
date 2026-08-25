@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -85,6 +86,63 @@ class SessionContinuationTests(unittest.TestCase):
             self.assertEqual(restored["latestReceiptPath"], str(receipt.resolve()))
             self.assertEqual(restored["cleanupStatus"], "pending_review")
 
+    def test_continuation_rechecks_finalization_under_runtime_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            runtime = base / "runtime"
+            output = base / "output"
+            source = base / "source"
+            session = runtime / "sessions" / "session"
+            source.mkdir()
+            session.mkdir(parents=True)
+            output.mkdir()
+            prompt = base / "prompt.md"
+            prompt.write_text("continue", encoding="utf-8")
+            result = output / "pi-result.json"
+            receipt = output / "pi-receipt.json"
+            result.write_text("{}", encoding="utf-8")
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "runId": "owner",
+                        "pid": 0,
+                        "resultPath": str(result),
+                        "latestReceiptPath": str(receipt),
+                        "ownerReceiptPath": str(receipt),
+                        "cleanupStatus": "pending_review",
+                        "sessionDir": str(session),
+                        "sessionId": "session",
+                        "runtimeRoot": str(runtime),
+                        "executionCwd": str(source),
+                        "sourceCwd": str(source),
+                        "sourceRoot": str(source),
+                        "outputDir": str(output),
+                        "mode": "analysis",
+                        "provider": "opencode-go",
+                        "model": "deepseek-v4-flash",
+                        "thinking": "max",
+                        "lastTurnIndex": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            @contextmanager
+            def finalize_before_lock(_root: Path):
+                owner = json.loads(receipt.read_text(encoding="utf-8"))
+                owner["cleanupStatus"] = "settled"
+                receipt.write_text(json.dumps(owner), encoding="utf-8")
+                yield
+
+            argv = ["continue_pi_worker.py", str(receipt), "--prompt-file", str(prompt)]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(continue_pi_worker, "runtime_lock", finalize_before_lock),
+                self.assertRaisesRegex(SystemExit, "already finalized"),
+            ):
+                continue_pi_worker.main()
+            self.assertFalse((output / "turns" / "turn-002").exists())
+
     def test_finalize_accept_requires_integrated_flag_for_patch_only_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -115,6 +173,140 @@ class SessionContinuationTests(unittest.TestCase):
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("--changes-integrated", completed.stderr)
+
+    def test_finalize_rejected_settles_dead_orphan_without_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            runtime = root / "runtime"
+            output = root / "output"
+            worktree = runtime / "worktrees" / "orphan-worktree"
+            session = runtime / "sessions" / "orphan"
+            source.mkdir()
+            output.mkdir()
+            session.mkdir(parents=True)
+            for command in (
+                ["git", "init", str(source)],
+                ["git", "-C", str(source), "config", "user.email", "pi-test@example.invalid"],
+                ["git", "-C", str(source), "config", "user.name", "Pi Test"],
+            ):
+                subprocess.run(command, check=True, capture_output=True)
+            (source / "tracked.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "base"], check=True, capture_output=True)
+            worktree.parent.mkdir(parents=True)
+            subprocess.run(
+                ["git", "-C", str(source), "worktree", "add", "--detach", str(worktree)],
+                check=True,
+                capture_output=True,
+            )
+            run_id = "orphan"
+            receipt = output / "pi-receipt.json"
+            result = output / "pi-result.json"
+            receipt_data = {
+                "runId": run_id,
+                "pid": 999_999_999,
+                "status": "running",
+                "resultPath": str(result),
+                "outputDir": str(output),
+                "sourceRoot": str(source),
+                "sourceCwd": str(source),
+                "executionCwd": str(worktree),
+                "worktreePath": str(worktree),
+                "sessionDir": str(session),
+                "runtimeRoot": str(runtime),
+                "ownerReceiptPath": str(receipt),
+                "latestReceiptPath": str(receipt),
+                "mode": "implementation",
+                "provider": "opencode-go",
+                "model": "deepseek-v4-flash",
+                "thinking": "max",
+            }
+            receipt.write_text(json.dumps(receipt_data), encoding="utf-8")
+            (runtime / "jobs").mkdir(parents=True)
+            (runtime / "jobs" / f"{run_id}.json").write_text(
+                json.dumps(
+                    {
+                        "jobId": run_id,
+                        "state": "orphaned",
+                        "pid": 0,
+                        "latestRunId": run_id,
+                        "latestReceiptPath": str(receipt),
+                        "resultPath": str(result),
+                        "sourceRoot": str(source),
+                        "worktreePath": str(worktree),
+                        "sessionDir": str(session),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (runtime / "runs" / run_id).mkdir(parents=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "finalize_pi_worker.py"),
+                    str(receipt),
+                    "--decision",
+                    "rejected",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env={**os.environ, "PI_WORKER_ROOT": str(runtime)},
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            finalized = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual(finalized["status"], "failed")
+            self.assertEqual(finalized["stopReason"], "worker_exited_without_result")
+            self.assertTrue(finalized["syntheticResult"])
+            self.assertEqual(finalized["cleanupStatus"], "settled")
+            self.assertFalse(worktree.exists())
+            self.assertFalse(session.exists())
+            self.assertFalse((runtime / "runs" / run_id).exists())
+
+    def test_finalize_orphan_without_result_rejects_accept_and_identity_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            output = root / "output"
+            output.mkdir()
+            (runtime / "jobs").mkdir(parents=True)
+            receipt = output / "pi-receipt.json"
+            result = output / "pi-result.json"
+            data = {
+                "runId": "orphan",
+                "resultPath": str(result),
+                "outputDir": str(output),
+                "sourceRoot": str(root / "source"),
+                "worktreePath": None,
+                "sessionDir": None,
+                "runtimeRoot": str(runtime),
+                "ownerReceiptPath": str(receipt),
+                "latestReceiptPath": str(receipt),
+            }
+            receipt.write_text(json.dumps(data), encoding="utf-8")
+            job = {
+                "jobId": "orphan",
+                "state": "orphaned",
+                "pid": 0,
+                "latestRunId": "orphan",
+                "latestReceiptPath": str(receipt),
+                "resultPath": str(result),
+                "sourceRoot": str(root / "different-source"),
+                "worktreePath": None,
+                "sessionDir": None,
+            }
+            (runtime / "jobs" / "orphan.json").write_text(json.dumps(job), encoding="utf-8")
+            base_command = [sys.executable, str(SCRIPTS / "finalize_pi_worker.py"), str(receipt), "--decision"]
+            env = {**os.environ, "PI_WORKER_ROOT": str(runtime)}
+            accepted = subprocess.run(base_command + ["accepted"], capture_output=True, text=True, env=env, check=False)
+            self.assertNotEqual(accepted.returncode, 0)
+            rejected = subprocess.run(base_command + ["rejected"], capture_output=True, text=True, env=env, check=False)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("identity mismatch", rejected.stderr)
+            self.assertFalse(result.exists())
 
     def test_finalize_removes_long_path_worktree_after_git_cleanup_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -212,7 +404,15 @@ class SessionContinuationTests(unittest.TestCase):
             result_path = output / "pi-result.json"
             receipt_path = output / "pi-receipt.json"
             result_path.write_text(
-                json.dumps({"status": "failed", "cleanupStatus": "pending_review", "changedFiles": []}),
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "cleanupStatus": "pending_review",
+                        "changedFiles": [],
+                        "reviewRequired": True,
+                        "continuationAvailable": True,
+                    }
+                ),
                 encoding="utf-8",
             )
             receipt_path.write_text(
@@ -243,6 +443,9 @@ class SessionContinuationTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIsNone(json.loads(completed.stdout)["sessionRemoved"])
+            finalized = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertFalse(finalized["reviewRequired"])
+            self.assertFalse(finalized["continuationAvailable"])
 
     def test_terminal_followup_reuses_session_then_finalize_removes_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -265,12 +468,14 @@ class SessionContinuationTests(unittest.TestCase):
                 "session_dir.mkdir(parents=True, exist_ok=True)\n"
                 "state=session_dir/'state.txt'\n"
                 "previous=state.read_text(encoding='utf-8') if state.exists() else 'NONE'\n"
-                "prompt=sys.stdin.read().strip()\n"
+                "command=json.loads(sys.stdin.readline())\n"
+                "prompt=command['message']\n"
                 "state.write_text(prompt, encoding='utf-8')\n"
                 "turn=1 if previous=='NONE' else 2\n"
                 "text=f'TURN={turn} PREV={previous} PROMPT={prompt}'\n"
                 "print(json.dumps({'type':'message_end','message':{'role':'assistant','provider':'krill','model':'grok-4.5','stopReason':'stop','usage':{},'content':[{'type':'text','text':text}]}}), flush=True)\n"
-                "print(json.dumps({'type':'agent_end'}), flush=True)\n",
+                "print(json.dumps({'type':'agent_end'}), flush=True)\n"
+                "print(json.dumps({'type':'agent_settled'}), flush=True)\n",
                 encoding="utf-8",
             )
             (fake_bin / "pi.cmd").write_text(
@@ -339,7 +544,8 @@ class SessionContinuationTests(unittest.TestCase):
             self.assertEqual(continued.returncode, 0, continued.stderr)
             second_receipt = json.loads(continued.stdout)
             second_receipt_path = Path(second_receipt["outputDir"]) / "pi-receipt.json"
-            self._watch(second_receipt_path, env)
+            watched = self._watch(owner_receipt, env)
+            self.assertEqual(watched["result"]["turnIndex"], 2)
             second_result = json.loads(Path(second_receipt["resultPath"]).read_text(encoding="utf-8"))
             self.assertEqual(second_result["turnIndex"], 2)
             self.assertIn("PREV=FIRST", second_result["finalText"])
@@ -369,7 +575,7 @@ class SessionContinuationTests(unittest.TestCase):
             )
             self.assertEqual(job["state"], "settled")
 
-    def _watch(self, receipt: Path, env: dict[str, str]) -> None:
+    def _watch(self, receipt: Path, env: dict[str, str]) -> dict[str, object]:
         watched = subprocess.run(
             [
                 sys.executable,
@@ -386,7 +592,9 @@ class SessionContinuationTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(watched.returncode, 0, watched.stderr)
-        self.assertEqual(json.loads(watched.stdout)["event"], "terminal")
+        result = json.loads(watched.stdout)
+        self.assertEqual(result["event"], "terminal")
+        return result
 
 
 if __name__ == "__main__":

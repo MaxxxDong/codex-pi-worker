@@ -10,11 +10,13 @@
 |---|---|
 | 后台启动 | `start` 立即返回 receipt，Windows 使用无窗口 detached process |
 | 事件优先等待 | named event + 进程句柄唤醒，不需要反复 `status`/日志轮询 |
-| 分析与实现分流 | `analysis` 禁止写工具；`implementation` 使用独立 Git worktree |
+| 分析与实现分流 | 默认 `implementation`；只有明确只读任务才用 `analysis`，两者都有 `grep/find/ls` |
+| 脏 WIP 隔离 | 自动复制 staged、unstaged 和非 ignored untracked 内容；源仓库不 stash、不改写 |
 | 同任务续跑 | receipt 绑定 Pi session、worktree 和 turn 序号 |
+| 运行中纠偏 | Pi 原生 RPC `steer`，receipt 绑定投递并等待 accepted 回执 |
 | 审核后清理 | Worker 结束只进入 `pending_review`；Codex 接受或拒绝后显式 finalize |
 | 并行执行 | 独立任务可共享 20 GiB 依赖下载缓存，写入范围不能重叠 |
-| 失败早通知 | 401/403、429、5xx、EPIPE、传输错误、reasoning 降级会发 `attention` |
+| 失败早通知 | provider/runtime 错误、连续工具失败和重试失败会立即发可重复 `attention` |
 | Windows 兼容 | UTF-8/CP936 安全 JSON、`CREATE_NO_WINDOW`、进程树终止、长路径清理 |
 | 证据控制 | JSON result、紧凑事件、stderr、binary patch 与日志容量上限 |
 
@@ -30,13 +32,12 @@ New-Item -ItemType Junction `
   -Target "C:\CodexWS\Software\codex-pi-worker"
 ```
 
-启动一个只读分析 Worker：
+启动一个普通实现 Worker（默认模式，无需写 `--mode implementation`）：
 
 ```powershell
 python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\start_pi_worker.py" `
   --cwd C:\path\to\repo `
   --prompt-file C:\path\to\task.md `
-  --mode analysis `
   --output-dir C:\path\to\evidence
 ```
 
@@ -65,15 +66,24 @@ python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\watch_pi_worker.py" `
 
 - `status=completed` 只代表执行合同成立，不代表代码正确。
 - implementation 使用独立 worktree 和命令 guard，但不是 OS 级沙箱；不要执行不可信 prompt。
+- Firecrawl 通过 `--firecrawl` 按需加载；Playwright 通过 `--playwright` 仅在浏览器任务加载。
 - `~/.pi/agent/models.json`、receipt、session、patch 和日志可能含秘密或私有源码，禁止提交。
 - 清理必须发生在 Codex 审核之后；不要让 Worker 自己删除候选 worktree。
 
 ## 最新更新
 
-### 2026-08-02
+### 2026-08-25
 
-- 首次公开 Windows lifecycle runtime：事件通知、session continuation、review-gated cleanup、共享缓存、长路径与日志上限。
-- 发布前加固缓存所有权、成果删除门禁、结构化失败和 shell 路径逃逸检查。
+- implementation 自动建立 WIP baseline，最终 patch 只含 Worker 增量。
+- 外部证据通过 `--evidence-file` 精确复制到 worktree，避免放宽源仓库写保护。
+- dead/no-result Worker 可在严格 receipt/job 身份校验后 rejected finalize，不再永久残留 orphan。
+
+### 2026-08-04
+
+- 修复 MSYS 工作树路径和 Gradle 文件名造成的 guard 误拦截。
+- 增加 receipt 绑定的安全取消；取消后保留结果、session 和 worktree，等待 Codex 审核再清理。
+- watch 返回 runtime job 的事实状态；重复工具错误直接携带最近三条脱敏摘要。
+- 并发 receipt 使用同一个 first-ready watch，任一任务完成、失败或异常都会立即唤醒。
 
 完整记录见 [发布记录](docs/releases/release-notes.md)。
 

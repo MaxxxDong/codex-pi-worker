@@ -17,6 +17,7 @@ from runtime_support import (
     activate_cache,
     atomic_json,
     attention_event_name,
+    cancel_event_name,
     emit_json,
     is_within,
     pid_alive,
@@ -27,6 +28,7 @@ from runtime_support import (
     reserve_cache,
     runtime_lock,
     runtime_root,
+    steer_event_name,
     terminate_process_tree,
 )
 
@@ -74,6 +76,7 @@ def main() -> int:
         raise SystemExit(f"execution cwd is missing: {execution_cwd}")
 
     run_id = str(uuid.uuid4())
+    steer_queue_dir = (root / "runs" / run_id / "steer").resolve()
     turn_index = int(owner.get("lastTurnIndex") or 1) + 1
     output_dir = Path(str(owner["outputDir"])).resolve() / "turns" / f"turn-{turn_index:03d}"
     receipt_path = output_dir / "pi-receipt.json"
@@ -81,6 +84,8 @@ def main() -> int:
 
     with runtime_lock(root):
         owner = read_json(owner_path)
+        if owner.get("cleanupStatus") == "settled":
+            raise SystemExit("worker is already finalized")
         if int(owner.get("lastTurnIndex") or 1) + 1 != turn_index:
             raise SystemExit("another continuation was allocated concurrently")
         output_dir.mkdir(parents=True, exist_ok=False)
@@ -94,6 +99,8 @@ def main() -> int:
         atomic_json(owner_path, owner)
 
     timeout_seconds = args.timeout_seconds or int(owner.get("timeoutSeconds") or 1800)
+    source_snapshot = owner.get("sourceSnapshot")
+    source_fingerprint = str(source_snapshot.get("fingerprint") or "") if isinstance(source_snapshot, dict) else ""
     cache_status = reserve_cache(root, run_id)
     runner = Path(__file__).with_name("run_pi_worker.py")
     command = [
@@ -125,6 +132,8 @@ def main() -> int:
         str(root),
         "--base-commit",
         str(owner.get("baseCommit") or ""),
+        "--source-fingerprint",
+        source_fingerprint,
         "--session-id",
         str(owner["sessionId"]),
         "--session-dir",
@@ -135,13 +144,25 @@ def main() -> int:
         str(turn_index),
         "--attention-event-name",
         attention_event_name(run_id),
+        "--cancel-event-name",
+        cancel_event_name(run_id),
+        "--steer-event-name",
+        steer_event_name(run_id),
+        "--steer-queue-dir",
+        str(steer_queue_dir),
         "--launch-gated",
     ]
     worktree = owner.get("worktreePath")
     if worktree:
         command.extend(("--worktree-path", str(worktree), "--allow-existing-changes"))
+    if owner.get("inputManifest"):
+        command.extend(("--input-manifest", ".pi-worker-inputs/manifest.json"))
     if owner.get("contextMode"):
         command.append("--context-mode")
+    if owner.get("firecrawl"):
+        command.append("--firecrawl")
+    if owner.get("playwright"):
+        command.append("--playwright")
 
     stdout_file = (output_dir / "runtime.stdout.log").open("wb")
     stderr_file = (output_dir / "runtime.stderr.log").open("wb")
@@ -204,12 +225,19 @@ def main() -> int:
         "resultPath": str(result_path),
         "attentionPath": str(output_dir / "pi-attention.json"),
         "attentionEventName": attention_event_name(run_id),
+        "cancelEventName": cancel_event_name(run_id),
+        "steerEventName": steer_event_name(run_id),
+        "steerQueueDir": str(steer_queue_dir),
+        "steerAvailable": os.name == "nt",
         "outputDir": str(output_dir),
         "sourceRoot": str(owner["sourceRoot"]),
         "sourceCwd": str(owner["sourceCwd"]),
         "executionCwd": str(execution_cwd),
         "worktreePath": worktree,
         "baseCommit": owner.get("baseCommit"),
+        "sourceHead": owner.get("sourceHead"),
+        "sourceSnapshot": owner.get("sourceSnapshot"),
+        "inputManifest": owner.get("inputManifest"),
         "sessionId": owner["sessionId"],
         "sessionDir": str(session_dir),
         "turnIndex": turn_index,
@@ -220,6 +248,8 @@ def main() -> int:
         "thinking": owner["thinking"],
         "timeoutSeconds": timeout_seconds,
         "contextMode": bool(owner.get("contextMode")),
+        "firecrawl": bool(owner.get("firecrawl")),
+        "playwright": bool(owner.get("playwright")),
         "cleanupStatus": "pending_worker",
         "cacheStatusAtStart": cache_status,
         "runtimeRoot": str(root),

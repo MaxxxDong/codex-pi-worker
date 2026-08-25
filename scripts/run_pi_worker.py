@@ -14,8 +14,9 @@ import sys
 import time
 import traceback
 import uuid
+from collections import deque
 from pathlib import Path
-from threading import Condition, Event, Thread
+from threading import Condition, Event, Lock, Thread
 
 from runtime_support import (
     DEFAULT_MODEL,
@@ -24,16 +25,22 @@ from runtime_support import (
     MODEL_CHOICES,
     PROVIDER_MODELS,
     atomic_json,
+    cancel_event_name,
+    capture_source_snapshot,
     close_windows_handle,
     create_attention_event,
     emit_json,
     record_job,
     release_cache,
     remove_run_temp,
+    reset_attention_event,
     set_attention_event,
+    steer_ack_event_name,
+    steer_event_name,
     terminate_process_tree,
     utc_now,
     validate_route,
+    wait_windows_event,
     worker_environment,
 )
 
@@ -41,12 +48,22 @@ MAX_RAW_EVENT_BYTES = 8 * 1024**2
 MAX_EVENT_LOG_BYTES = 16 * 1024**2
 MAX_STDERR_LOG_BYTES = 8 * 1024**2
 MAX_FINAL_TEXT_BYTES = 1024**2
+MAX_TOOL_ERROR_BYTES = 2048
+
+BASE_TOOLS = "read,bash,edit,write,grep,find,ls,web_search,fetch_content,get_search_content"
+ANALYSIS_TOOLS = "read,grep,find,ls,web_search,fetch_content,get_search_content"
+IMPLEMENTATION_GUIDANCE = (
+    "The current working directory is the isolated execution worktree. Use relative paths for edits and commands. "
+    "The source checkout and home may be inspected read-only, but never mutate or execute against them. "
+    "Resolve uncertain paths with find or grep before targeting them; do not infer a file path from a symbol name."
+)
 
 CREDENTIAL_PATTERNS = (
     re.compile(rb"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"),
     re.compile(rb"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(rb"(?i)(?<![A-Za-z0-9])(?:sk|nb)[-_][A-Za-z0-9_-]{8,}"),
 )
+GENERATED_PATH_PARTS = {"__pycache__", ".pytest_cache", ".playwright-cli"}
 
 
 def redact_credentials(raw: bytes) -> bytes:
@@ -55,13 +72,18 @@ def redact_credentials(raw: bytes) -> bytes:
     return CREDENTIAL_PATTERNS[2].sub(b"[REDACTED]", redacted)
 
 
+def tool_error_summary(event: dict[str, object]) -> str:
+    encoded = redact_credentials(json.dumps(event.get("result"), ensure_ascii=False, default=str).encode("utf-8"))
+    return encoded[:MAX_TOOL_ERROR_BYTES].decode("utf-8", errors="ignore")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cwd", type=Path, required=True)
     parser.add_argument("--source-cwd", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, default=None)
     parser.add_argument("--prompt-file", type=Path, required=True)
-    parser.add_argument("--mode", choices=("analysis", "implementation"), required=True)
+    parser.add_argument("--mode", choices=("analysis", "implementation"), default="implementation")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument(
@@ -80,16 +102,23 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_THINKING,
     )
     parser.add_argument("--context-mode", action="store_true")
+    parser.add_argument("--firecrawl", action="store_true")
+    parser.add_argument("--playwright", action="store_true")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--worktree-path", type=Path, default=None)
     parser.add_argument("--base-commit", default="")
+    parser.add_argument("--source-fingerprint", default="")
+    parser.add_argument("--input-manifest", default="")
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--session-dir", type=Path, required=True)
     parser.add_argument("--owner-run-id", default=None)
     parser.add_argument("--turn-index", type=int, default=1)
     parser.add_argument("--allow-existing-changes", action="store_true")
     parser.add_argument("--attention-event-name", default=None)
+    parser.add_argument("--cancel-event-name", default=None)
+    parser.add_argument("--steer-event-name", default=None)
+    parser.add_argument("--steer-queue-dir", type=Path, default=None)
     parser.add_argument("--launch-gated", action="store_true")
     return parser.parse_args()
 
@@ -141,7 +170,14 @@ def git_changes(cwd: Path) -> list[str]:
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         check=False,
     )
-    return completed.stdout.splitlines() if completed.returncode == 0 else []
+    if completed.returncode != 0:
+        return []
+    return [line for line in completed.stdout.splitlines() if not is_generated_path(line[3:])]
+
+
+def is_generated_path(value: str) -> bool:
+    normalized = value.replace("\\", "/")
+    return normalized.endswith(".pyc") or bool(GENERATED_PATH_PARTS.intersection(normalized.split("/")))
 
 
 def compact_event(raw: bytes) -> bytes | None:
@@ -164,6 +200,8 @@ def compact_event(raw: bytes) -> bytes | None:
             "toolName": event.get("toolName"),
             "isError": bool(event.get("isError")),
         }
+        if compact["isError"]:
+            compact["errorSummary"] = tool_error_summary(event)
     elif event_type == "message_end":
         message = event.get("message") or {}
         if message.get("role") != "assistant":
@@ -187,6 +225,50 @@ def compact_event(raw: bytes) -> bytes | None:
         }
     elif event_type in {"agent_end", "agent_settled"}:
         compact = {"type": event_type}
+    elif event_type == "response":
+        compact = {
+            "type": event_type,
+            "id": event.get("id"),
+            "command": event.get("command"),
+            "success": bool(event.get("success")),
+        }
+        if event.get("error"):
+            compact["error"] = redact_credentials(str(event["error"]).encode())[:MAX_TOOL_ERROR_BYTES].decode(
+                errors="ignore"
+            )
+    elif event_type == "queue_update":
+        compact = {
+            "type": event_type,
+            "steeringCount": len(event.get("steering") or []),
+            "followUpCount": len(event.get("followUp") or []),
+        }
+    elif event_type in {"auto_retry_start", "auto_retry_end"}:
+        compact = {
+            "type": event_type,
+            "attempt": event.get("attempt"),
+            "maxAttempts": event.get("maxAttempts"),
+            "success": event.get("success"),
+        }
+        retry_error = event.get("errorMessage") or event.get("finalError")
+        if retry_error:
+            compact["errorSummary"] = redact_credentials(str(retry_error).encode())[:MAX_TOOL_ERROR_BYTES].decode(
+                errors="ignore"
+            )
+    elif event_type == "compaction_end" and not event.get("result") and not event.get("aborted"):
+        compact = {
+            "type": event_type,
+            "errorSummary": redact_credentials(str(event.get("errorMessage") or "").encode())[
+                :MAX_TOOL_ERROR_BYTES
+            ].decode(errors="ignore"),
+        }
+    elif event_type == "extension_error":
+        compact = {
+            "type": event_type,
+            "extensionPath": event.get("extensionPath"),
+            "errorSummary": redact_credentials(str(event.get("error") or "").encode())[:MAX_TOOL_ERROR_BYTES].decode(
+                errors="ignore"
+            ),
+        }
     else:
         return None
     compact["at"] = utc_now()
@@ -203,7 +285,11 @@ def write_patch(cwd: Path, output_dir: Path, base_commit: str) -> dict[str, obje
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         check=False,
     ).stdout.split(b"\0")
-    untracked_paths = [path.decode("utf-8", errors="surrogateescape") for path in untracked if path]
+    untracked_paths = [
+        decoded
+        for path in untracked
+        if path and not is_generated_path(decoded := path.decode("utf-8", errors="surrogateescape"))
+    ]
     for start in range(0, len(untracked_paths), 100):
         subprocess.run(
             ["git", "add", "-N", "--", *untracked_paths[start : start + 100]],
@@ -214,7 +300,19 @@ def write_patch(cwd: Path, output_dir: Path, base_commit: str) -> dict[str, obje
             check=False,
         )
     completed = subprocess.run(
-        ["git", "diff", "--binary", "--no-ext-diff", base_commit, "--"],
+        [
+            "git",
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            base_commit,
+            "--",
+            ".",
+            ":(exclude)**/__pycache__/**",
+            ":(exclude)**/.pytest_cache/**",
+            ":(exclude)**/.playwright-cli/**",
+            ":(exclude)**/*.pyc",
+        ],
         cwd=cwd,
         capture_output=True,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
@@ -224,10 +322,25 @@ def write_patch(cwd: Path, output_dir: Path, base_commit: str) -> dict[str, obje
         return None
     patch_path = output_dir / "changes.patch"
     patch_path.write_bytes(completed.stdout)
+    files = [
+        path
+        for path in subprocess.run(
+            ["git", "diff", "--name-only", base_commit, "--", "."],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            check=False,
+        ).stdout.splitlines()
+        if not is_generated_path(path)
+    ]
     return {
         "path": str(patch_path),
         "sha256": hashlib.sha256(completed.stdout).hexdigest(),
         "bytes": len(completed.stdout),
+        "files": files,
     }
 
 
@@ -245,9 +358,20 @@ def schedule_cache_gc(runtime: Path) -> bool:
             start_new_session=os.name != "nt",
             close_fds=True,
         )
-        return True
     except OSError:
         return False
+    return True
+
+
+def cleanup_run_temp(runtime: Path, run_id: str) -> dict[str, object]:
+    try:
+        remove_run_temp(runtime, run_id)
+    except OSError as error:
+        return {
+            "status": "deferred",
+            "error": redact_credentials(str(error).encode("utf-8"))[:500].decode("utf-8", errors="ignore"),
+        }
+    return {"status": "removed"}
 
 
 def parse_events(path: Path) -> dict[str, object]:
@@ -258,6 +382,7 @@ def parse_events(path: Path) -> dict[str, object]:
     model = None
     stop_reason = None
     agent_ended = False
+    agent_settled = False
     final_text_truncated = False
 
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -268,8 +393,13 @@ def parse_events(path: Path) -> dict[str, object]:
         event_type = event.get("type")
         if event_type == "agent_end":
             agent_ended = True
+        elif event_type == "agent_settled":
+            agent_settled = True
         elif event_type == "tool_execution_end":
-            tools.append({"name": event.get("toolName"), "error": bool(event.get("isError"))})
+            tool = {"name": event.get("toolName"), "error": bool(event.get("isError"))}
+            if event.get("errorSummary"):
+                tool["errorSummary"] = event["errorSummary"]
+            tools.append(tool)
         elif event_type == "message_end":
             message = event.get("message", {})
             if message.get("role") != "assistant":
@@ -287,6 +417,7 @@ def parse_events(path: Path) -> dict[str, object]:
 
     return {
         "agentEnded": agent_ended,
+        "agentSettled": agent_settled,
         "provider": provider,
         "model": model,
         "stopReason": stop_reason,
@@ -311,6 +442,16 @@ def main(args: argparse.Namespace | None = None) -> int:
     worktree_path = args.worktree_path.resolve() if args.worktree_path else None
     prompt_file = args.prompt_file.resolve()
     output_dir = args.output_dir.resolve()
+    steer_queue_dir = args.steer_queue_dir.resolve() if args.steer_queue_dir else None
+    if bool(args.steer_event_name) != bool(steer_queue_dir):
+        raise SystemExit("steer event and queue directory must be configured together")
+    if steer_queue_dir and (
+        steer_queue_dir != (runtime / "runs" / run_id / "steer").resolve()
+        or args.steer_event_name != steer_event_name(run_id)
+    ):
+        raise SystemExit("steer control path does not match the current run")
+    if args.cancel_event_name and args.cancel_event_name != cancel_event_name(run_id):
+        raise SystemExit("cancel event does not match the current run")
     if not cwd.is_dir():
         raise SystemExit(f"cwd is not a directory: {cwd}")
     if not prompt_file.is_file():
@@ -330,35 +471,67 @@ def main(args: argparse.Namespace | None = None) -> int:
     result_path = output_dir / "pi-result.json"
     attention_path = output_dir / "pi-attention.json"
     attention_handle = create_attention_event(args.attention_event_name) if args.attention_event_name else None
-    attention_sent = Event()
+    cancel_handle = create_attention_event(args.cancel_event_name) if args.cancel_event_name else None
+    attention_lock = Lock()
+    attention_times: dict[str, float] = {}
+    attention_sequence = 0
     event_log_bytes = 0
     stderr_log_bytes = 0
     event_log_truncated = False
     stderr_log_truncated = False
     oversize_event_count = 0
     reasoning_ignored_seen = False
+    recent_tool_errors: deque[str] = deque(maxlen=3)
 
     def notify_attention(category: str) -> None:
-        if attention_sent.is_set():
-            return
-        attention_sent.set()
-        atomic_json(
-            attention_path,
-            {
+        nonlocal attention_sequence
+        with attention_lock:
+            now = time.monotonic()
+            previous = attention_times.get(category)
+            if attention_path.exists() or (previous is not None and now - previous < 30):
+                return
+            attention_sequence += 1
+            attention_times[category] = now
+            payload: dict[str, object] = {
                 "runId": run_id,
+                "sequence": attention_sequence,
                 "category": category,
                 "message": "Pi worker reported a runtime/provider error; inspect the redacted evidence log.",
                 "at": utc_now(),
                 "stderr": str(stderr_path),
-            },
-        )
-        set_attention_event(attention_handle)
+            }
+            if category == "repeated_tool_errors":
+                payload["recentToolErrors"] = list(recent_tool_errors)
+            atomic_json(attention_path, payload)
+            set_attention_event(attention_handle)
 
+    enabled_tools = ANALYSIS_TOOLS if args.mode == "analysis" else BASE_TOOLS
+    if args.firecrawl:
+        enabled_tools += ",mcp"
+    guidance = (
+        IMPLEMENTATION_GUIDANCE
+        if args.mode == "implementation"
+        else (
+            "This is a read-only task. Inspect the current working directory without changing files or repository state. "
+            "Resolve uncertain paths with find or grep before targeting them; do not infer a file path from a symbol name."
+        )
+    )
+    if args.input_manifest:
+        manifest_path = (cwd / args.input_manifest).resolve()
+        try:
+            manifest_path.relative_to(cwd)
+        except ValueError as exc:
+            raise SystemExit("input manifest must be inside the execution worktree") from exc
+        if not manifest_path.is_file():
+            raise SystemExit(f"input manifest does not exist: {manifest_path}")
+        guidance += (
+            f" External evidence was copied into this worktree; use the relative-path mapping in {args.input_manifest} "
+            "instead of running commands against the original absolute paths."
+        )
     command = [
         pi,
         "--mode",
-        "json",
-        "--print",
+        "rpc",
         "--session-id",
         args.session_id,
         "--session-dir",
@@ -370,8 +543,12 @@ def main(args: argparse.Namespace | None = None) -> int:
         args.model,
         "--thinking",
         args.thinking,
+        "--append-system-prompt",
+        guidance,
         "--extension",
         str(Path(__file__).with_name("pi_worker_guard.mjs")),
+        "--tools",
+        enabled_tools,
     ]
     if args.context_mode:
         agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
@@ -381,8 +558,19 @@ def main(args: argparse.Namespace | None = None) -> int:
         if not context_extension.is_file() or not context_skills.is_dir():
             raise SystemExit(f"context-mode package is incomplete under {context_root}")
         command.extend(("--extension", str(context_extension), "--skill", str(context_skills)))
-    if args.mode == "analysis":
-        command.extend(("--exclude-tools", "bash,edit,write,ast_grep_replace"))
+    agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
+    if args.firecrawl:
+        adapter = agent_dir / "npm" / "node_modules" / "pi-mcp-adapter" / "index.ts"
+        if not adapter.is_file():
+            raise SystemExit(f"pi-mcp-adapter is not installed under {agent_dir}")
+        command.extend(("--extension", str(adapter)))
+    if args.playwright:
+        if args.mode != "implementation":
+            raise SystemExit("Playwright requires implementation mode")
+        playwright_skills = agent_dir / "npm" / "node_modules" / "pi-playwright" / "skills"
+        if not playwright_skills.is_dir():
+            raise SystemExit(f"pi-playwright is not installed under {agent_dir}")
+        command.extend(("--skill", str(playwright_skills)))
     flags = 0
     kwargs: dict[str, object] = {}
     if os.name == "nt":
@@ -392,11 +580,14 @@ def main(args: argparse.Namespace | None = None) -> int:
 
     started = time.perf_counter()
     timeout_event = Event()
+    cancelled_event = Event()
     process_done = Event()
+    steer_stop = Event()
     activity = Condition()
     last_activity = time.monotonic()
     source_status_after: list[str] = []
-    prompt = prompt_file.read_bytes()
+    source_drift_detected = False
+    prompt = prompt_file.read_text(encoding="utf-8")
     worker_env, _ = worker_environment(runtime, run_id)
     worker_env.update(
         {
@@ -408,8 +599,15 @@ def main(args: argparse.Namespace | None = None) -> int:
         }
     )
     cache_status: dict[str, object] = {}
+    run_temp_cleanup: dict[str, object] = {"status": "pending"}
+    steer_handle: int | None = None
+    cancel_thread: Thread | None = None
     try:
         with events_path.open("wb") as events_file, stderr_path.open("wb") as stderr_file:
+            if steer_queue_dir:
+                steer_queue_dir.mkdir(parents=True, exist_ok=True)
+                (steer_queue_dir / "acks").mkdir(exist_ok=True)
+                steer_handle = create_attention_event(args.steer_event_name)
             process = subprocess.Popen(
                 command,
                 cwd=cwd,
@@ -421,6 +619,66 @@ def main(args: argparse.Namespace | None = None) -> int:
                 **kwargs,
             )
             assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+            stdin_lock = Lock()
+
+            def watch_cancel() -> None:
+                assert cancel_handle is not None
+                wait_windows_event(cancel_handle)
+                if not process_done.is_set():
+                    cancelled_event.set()
+                    terminate_process_tree(process)
+
+            if cancel_handle is not None:
+                cancel_thread = Thread(target=watch_cancel, name=f"pi-cancel-{run_id}", daemon=True)
+                cancel_thread.start()
+
+            def send_rpc(command_value: dict[str, object]) -> None:
+                encoded = (json.dumps(command_value, ensure_ascii=False) + "\n").encode("utf-8")
+                with stdin_lock:
+                    if process.stdin.closed or process.poll() is not None:
+                        raise BrokenPipeError("Pi RPC stdin is closed")
+                    process.stdin.write(encoded)
+                    process.stdin.flush()
+
+            def acknowledge_steer(message_id: str, success: bool, error: object = None) -> None:
+                assert steer_queue_dir is not None
+                atomic_json(
+                    steer_queue_dir / "acks" / f"{message_id}.json",
+                    {
+                        "id": message_id,
+                        "success": success,
+                        "error": (
+                            redact_credentials(str(error).encode())[:MAX_TOOL_ERROR_BYTES].decode(errors="ignore")
+                            if error
+                            else None
+                        ),
+                    },
+                )
+                ack_handle = create_attention_event(steer_ack_event_name(message_id))
+                try:
+                    set_attention_event(ack_handle)
+                finally:
+                    close_windows_handle(ack_handle)
+
+            def dispatch_steer() -> None:
+                assert steer_handle is not None and steer_queue_dir is not None
+                while not steer_stop.is_set():
+                    wait_windows_event(steer_handle)
+                    reset_attention_event(steer_handle)
+                    if steer_stop.is_set():
+                        return
+                    for path in sorted(steer_queue_dir.glob("*.json")):
+                        message_id = path.stem
+                        try:
+                            value = json.loads(path.read_text(encoding="utf-8"))
+                            if value.get("id") != message_id or value.get("type") != "steer" or not value.get("message"):
+                                raise ValueError("invalid steer payload")
+                            send_rpc({"id": message_id, "type": "steer", "message": value["message"]})
+                        except BaseException as error:
+                            acknowledge_steer(message_id, False, error)
+                            notify_attention("steer_delivery_failed")
+                        finally:
+                            path.unlink(missing_ok=True)
 
             def mark_activity() -> None:
                 nonlocal last_activity
@@ -460,10 +718,21 @@ def main(args: argparse.Namespace | None = None) -> int:
 
             watchdog = Thread(target=watch_idle, name=f"pi-idle-{run_id}", daemon=True)
             watchdog.start()
+            steer_thread = (
+                Thread(target=dispatch_steer, name=f"pi-steer-{run_id}", daemon=True) if steer_handle is not None else None
+            )
+            if steer_thread:
+                steer_thread.start()
+            consecutive_tool_errors = 0
+
+            def enforce_rpc_shutdown() -> None:
+                if not process_done.wait(5):
+                    notify_attention("rpc_shutdown_timeout")
+                    terminate_process_tree(process)
+
             try:
                 try:
-                    process.stdin.write(prompt)
-                    process.stdin.close()
+                    send_rpc({"id": f"prompt-{run_id}", "type": "prompt", "message": prompt})
                 except BrokenPipeError:
                     notify_attention("broken_pipe")
                 for raw in process.stdout:
@@ -485,22 +754,89 @@ def main(args: argparse.Namespace | None = None) -> int:
                         event = json.loads(raw)
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         event = {}
-                    if event.get("type") in {"tool_execution_start", "tool_execution_end", "message_end", "agent_end"}:
+                    event_type = event.get("type")
+                    if event_type in {
+                        "tool_execution_start",
+                        "tool_execution_end",
+                        "message_end",
+                        "agent_end",
+                        "agent_settled",
+                        "auto_retry_start",
+                        "auto_retry_end",
+                        "queue_update",
+                    }:
                         mark_activity()
+                    if event_type == "tool_execution_end":
+                        if event.get("isError"):
+                            recent_tool_errors.append(tool_error_summary(event))
+                        consecutive_tool_errors = consecutive_tool_errors + 1 if event.get("isError") else 0
+                        if consecutive_tool_errors >= 3:
+                            notify_attention("repeated_tool_errors")
+                    elif event_type == "auto_retry_start" and int(event.get("attempt") or 0) >= 2:
+                        notify_attention("provider_retry")
+                    elif event_type == "auto_retry_end" and event.get("success") is False:
+                        notify_attention("provider_retry_failed")
+                    elif event_type == "extension_error":
+                        notify_attention("extension_error")
+                    elif event_type == "compaction_end" and not event.get("result") and not event.get("aborted"):
+                        notify_attention("compaction_error")
+                    elif event_type == "response" and str(event.get("id") or "").startswith("steer-"):
+                        acknowledge_steer(str(event["id"]), bool(event.get("success")), event.get("error"))
+                    elif event_type == "response" and event.get("id") == f"prompt-{run_id}" and not event.get("success"):
+                        notify_attention("prompt_rejected")
+                        with stdin_lock:
+                            if not process.stdin.closed:
+                                process.stdin.close()
+                    if event_type == "agent_settled":
+                        steer_stop.set()
+                        if steer_handle is not None:
+                            set_attention_event(steer_handle)
+                        if steer_thread:
+                            steer_thread.join(timeout=2)
+                        with stdin_lock:
+                            if not process.stdin.closed:
+                                process.stdin.close()
+                        Thread(target=enforce_rpc_shutdown, name=f"pi-shutdown-{run_id}", daemon=True).start()
                 process.stdout.close()
-                exit_code = process.wait()
+                process_done.set()
+                steer_stop.set()
+                if steer_handle is not None:
+                    set_attention_event(steer_handle)
+                if steer_thread:
+                    steer_thread.join(timeout=2)
+                with stdin_lock:
+                    if not process.stdin.closed:
+                        process.stdin.close()
+                try:
+                    exit_code = process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    notify_attention("rpc_shutdown_timeout")
+                    terminate_process_tree(process)
+                    exit_code = process.returncode or 1
                 stderr_thread.join(timeout=5)
             finally:
                 process_done.set()
+                steer_stop.set()
+                if cancel_handle is not None:
+                    set_attention_event(cancel_handle)
+                if cancel_thread:
+                    cancel_thread.join(timeout=2)
+                if steer_handle is not None:
+                    set_attention_event(steer_handle)
                 with activity:
                     activity.notify()
                 watchdog.join(timeout=1)
     finally:
+        close_windows_handle(steer_handle)
+        close_windows_handle(cancel_handle)
         close_windows_handle(attention_handle)
-        remove_run_temp(runtime, run_id)
-        cache_status = release_cache(runtime, run_id)
+        try:
+            run_temp_cleanup = cleanup_run_temp(runtime, run_id)
+        finally:
+            cache_status = release_cache(runtime, run_id)
 
     timed_out = timeout_event.is_set()
+    cancelled = cancelled_event.is_set()
 
     parsed = parse_events(events_path)
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
@@ -509,12 +845,15 @@ def main(args: argparse.Namespace | None = None) -> int:
         for term in ("reasoning effort; ignoring", "reasoning is not supported", "unsupported reasoning")
     )
     if args.mode == "implementation":
-        source_status_after = git_changes(source_root)
+        source_after = capture_source_snapshot(source_root)
+        source_status_after = list(source_after["status"])
+        source_drift_detected = bool(args.source_fingerprint) and source_after["fingerprint"] != args.source_fingerprint
     tool_errors = sum(bool(item["error"]) for item in parsed["toolCalls"])
     completed = (
         exit_code == 0
         and not timed_out
-        and parsed["agentEnded"]
+        and not cancelled
+        and parsed["agentSettled"]
         and parsed["provider"] == args.provider
         and parsed["model"] == args.model
         and parsed["stopReason"] == "stop"
@@ -525,17 +864,19 @@ def main(args: argparse.Namespace | None = None) -> int:
     cache_gc_scheduled = bool(cache_status.get("gcEligible")) and schedule_cache_gc(runtime)
     result = {
         "runId": run_id,
-        "status": "completed" if completed else "failed",
+        "status": "cancelled" if cancelled else ("completed" if completed else "failed"),
         "mode": args.mode,
         "provider": parsed["provider"],
         "model": parsed["model"],
         "thinking": args.thinking,
-        "contextMode": args.context_mode,
+        "contextMode": bool(getattr(args, "context_mode", False)),
+        "firecrawl": bool(getattr(args, "firecrawl", False)),
+        "playwright": bool(getattr(args, "playwright", False)),
         "exitCode": exit_code,
         "timedOut": timed_out,
         "timeoutMode": "idle",
         "elapsedSeconds": round(time.perf_counter() - started, 3),
-        "stopReason": parsed["stopReason"],
+        "stopReason": "cancelled" if cancelled else parsed["stopReason"],
         "reasoningWarning": reasoning_warning,
         "evidenceTruncated": (
             event_log_truncated
@@ -558,7 +899,8 @@ def main(args: argparse.Namespace | None = None) -> int:
         "worktreeStatusBefore": changes_before,
         "worktreeStatusAfter": changes_after,
         "sourceEscapeDetected": False,
-        "sourceCheckoutChanged": bool(source_status_after),
+        "sourceCheckoutChanged": source_drift_detected,
+        "sourceDriftDetected": source_drift_detected,
         "sourceStatusAfter": source_status_after,
         "changedFiles": changes_after if args.mode == "implementation" else [],
         "finalText": parsed["finalText"],
@@ -571,6 +913,7 @@ def main(args: argparse.Namespace | None = None) -> int:
         "sessionDir": str(args.session_dir.resolve()),
         "turnIndex": args.turn_index,
         "cleanupStatus": "pending_review",
+        "runTempCleanup": run_temp_cleanup,
         "reviewRequired": True,
         "continuationAvailable": True,
         "nextAction": "review_then_continue_or_finalize",
@@ -617,6 +960,9 @@ def write_runner_failure(args: argparse.Namespace, error: BaseException) -> int:
         "provider": args.provider,
         "model": args.model,
         "thinking": args.thinking,
+        "contextMode": bool(getattr(args, "context_mode", False)),
+        "firecrawl": bool(getattr(args, "firecrawl", False)),
+        "playwright": bool(getattr(args, "playwright", False)),
         "exitCode": None,
         "timedOut": False,
         "stopReason": "runner_error",
@@ -683,6 +1029,9 @@ def failure_args_from_argv(argv: list[str]) -> argparse.Namespace | None:
         provider=value("--provider", DEFAULT_PROVIDER),
         model=value("--model", DEFAULT_MODEL),
         thinking=value("--thinking", DEFAULT_THINKING),
+        context_mode="--context-mode" in argv,
+        firecrawl="--firecrawl" in argv,
+        playwright="--playwright" in argv,
         session_id=value("--session-id", "unknown"),
         session_dir=Path(value("--session-dir", str(Path(runtime) / "sessions" / "unknown"))),
         turn_index=int(value("--turn-index", "1") or 1),

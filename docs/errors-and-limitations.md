@@ -15,6 +15,8 @@
 
 续跑输出位于 `turns/turn-NNN/`，但 owner receipt 仍是首轮的 `pi-receipt.json`。不要只看首轮 `pi-result.json` 判断最新状态；应从 owner receipt 的 `latestReceiptPath` 继续追踪。
 
+receipt 中的 `status=running` 是启动时快照，不会持续同步；不要用它判断 Worker 是否仍存活。`watch_pi_worker.py` 返回的 `lifecycleState` 来自 `C:\piw\jobs`，才是运行、待审核、异常或已清理状态。需要停止时使用 receipt 绑定的 `cancel_pi_worker.py`，不要直接杀 PID。
+
 常用 PowerShell 检查：
 
 ```powershell
@@ -45,9 +47,14 @@ $runtime = if ($env:PI_WORKER_ROOT) { $env:PI_WORKER_ROOT } else { 'C:\piw' }
 
 ## 2. 启动阶段错误
 
-### 2.1 `implementation mode requires a clean source worktree`
+### 2.1 WIP snapshot 被拒绝
 
-实现模式会从当前 `HEAD` 创建 detached worktree。源仓库存在已跟踪或未跟踪改动时，无法明确哪些内容属于用户、哪些内容应交给 Worker，因此启动会被拒绝。
+implementation 支持 staged、unstaged 和非 ignored untracked WIP，但下列状态无法安全、完整地复制，因此会 fail closed：
+
+- unresolved merge conflict；
+- dirty submodule、嵌套仓库或非普通文件；
+- 越界 symlink/junction/reparse point；
+- 快照复制期间源内容发生变化。
 
 ```powershell
 git -C '<repo>' status --short --untracked-files=all
@@ -55,7 +62,7 @@ git -C '<repo>' diff --stat
 git -C '<repo>' diff --cached --stat
 ```
 
-先由人处理这些改动（提交、保留到别处或改用只读 `analysis` 模式），不要为了启动 Worker 自动丢弃用户文件。
+先处理具体错误或等并发写入结束后重试。不要 stash、reset 或删除用户 WIP 来绕过门禁。ignored 依赖和构建缓存不会复制，应继续使用共享缓存或主工作树既有验证环境。
 
 ### 2.2 `output directory already contains a run`
 
@@ -102,6 +109,10 @@ git -C '<repo>' config --show-origin --get core.longpaths
 
 runtime 默认把临时对象放在短根目录 `C:\piw`，并在自有目录清理时使用 Windows 扩展路径前缀。第三方构建工具仍可能不支持长路径，因此输出目录和仓库路径也应尽量短。
 
+### 2.6 `No project session found ... creating a new session`
+
+首次运行会把 runtime 分配的 run ID 作为 Pi 的精确 session ID。该 ID 尚不存在时，Pi 会创建它并在 stderr 写一行提示；这是 `--session-id` 的预期语义，不是 provider、模型或仓库错误。continuation 复用已有 session，不会再次出现该提示。
+
 ## 3. 等待、超时与 attention
 
 ### 3.1 watch 返回 `timeout`
@@ -130,7 +141,7 @@ Get-Content $result.evidence.stderr -Tail 100 -Encoding UTF8
 
 ### 3.3 `attention` 类别
 
-runtime 会从 stderr 中识别并尽早发出一次 attention：
+runtime 会从 stderr 和 Pi RPC 事件中识别异常并尽早发出 attention。同类别 30 秒内去重；前一个通知投递后，后续不同类别或持续故障仍可再次唤醒：
 
 | 类别 | 常见原因 | 首要动作 |
 | --- | --- | --- |
@@ -141,10 +152,20 @@ runtime 会从 stderr 中识别并尽早发出一次 attention：
 | `reasoning_ignored` | provider 不支持或忽略所选 thinking effort | 查看 `reasoningWarning`；改用兼容 route 或降低 thinking |
 | `broken_pipe` | 子进程管道提前关闭 | 查看 runtime 与 Pi stderr，确认是否崩溃或被外部终止 |
 | `output_oversize` | 单事件或累计证据超限 | 依据 result 的截断字段检查最终结果，缩小任务或分轮执行 |
+| `repeated_tool_errors` | 连续 3 次工具调用失败 | 检查脱敏工具摘要，并用 steer 纠正路径、命令或任务范围 |
+| `provider_retry` / `provider_retry_failed` | 自动重试达到第 2 次或最终失败 | 先看 provider 错误；必要时 steer 缩小任务或等待终态后重试 |
+| `extension_error` / `compaction_error` | 扩展或上下文压缩失败 | 检查紧凑事件；禁用有问题的按需扩展或缩小上下文 |
+| `steer_delivery_failed` | RPC steer 未写入当前 Pi 进程 | 重新读取 latest receipt；若已终态则使用 continuation |
+| `prompt_rejected` | Pi RPC 在开始模型回合前拒绝初始 prompt | 检查 provider/model、会话和扩展初始化错误，不要等待 idle timeout |
+| `rpc_shutdown_timeout` | `agent_settled` 后 Pi 未在 5 秒内退出 | 保留 stderr，runtime 会终止该进程树并按失败交付 |
 
 attention 不是终态。处理后应继续 watch 同一 receipt；只有 `terminal` 事件或存在 result 才表示本轮结束。
 
-### 3.4 `worker process is unavailable and has no result` / `worker exited without result`
+### 3.4 单次 `Path not found` / `ENOENT`
+
+单次 `Path not found` 或 `ENOENT` 通常表示 Worker 猜错了文件位置。如果随后通过 `find`/`grep` 找到真实文件并完成任务，应保留该错误作为证据，但不要把整轮判为失败。只有连续 3 次工具失败才触发 `repeated_tool_errors`；反复发生时再用 steer 纠正路径或缩小范围。
+
+### 3.5 `worker process is unavailable and has no result` / `worker exited without result`
 
 说明 watch 无法打开 PID，且 receipt 指向的 result 不存在，或进程退出时 runner 没有完成原子写入。
 
@@ -190,7 +211,7 @@ Get-Item $r.evidence.events,$r.evidence.stderr | Select-Object FullName,Length
 
 ### 5.2 `worker is already finalized`
 
-finalize 会删除自有 session，并可能删除 implementation worktree。settled receipt 不可继续，避免在已经清理的上下文上制造第二条历史。
+finalize 会删除自有 session，并可能删除 implementation worktree。settled receipt 不可继续，避免在已经清理的上下文上制造第二条历史。完成后 result 的 `reviewRequired` 和 `continuationAvailable` 均为 `false`。
 
 ### 5.3 continuation 被拒绝或并发分配
 

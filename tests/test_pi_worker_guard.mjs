@@ -90,6 +90,66 @@ test("keeps mutation and execution paths inside the execution worktree", () => {
   assert.equal(evaluateToolCall("bash", { command: `rg TODO "${p.home}"` }, p), null);
 });
 
+test("accepts MSYS paths that resolve inside the Windows worktree", { skip: process.platform !== "win32" }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
+  const p = policy(root);
+  fs.mkdirSync(p.cwd, { recursive: true });
+  const msysCwd = `/${p.cwd[0].toLowerCase()}${p.cwd.slice(2).replaceAll("\\", "/")}`;
+
+  assert.equal(evaluateToolCall("bash", { command: `cd "${msysCwd}" && ./gradlew test` }, p), null);
+});
+
+test("does not treat build filenames as executable commands", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
+  const p = policy(root);
+  const outside = path.join(root, "toolchain");
+  fs.mkdirSync(p.cwd, { recursive: true });
+  fs.mkdirSync(path.join(outside, "gradle", "wrapper"), { recursive: true });
+
+  assert.equal(evaluateToolCall("bash", { command: `cat "${path.join(outside, "build.gradle.kts")}"` }, p), null);
+  assert.equal(evaluateToolCall("bash", { command: `ls "${path.join(outside, "gradle", "wrapper")}"` }, p), null);
+  assert.equal(evaluateToolCall("bash", { command: `cat "${path.join(outside, "copy.txt")}"` }, p), null);
+  assert.match(evaluateToolCall("bash", { command: `node "${path.join(outside, "check.mjs")}"` }, p), /outside/i);
+  assert.match(evaluateToolCall("bash", { command: `cp "${path.join(outside, "copy.txt")}" .` }, p), /outside/i);
+});
+
+test("allows shell syntax that is not an outside path", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
+  const p = policy(root);
+  fs.mkdirSync(p.cwd, { recursive: true });
+  assert.equal(evaluateToolCall("bash", { command: "git status --short 2>/dev/null" }, p), null);
+  assert.equal(evaluateToolCall("bash", { command: "echo a | tr '/' '_' > result.txt" }, p), null);
+  assert.equal(evaluateToolCall("bash", { command: "curl https://example.com \\\n    -o page.html" }, p), null);
+  assert.match(evaluateToolCall("bash", { command: "mkdir /tmp/out" }, p), /outside/i);
+  assert.match(evaluateToolCall("bash", { command: "mkdir '/'" }, p), /outside/i);
+});
+
+test("allows only the pinned Playwright wrapper outside the worktree", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
+  const p = { ...policy(root), agentDir: path.join(root, "home", ".pi", "agent") };
+  fs.mkdirSync(p.cwd, { recursive: true });
+  const script = path.join(
+    p.agentDir,
+    "npm",
+    "node_modules",
+    "pi-playwright",
+    "skills",
+    "playwright-browser",
+    "scripts",
+    "pw.js",
+  );
+  assert.equal(evaluateToolCall("bash", { command: `node "${script}" open about:blank` }, p), null);
+  assert.match(
+    evaluateToolCall("bash", { command: `node "${script}" screenshot --filename "${p.home}\\bad.png"` }, p),
+    /home|outside/i,
+  );
+  assert.equal(
+    evaluateToolCall("bash", { command: `node "${script}" eval '() => document.title'` }, p),
+    null,
+  );
+  assert.match(evaluateToolCall("bash", { command: `node "${script}" close; rm -rf C:/` }, p), /recursive/i);
+});
+
 test("blocks symlink or junction escapes for direct write tools", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-guard-"));
   const p = policy(root);

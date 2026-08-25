@@ -18,6 +18,7 @@ Codex 是调度者和最终责任方：编写任务、选择模式、等待事�
 | `finalize_pi_worker.py` | 审核后删除 worktree/session 并写入 settled 决策 |
 | `runtime_support.py` | 原子 JSON、锁、PID、缓存、job reconciliation、长路径清理 |
 | `pi_worker_guard.mjs` | Pi tool-call 策略防护；不是 OS sandbox |
+| `steer_pi_worker.py` | receipt 绑定的 Windows named-event RPC steer 客户端 |
 | `cache_gc.py` | Worker 空闲时将自有共享缓存从 20 GiB 修剪到 19 GiB |
 
 ## 数据流
@@ -31,13 +32,13 @@ start -> validate -> reserve cache -> optional detached worktree
       -> atomically write receipt -> release launch gate
                                   |
                                   v
-                         Pi --mode json --print
+                           Pi --mode rpc
                                   |
                +------------------+------------------+
-               |                                     |
-          compact events                        stderr classifier
-               |                                     |
-       token/tool/final text                  attention named event
+               |                    |                        |
+          compact events      steer named event         stderr classifier
+               |                    |                        |
+       token/tool/final text    RPC stdin queue       attention named event
                |                                     |
                +------------------+------------------+
                                   v
