@@ -13,6 +13,7 @@ from runtime_support import (
     atomic_json,
     emit_json,
     is_within,
+    pid_alive,
     record_job,
     remove_owned_tree,
     remove_run_temp,
@@ -23,6 +24,78 @@ from runtime_support import (
 
 def read_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def orphaned_result(
+    root: Path,
+    owner_path: Path,
+    owner: dict[str, object],
+    latest_path: Path,
+    latest: dict[str, object],
+) -> dict[str, object]:
+    owner_run_id = str(owner.get("runId") or "")
+    latest_run_id = str(latest.get("runId") or "")
+    job_path = root / "jobs" / f"{owner_run_id}.json"
+    if not job_path.is_file():
+        raise SystemExit("orphaned worker job record is missing")
+    job = read_json(job_path)
+    if job.get("state") != "orphaned" or int(str(job.get("pid") or 0)) != 0:
+        raise SystemExit("missing result can only be rejected after the worker is reconciled as orphaned")
+    if (root / "active" / f"{latest_run_id}.json").exists():
+        raise SystemExit("orphaned worker still has an active marker")
+    if pid_alive(int(str(job.get("pid") or 0))):
+        raise SystemExit("orphaned worker process is still alive")
+
+    latest_output = Path(str(latest.get("outputDir") or "")).resolve()
+    expected_result = (latest_output / "pi-result.json").resolve()
+    actual_result = Path(str(latest.get("resultPath") or "")).resolve()
+    checks = {
+        "owner run": str(job.get("jobId") or "") == owner_run_id,
+        "latest run": str(job.get("latestRunId") or "") == latest_run_id,
+        "owner latest receipt": Path(str(owner.get("latestReceiptPath") or owner_path)).resolve() == latest_path,
+        "job latest receipt": Path(str(job.get("latestReceiptPath") or "")).resolve() == latest_path,
+        "latest owner receipt": Path(str(latest.get("ownerReceiptPath") or "")).resolve() == owner_path,
+        "supplied output": latest_output == latest_path.parent,
+        "result path": actual_result == expected_result == Path(str(job.get("resultPath") or "")).resolve(),
+        "runtime root": Path(str(owner.get("runtimeRoot") or root)).resolve()
+        == Path(str(latest.get("runtimeRoot") or root)).resolve()
+        == root,
+    }
+    for field in ("sourceRoot", "worktreePath", "sessionDir"):
+        checks[field] = job.get(field) == owner.get(field) == latest.get(field)
+    failed = [name for name, valid in checks.items() if not valid]
+    if failed:
+        raise SystemExit(f"orphaned receipt identity mismatch: {', '.join(failed)}")
+    evidence = {
+        name: str(path)
+        for name, path in {
+            "events": Path(str(latest.get("outputDir"))) / "pi-events.jsonl",
+            "stderr": Path(str(latest.get("outputDir"))) / "pi-stderr.log",
+        }.items()
+        if path.is_file()
+    }
+    return {
+        "runId": latest_run_id,
+        "status": "failed",
+        "stopReason": "worker_exited_without_result",
+        "syntheticResult": True,
+        "mode": latest.get("mode"),
+        "provider": latest.get("provider"),
+        "model": latest.get("model"),
+        "thinking": latest.get("thinking"),
+        "sourceRoot": latest.get("sourceRoot"),
+        "sourceCwd": latest.get("sourceCwd"),
+        "executionCwd": latest.get("executionCwd"),
+        "worktreePath": latest.get("worktreePath"),
+        "sessionDir": latest.get("sessionDir"),
+        "changedFiles": [],
+        "patch": None,
+        "evidence": evidence,
+        "cleanupStatus": "pending_review",
+        "reviewRequired": True,
+        "continuationAvailable": False,
+        "nextAction": "review_then_finalize_rejected",
+    }
 
 
 def main() -> int:
@@ -38,10 +111,17 @@ def main() -> int:
     receipt = read_json(receipt_path)
     latest_receipt_path = Path(str(receipt.get("latestReceiptPath") or receipt_path)).resolve()
     latest_receipt = read_json(latest_receipt_path)
+    if supplied_receipt_path not in {receipt_path, latest_receipt_path}:
+        raise SystemExit("supplied receipt is not part of the owner/latest receipt chain")
     result_path = Path(str(latest_receipt["resultPath"])).resolve()
     if not result_path.is_file():
-        raise SystemExit("worker is not terminal: pi-result.json is missing")
-    result = read_json(result_path)
+        if args.decision != "rejected":
+            raise SystemExit("worker is not terminal: missing pi-result.json can only be rejected")
+        root = Path(str(receipt.get("runtimeRoot") or runtime_root())).resolve()
+        result = orphaned_result(root, receipt_path, receipt, latest_receipt_path, latest_receipt)
+        atomic_json(result_path, result)
+    else:
+        result = read_json(result_path)
     if result.get("cleanupStatus") == "settled":
         emit_json({"status": "settled", "alreadyFinalized": True})
         return 0
@@ -95,7 +175,8 @@ def main() -> int:
             raise SystemExit(f"refusing cleanup outside owned session root: {session_dir}")
         if session_dir.is_dir():
             remove_owned_tree(session_dir, sessions_root)
-    remove_run_temp(root, str(receipt["runId"]))
+    for run_id in {str(receipt["runId"]), str(latest_receipt["runId"])}:
+        remove_run_temp(root, run_id)
     settled_at = utc_now()
     result.update(
         {

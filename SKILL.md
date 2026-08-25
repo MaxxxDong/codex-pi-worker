@@ -5,17 +5,13 @@ description: Delegate bounded repository analysis, code review, implementation, 
 
 # Pi Worker
 
-Use Pi as an executor. Codex remains responsible for reviewing its result and
-verifying material changes.
+Pi executes the bounded task; Codex reviews the result and verifies material changes.
 
-## Workflow
-
-1. Write one bounded UTF-8 prompt with scope, deliverable, and focused checks.
-   Do not include secrets.
-2. Normal work defaults to `implementation`; it can read, search, edit, and run
-   checks in an isolated worktree. Use `--mode analysis` only when the task is
-   explicitly read-only.
-3. Start detached with a unique output directory:
+1. Write one UTF-8 prompt with scope, deliverable, and focused checks. Do not include secrets.
+2. Use the default `implementation` mode unless the task is explicitly read-only. Implementation
+   snapshots current non-ignored WIP into an isolated worktree without modifying or stashing the source.
+3. Start detached with a unique output directory. Add `--evidence-file <path>` for each external file
+   the Worker must process with commands; it receives a private worktree copy.
 
 ```powershell
 python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\start_pi_worker.py" `
@@ -23,58 +19,29 @@ python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\start_pi_worker.py" `
   --output-dir C:\absolute\evidence
 ```
 
-4. Wait once. Resume the same yielded shell process/cell; never replace it with
-   status polling, log tails, or periodic narration.
+4. Wait once; never replace it with status polling, log tails, or periodic narration.
 
 ```powershell
 python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\watch_pi_worker.py" `
   C:\absolute\evidence\pi-receipt.json --timeout-seconds 1800
 ```
 
-For parallel runs in one Codex task, pass every live receipt to one watch. It
-returns on the first `attention` or terminal event; handle that run, remove only
-terminal receipts, then watch the remaining set. Never wait receipts sequentially.
-Different Codex tasks must not consume the same receipt.
+For parallel runs in one Codex task, pass all live receipts to one watch. Handle the first
+`attention` or terminal event, remove only terminal receipts, then watch the rest. Different
+Codex tasks must not consume the same receipt.
 
-An `attention` event needs handling. While the turn is still running on Windows,
-send one focused correction through Pi's native RPC steer, then watch again:
-
-```powershell
-python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\steer_pi_worker.py" `
-  C:\absolute\evidence\pi-receipt.json --message-file C:\absolute\correction.md
-```
-
-To stop a bad run, use `cancel_pi_worker.py <receipt>` and then watch once for
-the reviewable `cancelled` result. Never kill the PID directly.
-
-A terminal result needs Codex review. For a correction after terminal, reuse the
-same session and worktree:
-
-```powershell
-python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\continue_pi_worker.py" `
-  C:\absolute\evidence\pi-receipt.json --prompt-file C:\absolute\correction.md
-```
-
-After review, always settle the receipt. Add `--changes-integrated` only after
-accepted implementation changes have been applied or committed.
+On `attention`, steer or cancel the same receipt. On terminal, review and either continue the
+same session or finalize it. Read [docs/operations.md](docs/operations.md) only for these controls.
+After review, always settle the receipt; use `--changes-integrated` only after accepted changes
+have been applied or committed.
 
 ```powershell
 python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\finalize_pi_worker.py" `
   C:\absolute\evidence\pi-receipt.json --decision accepted --changes-integrated
 ```
 
-Use `--decision rejected` for discarded work. Finalize analysis runs too.
+Use `--decision rejected` for discarded work and finalize analysis runs too.
 
-## Rules
-
-- Parallelize independent tasks only; implementation write scopes must not overlap.
-- Give each Worker one cohesive deliverable and focused checks. Run expensive
-  repository-wide gates once after integration.
-- Default route is `opencode-go/deepseek-v4-flash` with `max`; override provider,
-  model, or thinking only when the task requires it.
-- Add `--context-mode` only for large logs/files or repository-wide aggregation.
-- Both modes have `read/grep/find/ls` and web search. Add `--firecrawl` for a
-  Firecrawl task. Add `--playwright` only for browser work (implementation mode).
-- Treat `status=completed` as execution completion, not proof of correctness.
+- Parallelize only independent write scopes; run expensive repository-wide gates once after integration.
+- `completed` means execution ended, not that the result is correct.
 - Never print or copy `~/.pi/agent/models.json`; it contains provider credentials.
-- Live steer is receipt-bound and Windows-only; after terminal use continuation.

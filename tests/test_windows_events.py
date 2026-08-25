@@ -33,6 +33,7 @@ from run_pi_worker import (  # noqa: E402
 from runtime_support import (  # noqa: E402
     atomic_json,
     attention_event_name,
+    capture_source_snapshot,
     close_windows_handle,
     create_attention_event,
     emit_json,
@@ -48,6 +49,142 @@ from runtime_support import (  # noqa: E402
 
 
 class WindowsEventTests(unittest.TestCase):
+    def test_dirty_source_snapshot_preserves_wip_and_patch_contains_only_worker_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            worktree = root / "worktree"
+            output = root / "output"
+            source.mkdir()
+            output.mkdir()
+            for command in (
+                ["git", "init", str(source)],
+                ["git", "-C", str(source), "config", "user.email", "pi-test@example.invalid"],
+                ["git", "-C", str(source), "config", "user.name", "Pi Test"],
+            ):
+                subprocess.run(command, check=True, capture_output=True)
+            (source / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+            (source / "tracked.txt").write_text("base\n", encoding="utf-8")
+            (source / "untouched.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "base"], check=True, capture_output=True)
+
+            (source / "tracked.txt").write_text("base\nwip\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+            (source / "tracked.txt").write_text("base\nwip\nunstaged\n", encoding="utf-8")
+            (source / "untouched.txt").write_text("base\nuser-only\n", encoding="utf-8")
+            (source / "new.txt").write_text("untracked WIP\n", encoding="utf-8")
+            (source / ".venv").mkdir()
+            (source / ".venv" / "ignored.txt").write_text("ignored\n", encoding="utf-8")
+            evidence = root / "evidence.json"
+            evidence.write_text('{"ok":true}\n', encoding="utf-8")
+
+            before = capture_source_snapshot(source)
+            source_head = start_pi_worker.git(source, "rev-parse", "HEAD")
+            start_pi_worker.git(source, "worktree", "add", "--detach", str(worktree), source_head)
+            try:
+                baseline, manifest = start_pi_worker.prepare_snapshot_baseline(
+                    source,
+                    worktree,
+                    source_head,
+                    before,
+                    [evidence],
+                )
+                self.assertNotEqual(baseline, source_head)
+                self.assertEqual(capture_source_snapshot(source)["fingerprint"], before["fingerprint"])
+                self.assertEqual(subprocess.run(
+                    ["git", "-C", str(worktree), "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout, "")
+                self.assertEqual((worktree / "tracked.txt").read_text(encoding="utf-8"), "base\nwip\nunstaged\n")
+                self.assertEqual((worktree / "new.txt").read_text(encoding="utf-8"), "untracked WIP\n")
+                self.assertFalse((worktree / ".venv").exists())
+                assert manifest is not None
+                self.assertEqual(manifest["files"][0]["copy"], ".pi-worker-inputs/001-evidence.json")
+
+                (worktree / "tracked.txt").write_text("base\nwip\nunstaged\nworker\n", encoding="utf-8")
+                (worktree / "worker.txt").write_text("worker\n", encoding="utf-8")
+                patch_info = write_patch(worktree, output, baseline)
+                self.assertIsNotNone(patch_info)
+                assert patch_info is not None
+                self.assertEqual(set(patch_info["files"]), {"tracked.txt", "worker.txt"})
+                subprocess.run(
+                    ["git", "-C", str(source), "apply", "--whitespace=nowarn", str(output / "changes.patch")],
+                    check=True,
+                    capture_output=True,
+                )
+                self.assertEqual((source / "tracked.txt").read_text(encoding="utf-8"), "base\nwip\nunstaged\nworker\n")
+                self.assertEqual((source / "untouched.txt").read_text(encoding="utf-8"), "base\nuser-only\n")
+            finally:
+                subprocess.run(
+                    ["git", "-C", str(source), "worktree", "remove", "--force", str(worktree)],
+                    capture_output=True,
+                    check=False,
+                )
+
+    @unittest.skipUnless(os.name == "nt", "Windows integration test")
+    def test_start_rejects_source_drift_and_rolls_back_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            output = root / "output"
+            runtime = root / "runtime"
+            source.mkdir()
+            for command in (
+                ["git", "init", str(source)],
+                ["git", "-C", str(source), "config", "user.email", "pi-test@example.invalid"],
+                ["git", "-C", str(source), "config", "user.name", "Pi Test"],
+            ):
+                subprocess.run(command, check=True, capture_output=True)
+            tracked = source / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "base"], check=True, capture_output=True)
+            tracked.write_text("base\nwip\n", encoding="utf-8")
+            prompt = root / "task.md"
+            prompt.write_text("test", encoding="utf-8")
+
+            real_capture = capture_source_snapshot
+            capture_count = 0
+
+            def capture_with_drift(path: Path):
+                nonlocal capture_count
+                capture_count += 1
+                if capture_count == 3:
+                    tracked.write_text("base\nwip\nconcurrent edit\n", encoding="utf-8")
+                return real_capture(path)
+
+            argv = [
+                "start_pi_worker.py",
+                "--cwd",
+                str(source),
+                "--prompt-file",
+                str(prompt),
+                "--output-dir",
+                str(output),
+            ]
+            env = {
+                "PI_WORKER_ROOT": str(runtime),
+                "LOCALAPPDATA": str(root / "local"),
+                "PI_WORKER_DISABLE_CACHE_GC": "1",
+            }
+            with (
+                patch.dict(os.environ, env),
+                patch.object(sys, "argv", argv),
+                patch.object(start_pi_worker, "capture_source_snapshot", side_effect=capture_with_drift),
+                self.assertRaisesRegex(RuntimeError, "source checkout changed"),
+            ):
+                start_pi_worker.main()
+
+            self.assertFalse((output / "pi-receipt.json").exists())
+            self.assertFalse(any((runtime / "worktrees").glob("*")))
+            self.assertFalse(any((runtime / "active").glob("*.json")))
+            self.assertFalse(any((runtime / "jobs").glob("*.json")))
+            registrations = source / ".git" / "worktrees"
+            self.assertFalse(registrations.exists() and any(registrations.iterdir()))
+
     def test_playwright_windows_patch_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -11,6 +11,7 @@
 | 后台启动 | `start` 立即返回 receipt，Windows 使用无窗口 detached process |
 | 事件优先等待 | named event + 进程句柄唤醒，不需要反复 `status`/日志轮询 |
 | 分析与实现分流 | 默认 `implementation`；只有明确只读任务才用 `analysis`，两者都有 `grep/find/ls` |
+| 脏 WIP 隔离 | 自动复制 staged、unstaged 和非 ignored untracked 内容；源仓库不 stash、不改写 |
 | 同任务续跑 | receipt 绑定 Pi session、worktree 和 turn 序号 |
 | 运行中纠偏 | Pi 原生 RPC `steer`，receipt 绑定投递并等待 accepted 回执 |
 | 审核后清理 | Worker 结束只进入 `pending_review`；Codex 接受或拒绝后显式 finalize |
@@ -70,6 +71,12 @@ python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\watch_pi_worker.py" `
 - 清理必须发生在 Codex 审核之后；不要让 Worker 自己删除候选 worktree。
 
 ## 最新更新
+
+### 2026-08-25
+
+- implementation 自动建立 WIP baseline，最终 patch 只含 Worker 增量。
+- 外部证据通过 `--evidence-file` 精确复制到 worktree，避免放宽源仓库写保护。
+- dead/no-result Worker 可在严格 receipt/job 身份校验后 rejected finalize，不再永久残留 orphan。
 
 ### 2026-08-04
 

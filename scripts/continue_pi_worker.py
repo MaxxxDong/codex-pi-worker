@@ -99,6 +99,8 @@ def main() -> int:
         atomic_json(owner_path, owner)
 
     timeout_seconds = args.timeout_seconds or int(owner.get("timeoutSeconds") or 1800)
+    source_snapshot = owner.get("sourceSnapshot")
+    source_fingerprint = str(source_snapshot.get("fingerprint") or "") if isinstance(source_snapshot, dict) else ""
     cache_status = reserve_cache(root, run_id)
     runner = Path(__file__).with_name("run_pi_worker.py")
     command = [
@@ -130,6 +132,8 @@ def main() -> int:
         str(root),
         "--base-commit",
         str(owner.get("baseCommit") or ""),
+        "--source-fingerprint",
+        source_fingerprint,
         "--session-id",
         str(owner["sessionId"]),
         "--session-dir",
@@ -151,6 +155,8 @@ def main() -> int:
     worktree = owner.get("worktreePath")
     if worktree:
         command.extend(("--worktree-path", str(worktree), "--allow-existing-changes"))
+    if owner.get("inputManifest"):
+        command.extend(("--input-manifest", ".pi-worker-inputs/manifest.json"))
     if owner.get("contextMode"):
         command.append("--context-mode")
     if owner.get("firecrawl"):
@@ -229,6 +235,9 @@ def main() -> int:
         "executionCwd": str(execution_cwd),
         "worktreePath": worktree,
         "baseCommit": owner.get("baseCommit"),
+        "sourceHead": owner.get("sourceHead"),
+        "sourceSnapshot": owner.get("sourceSnapshot"),
+        "inputManifest": owner.get("inputManifest"),
         "sessionId": owner["sessionId"],
         "sessionDir": str(session_dir),
         "turnIndex": turn_index,

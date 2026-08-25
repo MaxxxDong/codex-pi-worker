@@ -26,6 +26,7 @@ from runtime_support import (
     PROVIDER_MODELS,
     atomic_json,
     cancel_event_name,
+    capture_source_snapshot,
     close_windows_handle,
     create_attention_event,
     emit_json,
@@ -107,6 +108,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--worktree-path", type=Path, default=None)
     parser.add_argument("--base-commit", default="")
+    parser.add_argument("--source-fingerprint", default="")
+    parser.add_argument("--input-manifest", default="")
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--session-dir", type=Path, required=True)
     parser.add_argument("--owner-run-id", default=None)
@@ -513,6 +516,18 @@ def main(args: argparse.Namespace | None = None) -> int:
             "Resolve uncertain paths with find or grep before targeting them; do not infer a file path from a symbol name."
         )
     )
+    if args.input_manifest:
+        manifest_path = (cwd / args.input_manifest).resolve()
+        try:
+            manifest_path.relative_to(cwd)
+        except ValueError as exc:
+            raise SystemExit("input manifest must be inside the execution worktree") from exc
+        if not manifest_path.is_file():
+            raise SystemExit(f"input manifest does not exist: {manifest_path}")
+        guidance += (
+            f" External evidence was copied into this worktree; use the relative-path mapping in {args.input_manifest} "
+            "instead of running commands against the original absolute paths."
+        )
     command = [
         pi,
         "--mode",
@@ -571,6 +586,7 @@ def main(args: argparse.Namespace | None = None) -> int:
     activity = Condition()
     last_activity = time.monotonic()
     source_status_after: list[str] = []
+    source_drift_detected = False
     prompt = prompt_file.read_text(encoding="utf-8")
     worker_env, _ = worker_environment(runtime, run_id)
     worker_env.update(
@@ -829,7 +845,9 @@ def main(args: argparse.Namespace | None = None) -> int:
         for term in ("reasoning effort; ignoring", "reasoning is not supported", "unsupported reasoning")
     )
     if args.mode == "implementation":
-        source_status_after = git_changes(source_root)
+        source_after = capture_source_snapshot(source_root)
+        source_status_after = list(source_after["status"])
+        source_drift_detected = bool(args.source_fingerprint) and source_after["fingerprint"] != args.source_fingerprint
     tool_errors = sum(bool(item["error"]) for item in parsed["toolCalls"])
     completed = (
         exit_code == 0
@@ -881,7 +899,8 @@ def main(args: argparse.Namespace | None = None) -> int:
         "worktreeStatusBefore": changes_before,
         "worktreeStatusAfter": changes_after,
         "sourceEscapeDetected": False,
-        "sourceCheckoutChanged": bool(source_status_after),
+        "sourceCheckoutChanged": source_drift_detected,
+        "sourceDriftDetected": source_drift_detected,
         "sourceStatusAfter": source_status_after,
         "changedFiles": changes_after if args.mode == "implementation" else [],
         "finalText": parsed["finalText"],

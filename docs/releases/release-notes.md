@@ -1,5 +1,13 @@
 # 发布记录
 
+### 2026-08-25
+
+- implementation 支持 staged、unstaged 和非 ignored untracked WIP 快照；不再要求调用方 stash，源工作区在启动前后保持不变。
+- 隔离 worktree 内创建无 hook 的临时 baseline，`changes.patch` 只包含 Worker 相对初始 WIP 的增量；ignored 依赖和缓存不复制。
+- 增加 `--evidence-file`，把明确授权的外部证据复制进 worktree，再由 Python/Node 处理，不弱化源仓库 guard。
+- orphaned/no-result 运行只允许 rejected finalize，并校验 job、owner/latest receipt、run ID、结果路径和 owned 目录后生成明确 synthetic failure 记录。
+- 精简 `SKILL.md` 热路径；steer、cancel、continuation 和条件扩展细节按需读取运维文档。
+
 ### 2026-08-04
 
 - 修复 Windows/MSYS `/c/...` 工作树路径被误判为越界，以及 `build.gradle.kts`、`gradle/wrapper` 等只读路径被误判为执行命令。

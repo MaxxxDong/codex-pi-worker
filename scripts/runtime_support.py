@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, TypedDict
 
 CACHE_LIMIT_BYTES = 20 * 1024**3
 CACHE_TARGET_BYTES = 19 * 1024**3
@@ -26,6 +28,7 @@ DEFAULT_PROVIDER = "opencode-go"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_THINKING = "max"
 PROVIDER_MODELS = {
+    "deepseek": {"deepseek-v4-flash"},
     "opencode-go": {"deepseek-v4-flash"},
     "shuaiapi": {"gpt-5.6-luna", "gpt-5.6-sol"},
     "shuaiapi-grok": {"grok-4.5"},
@@ -33,6 +36,71 @@ PROVIDER_MODELS = {
     "krill-sol": {"gpt-5.6-sol"},
 }
 MODEL_CHOICES = tuple(sorted({model for models in PROVIDER_MODELS.values() for model in models}))
+
+
+class UntrackedSnapshot(TypedDict):
+    path: str
+    sha256: str
+    bytes: int
+
+
+class SourceSnapshot(TypedDict):
+    fingerprint: str
+    dirty: bool
+    status: list[str]
+    trackedPatch: bytes
+    trackedPatchSha256: str
+    untracked: list[UntrackedSnapshot]
+
+
+def _git_bytes(source: Path, *args: str) -> bytes:
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    completed = subprocess.run(
+        ["git", "-C", str(source), *args],
+        capture_output=True,
+        env=env,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(message or "git command failed")
+    return completed.stdout
+
+
+def capture_source_snapshot(source: Path) -> SourceSnapshot:
+    """Capture the non-ignored WIP fingerprint without mutating the source checkout."""
+    source = source.resolve()
+    head = _git_bytes(source, "rev-parse", "HEAD").strip()
+    status = _git_bytes(source, "status", "--porcelain=v1", "--untracked-files=all")
+    tracked_patch = _git_bytes(source, "diff", "--binary", "--no-ext-diff", "HEAD", "--", ".")
+    raw_paths = _git_bytes(source, "ls-files", "--others", "--exclude-standard", "-z")
+    untracked: list[UntrackedSnapshot] = []
+    digest = hashlib.sha256(head + b"\0tracked\0" + tracked_patch)
+    for raw_path in filter(None, raw_paths.split(b"\0")):
+        relative = os.fsdecode(raw_path)
+        candidate = source / relative
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(source)
+        except ValueError as exc:
+            raise RuntimeError(f"untracked path escapes source checkout: {relative}") from exc
+        mode = candidate.lstat().st_mode
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"unsupported untracked non-file in source snapshot: {relative}")
+        content_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        size = candidate.stat().st_size
+        untracked.append({"path": relative, "sha256": content_hash, "bytes": size})
+        digest.update(b"\0untracked\0" + raw_path + b"\0")
+        digest.update(content_hash.encode("ascii") + b"\0" + str(size).encode("ascii"))
+    return {
+        "fingerprint": digest.hexdigest(),
+        "dirty": bool(status),
+        "status": status.decode("utf-8", errors="replace").splitlines(),
+        "trackedPatch": tracked_patch,
+        "trackedPatchSha256": hashlib.sha256(tracked_patch).hexdigest(),
+        "untracked": untracked,
+    }
 SAFE_ENV_NAMES = {
     "ALLUSERSPROFILE",
     "APPDATA",

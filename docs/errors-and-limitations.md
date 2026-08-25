@@ -47,9 +47,14 @@ $runtime = if ($env:PI_WORKER_ROOT) { $env:PI_WORKER_ROOT } else { 'C:\piw' }
 
 ## 2. 启动阶段错误
 
-### 2.1 `implementation mode requires a clean source worktree`
+### 2.1 WIP snapshot 被拒绝
 
-实现模式会从当前 `HEAD` 创建 detached worktree。源仓库存在已跟踪或未跟踪改动时，无法明确哪些内容属于用户、哪些内容应交给 Worker，因此启动会被拒绝。
+implementation 支持 staged、unstaged 和非 ignored untracked WIP，但下列状态无法安全、完整地复制，因此会 fail closed：
+
+- unresolved merge conflict；
+- dirty submodule、嵌套仓库或非普通文件；
+- 越界 symlink/junction/reparse point；
+- 快照复制期间源内容发生变化。
 
 ```powershell
 git -C '<repo>' status --short --untracked-files=all
@@ -57,7 +62,7 @@ git -C '<repo>' diff --stat
 git -C '<repo>' diff --cached --stat
 ```
 
-先由人处理这些改动（提交、保留到别处或改用只读 `analysis` 模式），不要为了启动 Worker 自动丢弃用户文件。
+先处理具体错误或等并发写入结束后重试。不要 stash、reset 或删除用户 WIP 来绕过门禁。ignored 依赖和构建缓存不会复制，应继续使用共享缓存或主工作树既有验证环境。
 
 ### 2.2 `output directory already contains a run`
 

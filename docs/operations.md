@@ -18,6 +18,18 @@ python scripts\start_pi_worker.py `
 
 普通任务默认是 `implementation`，可省略 `--mode implementation`。只有明确只读任务才使用 `--mode analysis`；两种模式都有 `read/grep/find/ls` 和联网搜索。按任务增加能力：
 
+implementation 会把源仓库当前的 staged、unstaged 和非 ignored untracked WIP 复制到隔离 worktree，并在隔离区建立临时 baseline；不会 stash、add、commit 或改写源仓库。最终 `changes.patch` 只包含 Worker 相对这份 WIP 的增量。冲突、dirty submodule、越界链接和快照期间并发变化会明确拒绝。
+
+需要让 Worker 用 Python/Node 等命令处理源仓库外部证据时，显式复制输入，不要让它对原绝对路径执行命令：
+
+```powershell
+python scripts\start_pi_worker.py ... `
+  --evidence-file C:\absolute\analysis-a\pi-result.json `
+  --evidence-file C:\absolute\analysis-b\pi-result.json
+```
+
+副本和路径映射位于 worktree 的 `.pi-worker-inputs/`，属于 baseline，不会进入 Worker patch。
+
 ```powershell
 # Firecrawl MCP，可用于只读或实现任务
 python scripts\start_pi_worker.py ... --mode analysis --firecrawl
