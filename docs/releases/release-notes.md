@@ -1,5 +1,47 @@
 # 发布记录
 
+## v0.2.1 - 2026-09-04
+
+- macOS attention 改为最多 8 条不同事件的有界队列；每条独立确认，后续不同故障不再被首条遮住，终态通知也不会删除已投递回执并重复告警。
+- 默认在 backend 启动后 60 秒仍未收到任何 stdout/stderr 事件时发出 `startup_silent` 软提醒；任务继续运行，不构成 idle/hard timeout，可用 `--startup-attention 0` 关闭。
+- 高频流式活动按 250 ms 合并持久化，工具边界、状态变化、attention 和终态仍立即落盘；减少长任务对 `result.json` 的重复原子写入。
+- 成功、失败或取消收口时清理本轮进程组中仍存活的后台后代，避免测试服务器或辅助进程残留并阻塞输出管道关闭。
+- macOS 启动器优先使用显式 `PI_WORKER_NODE_BIN` / `PI_WORKER_PI_BIN`，其次使用已验证的本地固定路径，最后回退到 `PATH`，升级后不再因单一路径变化直接 `command not found`。
+- Agy 若返回 `SUCCESS` 但最终文本为空且包含 `denied_actions`，不再只报模糊的 `empty_final`；结果明确失败为权限拒绝并立即发出 `permission_denied` attention。
+- Agy `The stream was interrupted` 错误归入 transport attention；已产生的部分文本继续保留，但 ERROR 终态不会被伪装为成功。
+
+## v0.2.0 - 2026-09-04
+
+- macOS runtime 新增 `--backend agy`，直接消费 Agy 1.1.8+ 的 `init`、`step_update`、`result` stream-json 事件；Pi 保持兼容默认。
+- Agy 与 Pi 共用现有 detached worktree、脏基线携带、事件优先 wait、cancel、patch、review-gated cleanup、共享依赖缓存和紧凑 result，不引入第二套 job/state/wait。
+- Agy `conversation_id` 支持同 run 续跑；模型、effort、usage、structured output 与终态状态进入统一结果。
+- Agy 的 `ERROR` 即使带部分 response 也明确失败；认证、限流、5xx、传输和裸 `EOF` 可即时诊断。默认不设置五分钟任务寿命，也不默认全工具自动批准。
+- Seatbelt 内的 review cleanup 不再遍历并尝试删除宿主共享缓存；缓存 GC 动作收据改为计数加最多 12 条样本，避免权限失败生成数万 Token 输出。
+
+## v0.1.16 - 2026-08-29
+
+- macOS 事件等待者与 attention 消费收据改存系统临时事件目录，持久运行目录只读时不再因创建 `waiters` 失败。
+- 只有连续三次相同工具错误才触发 `repeated_tool_errors`；不同的负向测试或格式探测仍计数，但不再误唤醒 Root。
+- 捕获候选补丁前删除本轮新建的 Python 字节码、测试缓存和 egg-info；源码与锁文件保持原样。
+
+## v0.1.15 - 2026-08-29
+
+- macOS Worker 运行状态改存到持久化 Application Support 目录，避免系统临时目录清理导致审核前结果消失。
+- `wait` 默认返回紧凑 receipt，并提供 `--full` 获取完整终态；完整 `result.json` 保持不变。
+- `status` 对不存在或已被清理的 run 明确返回 `state: "missing"`。
+
+## v0.1.14 - 2026-08-27
+
+- 移除 macOS Pi Worker 中 ShuaiAPI 的默认 Profile 与活动命令示例，避免已删除 Provider 继续出现在 `profiles` 输出中。
+- 默认 Profile 改为当前可用的 AHZM GLM、CommandCode GLM/DeepSeek/Gemini、OpenCode Go DeepSeek、DeepSeek 官方与 xAI Grok；调用方仍可显式覆盖合法思考强度。
+
+## v0.1.13 - 2026-08-27
+
+- macOS write 模式明确接受 staged、unstaged 和非忽略 untracked 基线，调用方不再执行 clean-tree 启动门禁。
+- 模型 Profile 只提供默认思考强度，不再覆盖或拒绝调用方传入的合法 Pi 强度。
+- 保持 `find` 默认禁用：真实双路写任务确认其在离线环境会因缺少 `fd` 必然失败，文件搜索继续使用 `grep`/`bash`。网络沙箱快速失败、独立 worktree、审核后清理和 20 GiB 共享缓存边界保持不变。
+- 显式选择 Provider 时按需加载用户级同名 Provider 扩展，修复 CommandCode 等扩展型 Provider 在临时 Profile 中启动前消失的问题。
+
 ## v0.1.12 - 2026-08-12
 
 - 移除 `krill/grok-4.5` 与 `krill-sol/gpt-5.6-sol` Profile、示例和测试引用。

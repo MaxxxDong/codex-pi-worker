@@ -1,8 +1,8 @@
 # Codex Pi Worker
 
-面向 Windows 与 macOS Codex 的 Pi 子代理编排器。Codex 负责拆任务、审核和最终验收；Pi 在后台完成有边界的分析、实现、修复、代码搜索或联网研究。
+面向 Windows 与 macOS Codex 的后台子代理编排器。Codex 负责拆任务、审核和最终验收；macOS 可在同一生命周期下选择 Pi 或 Agy 完成分析、实现、修复、代码搜索或联网研究。
 
-它不是 Codex 原生 `spawn_agent` 的替代实现，也不会更换 Codex 主模型。它是一套独立的 Skill + lifecycle runtime，重点解决后台执行、完成即通知、同会话续跑、并行 Worker、审核后清理和可审计结果。
+它不是 Codex 原生 `spawn_agent` 的替代实现，也不会更换 Codex 主模型。它是一套独立的 Skill + lifecycle runtime；执行器只是可替换的最内层适配器，worktree、事件通知、续跑、并行、审核后清理和结果合同只维护一份。
 
 ## 核心能力
 
@@ -18,11 +18,12 @@
 | 失败早通知 | provider/runtime 错误、连续工具失败和重试失败会立即发可重复 `attention` |
 | Windows 兼容 | UTF-8/CP936 安全 JSON、`CREATE_NO_WINDOW`、进程树终止、长路径清理 |
 | macOS 原生链路 | JSON headless、POSIX 事件唤醒、轻量 worktree、审核后清理和共享缓存 LRU |
+| 多执行器 | macOS 默认 `--backend pi`，也可直接使用 `--backend agy`；不嵌套 Agy 的另一套 job/wait/state |
 | 证据控制 | JSON result、紧凑事件、stderr、binary patch 与日志容量上限 |
 
 ## 快速开始
 
-Windows 要求 Python 3.12+、Node.js 22.19+、Git 和 Pi CLI 0.83+。macOS 使用 Node.js、Git 和 Pi CLI 0.83+，不依赖 Python。完整安装和私有 provider 配置见 [Windows 安装指南](docs/installation.md)、[macOS 安装指南](docs/macos.md) 与 [配置指南](docs/configuration.md)。
+Windows 要求 Python 3.12+、Node.js 22.19+、Git 和 Pi CLI 0.83+。macOS 使用 Node.js、Git 和 Pi CLI 0.83+，Agy 后端另需 Agy CLI 1.1.8+ 及有效登录。完整安装和私有 provider 配置见 [Windows 安装指南](docs/installation.md)、[macOS 安装指南](docs/macos.md) 与 [配置指南](docs/configuration.md)。
 
 ```powershell
 npm install -g @earendil-works/pi-coding-agent@0.83.0
@@ -82,6 +83,22 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker profiles
 - 清理必须发生在 Codex 审核之后；不要让 Worker 自己删除候选 worktree。
 
 ## 最新更新
+
+### 2026-09-04
+
+- macOS v0.2.1 修复多次 attention 的漏报与重复投递，增加不杀任务的启动静默提醒、流式状态写入节流、终态后台进程组清理，以及 Node/Pi 可执行文件的固定路径与 `PATH` 回退。
+- macOS v0.2.0 增加直接 Agy 后端：共享现有 worktree、事件等待、取消、补丁、清理和结果合同；使用 Agy 原生 `stream-json`、`conversation_id` 续跑和 usage，不复制 `agy-staff` 的第二套生命周期。
+- Agy 错误终态即使包含部分回答也不会伪装成成功；未知模型、认证、限流、5xx、传输与裸 `EOF` 会进入现有失败/attention 路径。
+- Pi 仍是默认后端，现有命令兼容；Agy 不默认全工具自动批准，单次可信任务可显式传入原生 Agy 权限参数。
+
+### 2026-08-29
+
+- macOS v0.1.16 将事件等待收据与持久结果解耦，只对连续相同工具错误告警，并在捕获补丁前删除本轮可重建的 Python 缓存；v0.1.15 的持久状态、紧凑 `wait` receipt 和明确 `missing` 状态保持不变。
+
+### 2026-08-27
+
+- macOS v0.1.14 移除 ShuaiAPI Worker Profile 与活动示例，默认模型列表改为 AHZM、CommandCode、DeepSeek、OpenCode Go 和 xAI；xAI Grok 4.6 使用官方 Responses 配置时可由调用方显式选择 High 或 XHigh。
+- macOS v0.1.13 取消模型思考强度白名单，明确允许脏仓库直接创建隔离 worktree，并按需加载显式选择的用户级 Provider 扩展；离线环境必然失败的 `find` 继续默认禁用，只保留网络不可用快速失败、审核后清理与共享缓存上限等必要边界。
 
 ### 2026-08-10
 

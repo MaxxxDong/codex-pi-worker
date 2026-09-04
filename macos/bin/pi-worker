@@ -1,6 +1,32 @@
 #!/bin/zsh
 set -euo pipefail
 
+resolve_executable() {
+  local override="$1"
+  local preferred="$2"
+  local name="$3"
+  if [[ -n "$override" ]]; then
+    if [[ -x "$override" ]]; then
+      print -r -- "$override"
+      return
+    fi
+    print -u2 "Pi Worker executable is not runnable: $override"
+    return 127
+  fi
+  if [[ -x "$preferred" ]]; then
+    print -r -- "$preferred"
+    return
+  fi
+  local discovered
+  discovered="$(command -v "$name" 2>/dev/null || true)"
+  if [[ -n "$discovered" && -x "$discovered" ]]; then
+    print -r -- "$discovered"
+    return
+  fi
+  print -u2 "Pi Worker could not find $name at $preferred or on PATH"
+  return 127
+}
+
 if [[ ("${1:-}" == "dispatch" || "${1:-}" == "continue") && "${CODEX_SANDBOX:-}" == "seatbelt" && "${CODEX_SANDBOX_NETWORK_DISABLED:-}" == "1" ]]; then
   print -u2 'Pi Worker provider network is blocked by the Codex sandbox. Re-run this command with sandbox_permissions="require_escalated".'
   exit 69
@@ -9,7 +35,8 @@ fi
 case "${1:-}" in
   dispatch|continue|steer|cancel|wait|cleanup|status|cache-status|profiles|help|--help|-h)
     skill_root="${0:A:h:h}"
-    exec "$HOME/.local/node-lts/bin/node" \
+    node_bin="$(resolve_executable "${PI_WORKER_NODE_BIN:-}" "$HOME/.local/node-lts/bin/node" node)"
+    exec "$node_bin" \
       "$skill_root/lib/events.mjs" "$@"
     ;;
 esac
@@ -29,7 +56,8 @@ for arg in "$@"; do
   previous="$arg"
 done
 
-exec "$HOME/.local/node-lts/bin/pi" \
+pi_bin="$(resolve_executable "${PI_WORKER_PI_BIN:-}" "$HOME/.local/node-lts/bin/pi" pi)"
+exec "$pi_bin" \
   "${output_args[@]}" \
   --offline \
   --tools read,bash,edit,write,grep,find,ls,web_search \

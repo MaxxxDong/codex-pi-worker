@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   copyFileSync,
@@ -12,6 +13,7 @@ import {
   readlinkSync,
   readdirSync,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -22,13 +24,20 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { AGY_PROFILES, agyLaunchArgs, agyLauncher, selectAgy, summarizeAgyStream } from "./agy-backend.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
-const DEFAULT_ROOT = join(tmpdir(), `pi-worker-${process.getuid?.() ?? "user"}`);
+const DEFAULT_ROOT = process.platform === "darwin"
+  ? join(homedir(), "Library", "Application Support", "pi-worker", "runs")
+  : join(homedir(), ".local", "state", "pi-worker", "runs");
 const FALLBACK_MS = 15_000;
+const PROGRESS_WRITE_MS = 250;
+const DEFAULT_STARTUP_ATTENTION_SECONDS = 60;
+const ATTENTION_LIMIT = 8;
 const CACHE_MAX_BYTES = 20 * 1024 * 1024 * 1024;
 const CACHE_STALE_MS = 90 * 24 * 60 * 60 * 1000;
 const CACHE_GC_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const CACHE_ACTION_LIMIT = 12;
 const FAILURE_TAIL_BYTES = 64 * 1024;
 const TOOL_ERROR_BYTES = 2 * 1024;
 const STEER_MAX_BYTES = 16 * 1024;
@@ -39,19 +48,25 @@ const AGENT_PROFILE_FILES = ["auth.json", "models.json", "models-store.json", "s
 const OPTIONAL_PACKAGES = ["@upstash/context7-pi", "context-mode", "pi-lens", "pi-playwright"];
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const PROFILES = new Map([
-  ["opencode-go/deepseek-v4-flash", { defaultThinking: "max", allowed: ["max"], fixedThinking: "max" }],
-  ["deepseek/deepseek-v4-flash", { defaultThinking: "max", allowed: ["high", "max"] }],
-  ["xai/grok-4.5", { defaultThinking: "high", allowed: ["low", "medium", "high"] }],
-  ["shuaiapi-grok/grok-4.5", { defaultThinking: "high", allowed: ["high"] }],
-  ["shuaiapi/gpt-5.6-sol", { defaultThinking: "medium", allowed: ["low", "medium", "high", "xhigh", "max"] }],
-  ["shuaiapi/gpt-5.6-luna", { defaultThinking: "xhigh", allowed: ["low", "medium", "high", "xhigh", "max"] }],
+  ["deepseek/deepseek-v4-flash", { defaultThinking: "max" }],
+  ["ahzm/glm-5.3", { defaultThinking: "max" }],
+  ["ahzm/glm-5.3-flash", { defaultThinking: "max" }],
+  ["commandcode/z-ai/glm-5.3-flash", { defaultThinking: "max" }],
+  ["commandcode/deepseek/deepseek-v4-flash", { defaultThinking: "max" }],
+  ["commandcode/google/gemini-3.7-flash", { defaultThinking: "high" }],
+  ["commandcode/Qwen/Qwen3.8-Flash", { defaultThinking: "max" }],
+  ["commandcode/Qwen/Qwen3.8-Max", { defaultThinking: "xhigh" }],
+  ["xai/grok-4.5", { defaultThinking: "high" }],
+  ["xai/grok-4.6", { defaultThinking: "high" }],
 ]);
 const ATTENTION_PATTERNS = [
-  ["authentication", /(?:\b401\b|\b403\b|unauthori[sz]ed|invalid (?:api )?key|authentication failed)/i],
+  ["authentication", /(?:\b401\b|\b403\b|unauthori[sz]ed|invalid (?:api )?key|authentication failed|invalid_grant|oauth token refresh failed)/i],
+  ["request_rejected", /(?:data[_ ]inspection[_ ]failed|inappropriate content|invalid_request_error)/i],
   ["rate_limit", /(?:\b429\b|rate[ -]?limit|too many requests)/i],
   ["provider_5xx", /(?:\b50[0-4]\b|internal server error|bad gateway|service unavailable|gateway timeout)/i],
+  ["permission_denied", /(?:permission.*(?:denied|cannot prompt)|auto-denied|denied\s+\d*\s*required action)/i],
   ["reasoning_ignored", /(?:(?:reasoning|thinking).*(?:ignored|unsupported|not supported)|(?:ignored|unsupported).*(?:reasoning|thinking))/i],
-  ["transport", /(?:broken pipe|ECONNRESET|socket hang up|connection reset)/i],
+  ["transport", /(?:broken pipe|ECONNRESET|socket hang up|connection reset|connection error|unexpected eof|\bEOF\b|stream (?:ended before a terminal response event|was interrupted)|fetch failed)/i],
 ];
 
 function fail(message, code = 2) {
@@ -69,7 +84,7 @@ function parseArgs(argv) {
     if (!flag.startsWith("--")) fail(`unexpected argument: ${flag}`);
     const equal = flag.indexOf("=");
     const name = equal < 0 ? flag.slice(2) : flag.slice(2, equal);
-    if (equal < 0 && name === "live") {
+    if (equal < 0 && ["live", "full"].includes(name)) {
       options.set(name, [...(options.get(name) ?? []), "true"]);
       continue;
     }
@@ -82,13 +97,13 @@ function parseArgs(argv) {
 
 function usage() {
   return `pi-worker commands:
-  dispatch --run-id ID [--mode read|write|in-place] [--source DIR|--workdir DIR]
+  dispatch --run-id ID [--backend pi|agy] [--mode read|write|in-place] [--source DIR|--workdir DIR]
            [--capability docs|lens|context|browser] [--live] [--idle-timeout SECONDS]
-           [--hard-timeout SECONDS] -- --provider NAME --model ID [--thinking LEVEL] PROMPT
-  continue --run-id ID [--live] [--idle-timeout SECONDS] -- PROMPT
+           [--hard-timeout SECONDS] [--startup-attention SECONDS] -- BACKEND_ARGS PROMPT
+  continue --run-id ID [--live] [--idle-timeout SECONDS] [--startup-attention SECONDS] -- PROMPT
   steer --run-id ID [--timeout SECONDS] -- MESSAGE
   cancel --run-id ID [--run-id ID...] [--reason TEXT] [--timeout SECONDS]
-  wait --run-id ID [--run-id ID...] [--timeout SECONDS]
+  wait --run-id ID [--run-id ID...] [--timeout SECONDS] [--full]
   cleanup --reviewed yes --run-id ID [--run-id ID...]
   status --run-id ID [--run-id ID...]
   cache-status
@@ -150,7 +165,7 @@ function withRunLock(directory, action) {
 
 function extractPrompt(piArgs) {
   const prompt = piArgs.at(-1);
-  if (!prompt || prompt.startsWith("--")) fail("dispatch requires one prompt as the final Pi argument");
+  if (!prompt || prompt.startsWith("--")) fail("dispatch requires one prompt as the final backend argument");
   return { prompt, args: piArgs.slice(0, -1) };
 }
 
@@ -158,6 +173,16 @@ function processAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function processGroupAlive(pid) {
+  if (process.platform === "win32" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(-pid, 0);
     return true;
   } catch (error) {
     return error?.code === "EPERM";
@@ -191,6 +216,13 @@ function replacePiOption(piArgs, name, value) {
   return [flag, value, ...args];
 }
 
+function providerExtensionArgs(provider) {
+  if (!/^[A-Za-z0-9._-]+$/.test(provider)) return [];
+  const source = resolve(process.env.PI_WORKER_AGENT_SOURCE ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"));
+  const extension = ["ts", "js", "mjs"].map((suffix) => join(source, "extensions", `${provider}.${suffix}`)).find(existsSync);
+  return extension ? ["--extension", extension] : [];
+}
+
 function applyDispatchProfile(piArgs) {
   if (piArgs.some((argument) => /^--(?:session|session-id|session-dir|continue|resume|fork)(?:=|$)/.test(argument))) {
     fail("Pi Worker owns its managed session; use the continue command for another turn");
@@ -204,14 +236,9 @@ function applyDispatchProfile(piArgs) {
   const requestedThinking = supplied.at(-1) ?? profile?.defaultThinking;
   if (!requestedThinking) fail(`unknown Pi Worker profile ${key} requires explicit --thinking`);
   if (!THINKING_LEVELS.includes(requestedThinking)) fail(`thinking must be one of: ${THINKING_LEVELS.join(", ")}`);
-  const thinking = profile?.fixedThinking ?? requestedThinking;
-  if (profile && !profile.fixedThinking && !profile.allowed.includes(thinking)) {
-    fail(`${key} thinking must be one of: ${profile.allowed.join(", ")}`);
-  }
+  const thinking = requestedThinking;
   return {
-    args: profile?.fixedThinking
-      ? replacePiOption(piArgs, "thinking", profile.fixedThinking)
-      : (supplied.length > 0 ? piArgs : ["--thinking", profile.defaultThinking, ...piArgs]),
+    args: [...providerExtensionArgs(provider), ...(supplied.length > 0 ? piArgs : ["--thinking", profile.defaultThinking, ...piArgs])],
     provider,
     model,
     thinking,
@@ -335,9 +362,33 @@ function createManagedWorktree(source, directory) {
   }
 }
 
+function rebuildableArtifactRoot(name) {
+  const parts = name.split("/");
+  const index = parts.findIndex((part) =>
+    ["__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".venv", "venv"].includes(part)
+    || part.endsWith(".egg-info"));
+  if (index >= 0) return parts.slice(0, index + 1).join("/");
+  if (/\.(?:pyc|pyo)$/.test(name) || parts.at(-1) === ".coverage") return name;
+  return null;
+}
+
+function discardRebuildableArtifacts(result) {
+  const changed = runGit(result.workdir, ["diff", "--cached", "--name-only", "-z", result.baselineTree], { binary: true })
+    .stdout.toString("utf8").split("\0").filter(Boolean);
+  const artifacts = new Set(changed.map(rebuildableArtifactRoot).filter(Boolean));
+  for (const name of artifacts) {
+    const object = result.baselineTree + ":" + name;
+    const existed = runGit(result.workdir, ["cat-file", "-e", object], { allowFailure: true }).status === 0;
+    runGit(result.workdir, ["reset", result.baselineTree, "--", name]);
+    rmSync(join(result.workdir, name), { recursive: true, force: true });
+    if (existed) runGit(result.workdir, ["checkout", result.baselineTree, "--", name]);
+  }
+}
+
 function capturePatch(result, directory) {
   if (!result.managedWorktree) return { patchPath: null, patchBytes: 0 };
   runGit(result.workdir, ["add", "-A"]);
+  discardRebuildableArtifacts(result);
   const patch = runGit(result.workdir, ["diff", "--binary", "--cached", result.baselineTree], { binary: true }).stdout;
   runGit(result.workdir, ["reset", "--mixed", "HEAD"]);
   if (patch.length === 0) return { patchPath: null, patchBytes: 0 };
@@ -370,7 +421,7 @@ function messageText(message) {
 }
 
 async function summarizeStream(stream, onActivity, onAttention, onResponse = () => {}, onSettled = () => {}) {
-  const summary = { settled: false, lastAssistant: null, usage: {}, assistantCalls: 0, tools: [], playwrightUsed: false, consecutiveToolErrors: 0 };
+  const summary = { settled: false, lastAssistant: null, usage: {}, assistantCalls: 0, tools: [], playwrightUsed: false, consecutiveToolErrors: 0, lastToolErrorKey: null };
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   for await (const line of lines) {
     try {
@@ -395,8 +446,15 @@ async function summarizeStream(stream, onActivity, onAttention, onResponse = () 
         if (error) {
           tool.errorCount += 1;
           tool.lastError = redactText(JSON.stringify(event.result ?? event.error ?? "tool failed")).slice(0, TOOL_ERROR_BYTES);
+          const errorKey = String(name) + "\\0" + tool.lastError;
+          summary.consecutiveToolErrors = summary.lastToolErrorKey === errorKey
+            ? summary.consecutiveToolErrors + 1
+            : 1;
+          summary.lastToolErrorKey = errorKey;
+        } else {
+          summary.consecutiveToolErrors = 0;
+          summary.lastToolErrorKey = null;
         }
-        summary.consecutiveToolErrors = error ? summary.consecutiveToolErrors + 1 : 0;
         if (summary.consecutiveToolErrors >= 3) onAttention("repeated_tool_errors", tool.lastError);
       }
       if (event.type === "auto_retry_start" && Number(event.attempt ?? 0) >= 2) onAttention("provider_retry", JSON.stringify(event));
@@ -439,10 +497,31 @@ function collectTail(stream, onActivity, onAttention) {
   });
 }
 
+function eventDirectory(directory) {
+  const key = createHash("sha256").update(resolve(directory)).digest("hex");
+  return join(tmpdir(), "pi-worker-events", key);
+}
+
+function attentionReceipt(directory, attention) {
+  const key = createHash("sha256")
+    .update(String(attention.detectedAt ?? "") + "\\0" + String(attention.category ?? ""))
+    .digest("hex");
+  return join(eventDirectory(directory), "attention-" + key + ".json");
+}
+
+function attentionEvents(value) {
+  if (Array.isArray(value?.events)) return value.events;
+  return value?.category ? [value] : [];
+}
+
+function attentionFingerprint(category, detail) {
+  return createHash("sha256").update(String(category) + "\0" + String(detail)).digest("hex");
+}
+
 function notifyWaiter(directory) {
-  const waiters = join(directory, "waiters");
+  const waiters = eventDirectory(directory);
   if (!existsSync(waiters)) return;
-  for (const name of readdirSync(waiters).filter((entry) => entry.endsWith(".json"))) {
+  for (const name of readdirSync(waiters).filter((entry) => /^\d+\.json$/.test(entry))) {
     const path = join(waiters, name);
     const waiter = readJson(path);
     if (!processAlive(waiter?.pid)) {
@@ -536,7 +615,14 @@ function activeWorkers(root) {
   });
 }
 
-function pruneCacheFiles(before, actions) {
+function recordCacheAction(actions, actionSummary, action) {
+  actionSummary.attempted += 1;
+  if (action.exitCode === 0) actionSummary.succeeded += 1;
+  else actionSummary.failed += 1;
+  if (actions.length < CACHE_ACTION_LIMIT) actions.push(action);
+}
+
+function pruneCacheFiles(before, actions, actionSummary) {
   const cutoff = Date.now() - CACHE_STALE_MS;
   const files = cacheCandidates().flatMap(cacheFiles).sort((left, right) => left.lastUsedMs - right.lastUsedMs);
   let estimatedBytes = before.totalBytes;
@@ -545,19 +631,37 @@ function pruneCacheFiles(before, actions) {
     try {
       unlinkSync(file.path);
       estimatedBytes = Math.max(0, estimatedBytes - file.bytes);
-      actions.push({ command: "cache file remove", path: file.path, bytes: file.bytes, stale: file.lastUsedMs < cutoff, exitCode: 0 });
+      recordCacheAction(actions, actionSummary, { command: "cache file remove", path: file.path, bytes: file.bytes, stale: file.lastUsedMs < cutoff, exitCode: 0 });
     } catch (error) {
-      actions.push({ command: "cache file remove", path: file.path, bytes: file.bytes, exitCode: 1, error: error.message });
+      recordCacheAction(actions, actionSummary, { command: "cache file remove", path: file.path, bytes: file.bytes, exitCode: 1, error: error.message });
     }
   }
 }
 
+function compactCacheReceipt(receipt) {
+  if (!Array.isArray(receipt?.actions) || receipt.actions.length <= CACHE_ACTION_LIMIT) return receipt;
+  const actionSummary = receipt.actionSummary ?? receipt.actions.reduce((summary, action) => {
+    summary.attempted += 1;
+    if (action.exitCode === 0) summary.succeeded += 1;
+    else summary.failed += 1;
+    return summary;
+  }, { attempted: 0, succeeded: 0, failed: 0 });
+  return {
+    ...receipt,
+    actions: receipt.actions.slice(0, CACHE_ACTION_LIMIT),
+    actionSummary: { ...actionSummary, omitted: receipt.actions.length - CACHE_ACTION_LIMIT },
+  };
+}
+
 function cacheGc(root) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
+  if (process.env.CODEX_SANDBOX === "seatbelt" && !process.env.PI_WORKER_TEST_CACHE_ROOTS) {
+    return { skipped: "shared cache GC requires host filesystem permissions", ...cacheReport() };
+  }
   const receiptPath = join(root, ".cache-gc.json");
   const previous = readJson(receiptPath);
   if (previous && Date.now() - Date.parse(previous.checkedAt) < CACHE_GC_INTERVAL_MS) {
-    return { skipped: "checked within the last day", ...previous };
+    return { ...compactCacheReceipt(previous), skipped: "checked within the last day" };
   }
   const lock = join(root, ".cache-gc.lock");
   let handle;
@@ -580,9 +684,10 @@ function cacheGc(root) {
     const env = { ...process.env, ...sharedEnv };
     const pnpmStore = cacheCandidates().find((path) => path.endsWith("/pnpm/store") && existsSync(path));
     const actions = [];
-    pruneCacheFiles(before, actions);
-    if (actions.length === 0 && before.totalBytes <= before.maxBytes) {
-      const outcome = { checkedAt: new Date().toISOString(), before, after: before, actions, overLimit: false };
+    const actionSummary = { attempted: 0, succeeded: 0, failed: 0 };
+    pruneCacheFiles(before, actions, actionSummary);
+    if (actionSummary.attempted === 0 && before.totalBytes <= before.maxBytes) {
+      const outcome = { checkedAt: new Date().toISOString(), before, after: before, actions, actionSummary, overLimit: false };
       atomicJson(receiptPath, outcome);
       return outcome;
     }
@@ -593,10 +698,17 @@ function cacheGc(root) {
     ];
     for (const [command, args] of commands) {
       const result = spawnSync(command, args, { env, encoding: "utf8" });
-      actions.push({ command: `${command} ${args.join(" ")}`, exitCode: result.status });
+      recordCacheAction(actions, actionSummary, { command: `${command} ${args.join(" ")}`, exitCode: result.status });
     }
     const after = cacheReport();
-    const outcome = { checkedAt: new Date().toISOString(), before, after, actions, overLimit: after.totalBytes > after.maxBytes };
+    const outcome = {
+      checkedAt: new Date().toISOString(),
+      before,
+      after,
+      actions,
+      actionSummary: { ...actionSummary, omitted: Math.max(0, actionSummary.attempted - actions.length) },
+      overLimit: after.totalBytes > after.maxBytes,
+    };
     atomicJson(receiptPath, outcome);
     return outcome;
   } finally {
@@ -617,6 +729,13 @@ function stopPidTree(pid, signal) {
     if (process.platform === "win32") process.kill(pid, signal);
     else process.kill(-pid, signal);
   } catch {}
+}
+
+function stopOwnedProcessGroup(child) {
+  if (!child?.pid || !processGroupAlive(child.pid)) return;
+  stopProcessTree(child, "SIGTERM");
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  if (processGroupAlive(child.pid)) stopProcessTree(child, "SIGKILL");
 }
 
 function closePlaywrightSession(env, cwd) {
@@ -641,6 +760,9 @@ function prepareAgentProfile(directory) {
     }
     const settings = readJson(from);
     if (!settings) throw new Error(`invalid Pi settings: ${from}`);
+    delete settings.defaultProvider;
+    delete settings.defaultModel;
+    delete settings.enabledModels;
     if (Array.isArray(settings.packages)) {
       settings.packages = settings.packages.filter((entry) => {
         const value = typeof entry === "string" ? entry : entry?.source ?? entry?.package ?? entry?.name ?? "";
@@ -665,9 +787,21 @@ async function supervise(options, piArgs) {
   let earlyCancelRequested = false;
   const earlyCancelSignal = () => { earlyCancelRequested = true; };
   process.on("SIGTERM", earlyCancelSignal);
+  const backend = initial.backend ?? "pi";
   const live = initial.live === true;
   const { prompt, args: launchArgs } = extractPrompt(piArgs);
-  const launcher = process.env.PI_WORKER_LAUNCHER ?? resolve(dirname(SCRIPT), "../bin/pi-worker");
+  const launcher = backend === "agy"
+    ? agyLauncher()
+    : (process.env.PI_WORKER_LAUNCHER ?? resolve(dirname(SCRIPT), "../bin/pi-worker"));
+  const childArgs = backend === "agy"
+    ? agyLaunchArgs({
+      args: launchArgs,
+      prompt,
+      mode: { model: initial.model, thinking: initial.thinking, readOnly: initial.mode === "read" },
+      hardTimeoutSeconds: initial.hardTimeoutSeconds,
+      conversationId: initial.resumeConversationId ?? null,
+    })
+    : (live ? ["--mode", "rpc", ...launchArgs] : [...launchArgs, prompt]);
   const tmp = join(directory, "tmp");
   mkdirSync(tmp, { recursive: true, mode: 0o700 });
   atomicJson(resultPath, { ...initial, state: "starting", activity: "waiting_event", supervisorPid: process.pid, startedAt: new Date().toISOString() });
@@ -679,13 +813,18 @@ async function supervise(options, piArgs) {
   let timeoutType = null;
   let cancelRequested = false;
   let cancelReason = null;
-  let summary = { settled: false, lastAssistant: null, usage: {}, assistantCalls: 0, tools: [], playwrightUsed: false };
+  let summary = { settled: false, lastAssistant: null, usage: {}, assistantCalls: 0, tools: [], playwrightUsed: false, conversationId: null, structuredOutput: null, backendStatus: null, backendTurns: null, backendDeniedActionCount: 0 };
   let stderr = "";
-  let attention = initial.attention ?? null;
+  const attentions = Array.isArray(initial.attentions)
+    ? [...initial.attentions]
+    : (initial.attention ? [initial.attention] : []);
+  const attentionFingerprints = new Set(attentions.map((entry) => attentionFingerprint(entry.category, entry.detail)));
+  let attention = attentions.at(-1) ?? null;
+  const agentDir = backend === "pi" ? (initial.agentDir ?? prepareAgentProfile(directory)) : null;
   const runEnv = {
     ...process.env,
     ...cacheEnvironment(),
-    PI_CODING_AGENT_DIR: initial.agentDir ?? prepareAgentProfile(directory),
+    ...(agentDir ? { PI_CODING_AGENT_DIR: agentDir } : {}),
     TMPDIR: tmp,
     TMP: tmp,
     TEMP: tmp,
@@ -695,6 +834,7 @@ async function supervise(options, piArgs) {
   let idleTimer = null;
   let forceTimer = null;
   let rpcShutdownTimer = null;
+  let startupAttentionTimer = null;
   let steerFallback = null;
   let steerSignal = null;
   let cancelSignal = null;
@@ -705,13 +845,33 @@ async function supervise(options, piArgs) {
   let firstToolAt = initial.firstToolAt ?? null;
   let lastToolAt = initial.lastToolAt ?? null;
   let lastEventType = initial.lastEventType ?? null;
+  let lastEventAt = initial.lastEventAt ?? null;
   let assistantCalls = Number(initial.assistantCalls ?? 0);
-  const updateProgress = (event = undefined, forcedState = null) => {
+  let progressWrites = Number(initial.progressWrites ?? 0);
+  let progressState = initial.state ?? "starting";
+  let progressActivity = initial.activity ?? "waiting_event";
+  let activitySince = initial.activitySince ?? initial.startedAt ?? new Date().toISOString();
+  let pendingProgress = null;
+  let progressTimer = null;
+  let lastProgressWriteMs = 0;
+  const flushProgress = () => {
+    if (progressTimer) clearTimeout(progressTimer);
+    progressTimer = null;
+    const snapshot = pendingProgress;
+    pendingProgress = null;
+    if (!snapshot) return;
     const current = readJson(resultPath);
     if (!current || terminal(current) || current.supervisorPid !== process.pid) return;
+    progressWrites += 1;
+    atomicJson(resultPath, { ...current, ...snapshot, progressWrites });
+    lastProgressWriteMs = Date.now();
+  };
+  const updateProgress = (event = undefined, forcedState = null) => {
     const at = new Date().toISOString();
+    const firstActivity = event !== undefined && firstEventAt === null;
     if (event !== undefined) {
       firstEventAt ??= at;
+      lastEventAt = at;
       lastEventType = event?.type ?? "stderr";
       if (event?.type === "tool_execution_start") {
         firstToolAt ??= at;
@@ -730,27 +890,38 @@ async function supervise(options, piArgs) {
         assistantCalls += 1;
       }
     }
-    let state = forcedState ?? current.state;
+    let state = forcedState ?? progressState;
     if (!forcedState && !["stopping", "finalizing"].includes(state)) {
       state = event?.type === "agent_settled" ? "finalizing" : "running";
     }
     const activity = ["stopping", "finalizing"].includes(state)
       ? null
       : (activeTools.size > 0 ? "running_tools" : (firstEventAt ? "waiting_model" : "waiting_event"));
-    const activitySince = activity === current.activity ? (current.activitySince ?? at) : at;
-    atomicJson(resultPath, {
-      ...current,
+    if (activity !== progressActivity) activitySince = at;
+    progressState = state;
+    progressActivity = activity;
+    pendingProgress = {
       state,
       activity,
       activitySince,
       firstEventAt,
-      lastEventAt: event === undefined ? current.lastEventAt ?? null : at,
+      lastEventAt,
       firstToolAt,
       lastToolAt,
       lastEventType,
       assistantCalls,
       activeTools: [...activeTools.values()].slice(0, 10),
-    });
+    };
+    const important = forcedState !== null
+      || event === undefined
+      || firstActivity
+      || ["tool_execution_start", "tool_execution_end", "message_end", "agent_settled"].includes(event?.type);
+    if (important || Date.now() - lastProgressWriteMs >= PROGRESS_WRITE_MS) {
+      flushProgress();
+    } else if (!progressTimer) {
+      progressTimer = setTimeout(flushProgress, PROGRESS_WRITE_MS - (Date.now() - lastProgressWriteMs));
+      progressTimer.unref();
+    }
   };
   try {
     const stopChild = () => {
@@ -776,17 +947,25 @@ async function supervise(options, piArgs) {
     };
     const markActivity = (event) => {
       resetIdle();
+      if (firstEventAt === null && startupAttentionTimer) {
+        clearTimeout(startupAttentionTimer);
+        startupAttentionTimer = null;
+      }
       updateProgress(event);
     };
     const markAttention = (category, detail) => {
-      if (attention) return;
+      const safeDetail = redactText(detail).slice(-4_096);
+      const fingerprint = attentionFingerprint(category, safeDetail);
+      if (attentionFingerprints.has(fingerprint) || attentions.length >= ATTENTION_LIMIT) return;
+      attentionFingerprints.add(fingerprint);
       attention = {
         category,
-        detail: redactText(detail).slice(-4_096),
+        detail: safeDetail,
         detectedAt: new Date().toISOString(),
         delivered: false,
       };
-      atomicJson(join(directory, "attention.json"), attention);
+      attentions.push(attention);
+      atomicJson(join(directory, "attention.json"), { events: attentions });
       notifyWaiter(directory);
     };
     const steerDir = join(directory, "steer");
@@ -804,7 +983,7 @@ async function supervise(options, piArgs) {
     process.on("SIGTERM", cancelSignal);
     if (earlyCancelRequested || existsSync(cancelPath)) cancelSignal();
     if (live) mkdirSync(ackDir, { recursive: true, mode: 0o700 });
-    child = spawn(launcher, live ? ["--mode", "rpc", ...launchArgs] : [...launchArgs, prompt], {
+    child = spawn(launcher, childArgs, {
       cwd: initial.workdir,
       detached: process.platform !== "win32",
       env: runEnv,
@@ -859,13 +1038,24 @@ async function supervise(options, piArgs) {
       steerFallback = setInterval(drainSteer, 5_000);
       steerFallback.unref();
     }
-    atomicJson(resultPath, { ...readJson(resultPath), state: "running", activity: "waiting_event", supervisorPid: process.pid, childPid: child.pid });
+    atomicJson(resultPath, { ...readJson(resultPath), supervisorPid: process.pid, childPid: child.pid });
+    updateProgress(undefined, "running");
     resetIdle();
+    if (initial.startupAttentionSeconds > 0 && firstEventAt === null) {
+      startupAttentionTimer = setTimeout(() => {
+        if (firstEventAt === null) {
+          markAttention("startup_silent", `No backend event received within ${initial.startupAttentionSeconds} seconds; the worker is still running.`);
+        }
+      }, initial.startupAttentionSeconds * 1000);
+      startupAttentionTimer.unref();
+    }
     if (cancelRequested) {
       updateProgress(undefined, "stopping");
       stopChild();
     }
-    const summaryPromise = summarizeStream(child.stdout, markActivity, markAttention, onResponse, onSettled);
+    const summaryPromise = backend === "agy"
+      ? summarizeAgyStream(child.stdout, { onActivity: markActivity, onAttention: markAttention, onSettled, classifyAttention })
+      : summarizeStream(child.stdout, markActivity, markAttention, onResponse, onSettled);
     const stderrPromise = collectTail(child.stderr, markActivity, markAttention);
     hardTimeout = initial.hardTimeoutSeconds > 0 ? setTimeout(() => {
       stopForTimeout("hard");
@@ -878,6 +1068,7 @@ async function supervise(options, piArgs) {
       child.once("error", (error) => resolveExit({ exitCode: null, signal: null, launchError: error.message }));
       child.once("close", (code, childSignal) => resolveExit({ exitCode: code, signal: childSignal, launchError: null }));
     }));
+    stopOwnedProcessGroup(child);
     updateProgress(undefined, "finalizing");
     [summary, stderr] = await Promise.all([summaryPromise, stderrPromise]);
   } catch (error) {
@@ -887,16 +1078,19 @@ async function supervise(options, piArgs) {
     if (idleTimer) clearTimeout(idleTimer);
     if (forceTimer) clearTimeout(forceTimer);
     if (rpcShutdownTimer) clearTimeout(rpcShutdownTimer);
+    if (startupAttentionTimer) clearTimeout(startupAttentionTimer);
+    if (progressTimer) clearTimeout(progressTimer);
     if (steerFallback) clearInterval(steerFallback);
     if (steerSignal) process.off("SIGUSR2", steerSignal);
     if (cancelSignal) process.off("SIGTERM", cancelSignal);
     process.off("SIGTERM", earlyCancelSignal);
     if (child?.stdin?.writable) child.stdin.end();
+    stopOwnedProcessGroup(child);
     rmSync(tmp, { recursive: true, force: true });
   }
 
-  const playwrightCleanupError = summary.playwrightUsed ? closePlaywrightSession(runEnv, initial.workdir) : null;
-  rmSync(runEnv.PI_CODING_AGENT_DIR, { recursive: true, force: true });
+  const playwrightCleanupError = backend === "pi" && summary.playwrightUsed ? closePlaywrightSession(runEnv, initial.workdir) : null;
+  if (agentDir) rmSync(agentDir, { recursive: true, force: true });
   let patch = { patchPath: null, patchBytes: 0 };
   let patchError = null;
   try { patch = capturePatch(initial, directory); } catch (error) { patchError = error.message; }
@@ -906,7 +1100,8 @@ async function supervise(options, piArgs) {
   const reason = success ? null : (
     (cancelRequested ? cancelReason : null) ?? patchError ?? playwrightCleanupError ?? launchError
     ?? (timedOut ? `${timeoutType} timeout` : null) ?? summary.lastAssistant?.error
-    ?? (!summary.settled ? "missing agent_settled" : null) ?? (emptyFinal ? "empty final response" : `exit ${exitCode}`)
+    ?? (!summary.settled ? (backend === "agy" ? "missing Agy terminal result" : "missing agent_settled") : null)
+    ?? (emptyFinal ? "empty final response" : `exit ${exitCode}`)
   );
   const reasonCode = success ? null : (
     cancelRequested ? "user_cancelled"
@@ -931,6 +1126,7 @@ async function supervise(options, piArgs) {
     activeTools: [],
     exitCode,
     signal,
+    backend,
     agentSettled: summary.settled,
     reason,
     reasonCode,
@@ -941,11 +1137,20 @@ async function supervise(options, piArgs) {
     observedModel: summary.lastAssistant?.model ?? null,
     thinking: initial.thinking,
     finalText: summary.lastAssistant?.text ?? "",
+    conversationId: summary.conversationId ?? initial.conversationId ?? null,
+    structuredOutput: summary.structuredOutput ?? null,
+    backendStatus: summary.backendStatus ?? null,
+    backendTurns: summary.backendTurns ?? null,
+    backendDeniedActionCount: summary.backendDeniedActionCount ?? 0,
     usage: summary.usage,
     assistantCalls: summary.assistantCalls,
-    reportedReasoningTokens: Number.isFinite(summary.usage?.reasoning) ? summary.usage.reasoning : null,
+    reportedReasoningTokens: Number.isFinite(summary.usage?.reasoning)
+      ? summary.usage.reasoning
+      : (Number.isFinite(summary.usage?.thinking_tokens) ? summary.usage.thinking_tokens : null),
     tools: summary.tools,
     attention,
+    attentions,
+    progressWrites,
     ...patch,
     failureLogPath,
     reviewPending: initial.mode !== "read",
@@ -970,28 +1175,48 @@ function startSupervisor(root, runId, piArgs) {
 function dispatch(options, piArgs) {
   const root = stateRoot(options);
   const runId = validateRunId(one(options, "run-id"));
+  const backend = one(options, "backend", "pi");
+  if (!["pi", "agy"].includes(backend)) fail("--backend must be pi or agy");
   const mode = one(options, "mode", one(options, "source") ? "write" : "read");
   if (!["read", "write", "in-place"].includes(mode)) fail("--mode must be read, write, or in-place");
-  if (piArgs.length === 0) fail("dispatch requires Pi arguments after --");
-  const selection = applyDispatchProfile(piArgs);
+  if (piArgs.length === 0) fail("dispatch requires backend arguments after --");
   const capabilities = options.get("capability") ?? [];
-  const taskArgs = mode === "read" ? ["--append-system-prompt", READ_ONLY_PROMPT, ...selection.args] : selection.args;
-  const effectiveArgs = applyCapabilities(taskArgs, capabilities, mode === "read" ? READ_TOOLS : BASE_TOOLS);
+  if (backend === "agy" && capabilities.length > 0) fail("Agy backend does not support Pi capabilities");
+  if (backend === "agy" && options.has("live")) fail("Agy backend does not support --live; use continue after completion");
+  let selection;
+  let effectiveArgs;
+  try {
+    if (backend === "agy") {
+      const { prompt, args } = extractPrompt(piArgs);
+      selection = selectAgy(args);
+      effectiveArgs = [...selection.args, prompt];
+    } else {
+      selection = applyDispatchProfile(piArgs);
+      const taskArgs = mode === "read" ? ["--append-system-prompt", READ_ONLY_PROMPT, ...selection.args] : selection.args;
+      effectiveArgs = applyCapabilities(taskArgs, capabilities, mode === "read" ? READ_TOOLS : BASE_TOOLS);
+    }
+  } catch (error) {
+    fail(error.message);
+  }
   const hardTimeoutSeconds = Number(one(options, "hard-timeout", "0"));
   if (!Number.isFinite(hardTimeoutSeconds) || hardTimeoutSeconds < 0) fail("--hard-timeout must be zero or positive");
   const idleTimeoutSeconds = Number(one(options, "idle-timeout", "0"));
   if (!Number.isFinite(idleTimeoutSeconds) || idleTimeoutSeconds < 0) fail("--idle-timeout must be zero or positive");
+  const startupAttentionSeconds = Number(one(options, "startup-attention", String(DEFAULT_STARTUP_ATTENTION_SECONDS)));
+  if (!Number.isFinite(startupAttentionSeconds) || startupAttentionSeconds < 0) fail("--startup-attention must be zero or positive");
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const directory = runDirectory(root, runId);
   if (existsSync(directory)) fail(`run already exists: ${runId}`);
   mkdirSync(directory, { mode: 0o700 });
-  const sessionDir = join(directory, "session");
+  const sessionDir = backend === "pi" ? join(directory, "session") : null;
 
   let workspace;
   let agentDir;
   try {
-    agentDir = prepareAgentProfile(directory);
-    mkdirSync(sessionDir, { mode: 0o700 });
+    if (backend === "pi") {
+      agentDir = prepareAgentProfile(directory);
+      mkdirSync(sessionDir, { mode: 0o700 });
+    }
     if (mode === "write") {
       const source = one(options, "source");
       if (!source) throw new Error("write mode requires --source");
@@ -1009,6 +1234,7 @@ function dispatch(options, piArgs) {
   atomicJson(join(directory, "result.json"), {
     schema: 3,
     runId,
+    backend,
     state: "starting",
     activity: "waiting_event",
     mode,
@@ -1024,21 +1250,26 @@ function dispatch(options, piArgs) {
     lastToolAt: null,
     lastEventType: null,
     assistantCalls: 0,
+    progressWrites: 0,
     activeTools: [],
     baseCommit: workspace.baseCommit,
     baselineTree: workspace.baselineTree,
-    provider: selection.provider,
+    provider: selection.provider ?? null,
     model: selection.model,
     thinking: selection.thinking,
+    backendArgs: backend === "agy" ? selection.args : null,
     capabilities,
     live: options.has("live"),
     hardTimeoutSeconds,
     idleTimeoutSeconds,
+    startupAttentionSeconds,
+    attention: null,
+    attentions: [],
     dispatchedAt: new Date().toISOString(),
   });
-  const supervisorPid = startSupervisor(root, runId, ["--session-dir", sessionDir, ...effectiveArgs]);
+  const supervisorPid = startSupervisor(root, runId, backend === "pi" ? ["--session-dir", sessionDir, ...effectiveArgs] : effectiveArgs);
   atomicJson(join(directory, "result.json"), { ...readJson(join(directory, "result.json")), supervisorPid });
-  console.log(JSON.stringify({ runId, state: "running", mode, live: options.has("live"), supervisorPid, workdir: workspace.worktree, sessionDir, directory }));
+  console.log(JSON.stringify({ runId, state: "running", backend, mode, live: options.has("live"), supervisorPid, workdir: workspace.worktree, sessionDir, directory }));
 }
 
 function continueRun(options, promptArgs) {
@@ -1048,19 +1279,31 @@ function continueRun(options, promptArgs) {
   const resultPath = join(directory, "result.json");
   const previous = readJson(resultPath);
   if (!terminal(previous)) fail(`run is not ready to continue: ${runId}`);
+  const backend = previous.backend ?? "pi";
+  if (backend === "agy" && options.has("live")) fail("Agy backend does not support --live; continue as a normal headless turn");
   if (promptArgs.length === 0) fail("continue requires a prompt after --");
-  if (!previous.sessionDir || !existsSync(previous.sessionDir)) fail(`managed session is unavailable: ${runId}`);
+  if (backend === "pi" && (!previous.sessionDir || !existsSync(previous.sessionDir))) fail(`managed session is unavailable: ${runId}`);
+  if (backend === "agy" && !previous.conversationId) fail(`Agy conversation is unavailable: ${runId}`);
   if (!existsSync(previous.workdir)) fail(`worker directory is unavailable: ${previous.workdir}`);
-  const selection = applyDispatchProfile([
-    "--provider", previous.provider,
-    "--model", previous.model,
-    "--thinking", previous.thinking,
-    ...promptArgs,
-  ]);
-  const taskArgs = previous.mode === "read" ? ["--append-system-prompt", READ_ONLY_PROMPT, "--continue", ...selection.args] : ["--continue", ...selection.args];
-  const effectiveArgs = applyCapabilities(taskArgs, previous.capabilities ?? [], previous.mode === "read" ? READ_TOOLS : BASE_TOOLS);
+  let effectiveArgs;
+  if (backend === "agy") {
+    const { prompt, args } = extractPrompt(promptArgs);
+    if (args.length > 0) fail("Agy continue accepts only one prompt after --");
+    effectiveArgs = [...(previous.backendArgs ?? []), prompt];
+  } else {
+    const selection = applyDispatchProfile([
+      "--provider", previous.provider,
+      "--model", previous.model,
+      "--thinking", previous.thinking,
+      ...promptArgs,
+    ]);
+    const taskArgs = previous.mode === "read" ? ["--append-system-prompt", READ_ONLY_PROMPT, "--continue", ...selection.args] : ["--continue", ...selection.args];
+    effectiveArgs = applyCapabilities(taskArgs, previous.capabilities ?? [], previous.mode === "read" ? READ_TOOLS : BASE_TOOLS);
+  }
   const idleTimeoutSeconds = Number(one(options, "idle-timeout", String(previous.idleTimeoutSeconds ?? 0)));
   if (!Number.isFinite(idleTimeoutSeconds) || idleTimeoutSeconds < 0) fail("--idle-timeout must be zero or positive");
+  const startupAttentionSeconds = Number(one(options, "startup-attention", String(previous.startupAttentionSeconds ?? DEFAULT_STARTUP_ATTENTION_SECONDS)));
+  if (!Number.isFinite(startupAttentionSeconds) || startupAttentionSeconds < 0) fail("--startup-attention must be zero or positive");
   const turns = [...(previous.turns ?? []), {
     turnIndex: previous.turnIndex ?? 1,
     state: previous.state,
@@ -1075,6 +1318,8 @@ function continueRun(options, promptArgs) {
     reportedReasoningTokens: previous.reportedReasoningTokens ?? null,
     elapsedSeconds: previous.elapsedSeconds ?? null,
     tools: previous.tools ?? [],
+    conversationId: previous.conversationId ?? null,
+    backendTurns: previous.backendTurns ?? null,
     finishedAt: previous.finishedAt,
   }];
   let supervisorPid;
@@ -1082,7 +1327,7 @@ function continueRun(options, promptArgs) {
     supervisorPid = withRunLock(directory, () => {
       const current = readJson(resultPath);
       if (!terminal(current) || current.finishedAt !== previous.finishedAt) throw new Error(`run changed before continuation: ${runId}`);
-      const agentDir = prepareAgentProfile(directory);
+      const agentDir = backend === "pi" ? prepareAgentProfile(directory) : null;
       atomicJson(resultPath, {
         ...previous,
         state: "starting",
@@ -1090,6 +1335,7 @@ function continueRun(options, promptArgs) {
         supervisorPid: null,
         childPid: null,
         agentDir,
+        resumeConversationId: backend === "agy" ? previous.conversationId : null,
         turnIndex: (previous.turnIndex ?? 1) + 1,
         turns,
         firstEventAt: null,
@@ -1098,6 +1344,7 @@ function continueRun(options, promptArgs) {
         lastToolAt: null,
         lastEventType: null,
         assistantCalls: 0,
+        progressWrites: 0,
         reportedReasoningTokens: null,
         activeTools: [],
         exitCode: null,
@@ -1107,25 +1354,30 @@ function continueRun(options, promptArgs) {
         reasonCode: null,
         timeoutType: null,
         finalText: "",
+        structuredOutput: null,
+        backendStatus: null,
+        backendTurns: null,
         usage: null,
         tools: [],
         attention: null,
+        attentions: [],
         live: options.has("live"),
         idleTimeoutSeconds,
+        startupAttentionSeconds,
         failureLogPath: null,
         dispatchedAt: new Date().toISOString(),
         finishedAt: null,
       });
       try { unlinkSync(join(directory, "attention.json")); } catch {}
       try { unlinkSync(join(directory, "failure.log")); } catch {}
-      const pid = startSupervisor(root, runId, ["--session-dir", previous.sessionDir, ...effectiveArgs]);
+      const pid = startSupervisor(root, runId, backend === "pi" ? ["--session-dir", previous.sessionDir, ...effectiveArgs] : effectiveArgs);
       atomicJson(resultPath, { ...readJson(resultPath), supervisorPid: pid });
       return pid;
     });
   } catch (error) {
     fail(error.message, 3);
   }
-  console.log(JSON.stringify({ runId, state: "running", mode: previous.mode, live: options.has("live"), turnIndex: (previous.turnIndex ?? 1) + 1, supervisorPid, workdir: previous.workdir, sessionDir: previous.sessionDir, directory }));
+  console.log(JSON.stringify({ runId, state: "running", backend, mode: previous.mode, live: options.has("live"), turnIndex: (previous.turnIndex ?? 1) + 1, supervisorPid, workdir: previous.workdir, sessionDir: previous.sessionDir, directory }));
 }
 
 async function steerRun(options, messageArgs) {
@@ -1183,6 +1435,46 @@ function currentResults(root, ids) {
 
 function terminal(result) {
   return result && ["success", "failed", "cancelled"].includes(result.state);
+}
+
+function resultReceipt(root, result) {
+  const finalText = String(result.finalText ?? "");
+  return {
+    schema: result.schema,
+    runId: result.runId,
+    state: result.state,
+    backend: result.backend ?? "pi",
+    mode: result.mode,
+    provider: result.provider,
+    model: result.model,
+    thinking: result.thinking,
+    observedProvider: result.observedProvider,
+    observedModel: result.observedModel,
+    conversationId: result.conversationId ?? null,
+    backendStatus: result.backendStatus ?? null,
+    backendTurns: result.backendTurns ?? null,
+    backendDeniedActionCount: result.backendDeniedActionCount ?? 0,
+    elapsedSeconds: result.elapsedSeconds,
+    assistantCalls: result.assistantCalls,
+    usage: result.usage,
+    reportedReasoningTokens: result.reportedReasoningTokens,
+    tools: (result.tools ?? []).map(({ name, count, errorCount }) => ({ name, count, errorCount })),
+    reason: result.reason,
+    reasonCode: result.reasonCode,
+    attention: result.attention,
+    attentions: result.attentions ?? (result.attention ? [result.attention] : []),
+    startupAttentionSeconds: result.startupAttentionSeconds,
+    progressWrites: result.progressWrites,
+    finalText: finalText.slice(0, 2048),
+    finalTextTruncated: finalText.length > 2048,
+    patchBytes: result.patchBytes,
+    reviewPending: result.reviewPending,
+    cleanupRequired: result.cleanupRequired,
+    resultPath: join(runDirectory(root, result.runId), "result.json"),
+    patchPath: result.patchPath,
+    failureLogPath: result.failureLogPath,
+    finishedAt: result.finishedAt,
+  };
 }
 
 function reconcileVanished(root, ids) {
@@ -1287,9 +1579,14 @@ async function cancelRun(options) {
 
 function pendingAttention(root, ids) {
   return ids.flatMap((runId) => {
-    const path = join(runDirectory(root, runId), "attention.json");
-    const attention = readJson(path);
-    return attention && !attention.delivered ? [{ runId, path, attention }] : [];
+    const directory = runDirectory(root, runId);
+    const path = join(directory, "attention.json");
+    return attentionEvents(readJson(path)).flatMap((attention) => {
+      const receipt = attentionReceipt(directory, attention);
+      return !attention.delivered && !existsSync(receipt)
+        ? [{ runId, receipt, attention }]
+        : [];
+    });
   });
 }
 
@@ -1310,7 +1607,7 @@ async function waitForResults(options) {
       const timeout = timeoutSeconds > 0 ? setTimeout(() => finish(new Error("wait timed out")), timeoutSeconds * 1000) : null;
       process.on("SIGUSR1", check);
       const waiterPaths = ids.map((id) => {
-        const directory = join(runDirectory(root, id), "waiters");
+        const directory = eventDirectory(runDirectory(root, id));
         mkdirSync(directory, { recursive: true, mode: 0o700 });
         const path = join(directory, `${process.pid}.json`);
         atomicJson(path, { pid: process.pid, registeredAt: new Date().toISOString() });
@@ -1322,6 +1619,7 @@ async function waitForResults(options) {
         clearInterval(fallback);
         if (timeout) clearTimeout(timeout);
         for (const path of waiterPaths) try { unlinkSync(path); } catch {}
+        for (const directory of new Set(waiterPaths.map(dirname))) try { rmdirSync(directory); } catch {}
         error ? rejectWait(error) : resolveWait();
       }
       function check() {
@@ -1334,11 +1632,15 @@ async function waitForResults(options) {
   }
   reconcileVanished(root, ids);
   const snapshot = currentResults(root, ids);
-  const results = snapshot.filter((item) => terminal(item.result)).map((item) => item.result);
+  const full = one(options, "full") === "true";
+  const results = snapshot.filter((item) => terminal(item.result)).map((item) => full ? item.result : resultReceipt(root, item.result));
   const pending = snapshot.filter((item) => !terminal(item.result)).map((item) => item.runId);
   const failures = snapshot.filter((item) => ["failed", "cancelled"].includes(item.result?.state));
   const alerts = pendingAttention(root, ids);
-  for (const alert of alerts) atomicJson(alert.path, { ...alert.attention, delivered: true, deliveredAt: new Date().toISOString() });
+  for (const alert of alerts) {
+    mkdirSync(dirname(alert.receipt), { recursive: true, mode: 0o700 });
+    atomicJson(alert.receipt, { deliveredAt: new Date().toISOString() });
+  }
   if (failures.length > 0) {
     console.log(JSON.stringify({
       state: "failed",
@@ -1388,6 +1690,7 @@ function cleanup(options) {
           throw new Error(`worktree cleanup failed for ${runId}: ${removal.errors.join("; ")}`);
         }
         rmSync(directory, { recursive: true, force: true });
+        rmSync(eventDirectory(directory), { recursive: true, force: true });
         return removal;
       });
     } catch (error) {
@@ -1405,7 +1708,12 @@ function status(options) {
   const ids = runIds(options);
   if (ids.length === 0) fail("status requires at least one --run-id");
   reconcileVanished(root, ids);
-  console.log(JSON.stringify({ runs: currentResults(root, ids).map((item) => ({ ...item, result: statusView(item.result) })) }));
+  console.log(JSON.stringify({ runs: currentResults(root, ids).map((item) => ({
+    runId: item.runId,
+    exists: Boolean(item.result),
+    state: item.result?.state ?? "missing",
+    result: statusView(item.result),
+  })) }));
 }
 
 const [command, ...argv] = process.argv.slice(2);
@@ -1424,6 +1732,10 @@ else if (command === "cleanup") cleanup(options);
 else if (command === "status") status(options);
 else if (command === "cache-status") console.log(JSON.stringify(cacheReport()));
 else if (command === "profiles") console.log(JSON.stringify({
+  backends: {
+    pi: { capabilities: ["docs", "lens", "context", "browser"], live: true },
+    agy: { efforts: AGY_PROFILES.efforts, defaultEffort: AGY_PROFILES.defaultEffort, live: false },
+  },
   models: [...PROFILES].map(([id, profile]) => ({ id, ...profile })),
   capabilities: ["docs", "lens", "context", "browser"],
 }));
