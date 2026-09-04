@@ -2,11 +2,11 @@
 
 ## 角色边界
 
-Codex 是调度者和最终责任方：编写任务、选择模式、等待事件、审查 patch、运行独立验证并决定接受或拒绝。Pi 或 Agy 是最内层执行器：在给定 cwd、模型和可选 timeout 内完成一轮任务。
+Codex 是调度者和最终责任方：编写任务、选择模式、等待事件、审查 patch、运行独立验证并决定接受或拒绝。Pi、Agy 或 Claude Code 是最内层执行器：在给定 cwd、模型和可选 timeout 内完成一轮任务。
 
-本项目不修改 Codex 主模型，也不使用 Codex Multi-Agent V2 的 `agent_message` 协议。任务以普通 prompt 进入 Pi 或 Agy CLI，因此第三方 Responses provider 是否支持 Codex 专用输入类型，与本 Worker 是两个独立问题。
+本项目不修改 Codex 主模型，也不使用 Codex Multi-Agent V2 的 `agent_message` 协议。任务以普通 prompt 进入所选 CLI，因此第三方 Responses provider 是否支持 Codex 专用输入类型，与本 Worker 是两个独立问题。
 
-macOS 的执行器边界保持很小：Pi 适配器负责 profile、capability、session 和 JSON/RPC；Agy 适配器负责 CLI 参数、stream-json、`conversation_id` 和 usage。worktree、状态、事件等待、取消、patch 与清理全部共享，新增执行器不得复制这些生命周期能力。
+macOS 的执行器边界保持很小：Pi 适配器负责 profile、capability、session 和 JSON/RPC；Agy 适配器负责 CLI 参数与 stream-json；Claude 适配器负责 Claude stream-json、session 和 CommandCode 本机 Messages 桥。worktree、状态、事件等待、取消、patch 与清理全部共享，新增执行器不得复制这些生命周期能力。
 
 ## 组件
 

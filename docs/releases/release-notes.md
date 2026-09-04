@@ -1,5 +1,13 @@
 # 发布记录
 
+## v0.2.2 - 2026-09-04
+
+- macOS runtime 新增 `--backend claude`，直接消费 Claude Code stream-json，保存真实 session ID、tool/usage/terminal 状态并支持同 run `continue`。
+- Claude 支持当前用户 native 配置，以及 CommandCode `deepseek/deepseek-v4-flash` Max；后者让 Claude 保持 Anthropic Messages 输入，再由仅监听本机回环的无依赖桥转换到 CommandCode Chat Completions。
+- CommandCode Key 只从 Pi `auth.json` 在 launcher 内存读取，不进入 prompt、result、日志或全局 Claude 设置；本次命令级 `--settings` 避免 `~/.claude/settings.json` 覆盖路由。
+- read/write 默认分别使用 Claude `plan`/`auto`。权限拒绝立即发 attention；默认禁止内部 Agent/Task/Workflow 编排，显式 `--allow-orchestration` 才开放。
+- 修复 Claude 可能返回 `subtype=success` 但 `is_error=true` 时被误报成功的问题；错误文本、部分输出、缓存 usage 和工具统计保留用于审核。
+
 ## v0.2.1 - 2026-09-04
 
 - macOS attention 改为最多 8 条不同事件的有界队列；每条独立确认，后续不同故障不再被首条遮住，终态通知也不会删除已投递回执并重复告警。

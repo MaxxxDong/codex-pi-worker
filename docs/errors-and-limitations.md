@@ -69,6 +69,14 @@ Agy Headless 无法弹出交互授权框。模型请求了未在 Agy 配置中�
 
 这是 Agy/backend 在已有部分输出后仍返回的错误终态。macOS v0.2.1 将其归为 transport attention，并保留部分文本、usage 和工具摘要供审核，但仍保持失败；应从同一 conversation 续跑或在确认服务恢复后重试，不能仅因文本看起来正确就接受为成功。
 
+### 2.1.4 Claude CommandCode 请求仍进入原有 Claude endpoint
+
+`~/.claude/settings.json` 的 `env` 会覆盖普通子进程环境变量。macOS v0.2.2 使用本次命令级 `--settings` 指向临时回环桥；若自行删除该参数，Claude 可能继续调用原有 endpoint。不要为修复这一问题改写全局 Claude 配置。
+
+### 2.1.5 Claude 权限拒绝或内部编排循环
+
+Headless Claude 无法等待交互授权。Worker 对 read/write 分别使用 `plan`/`auto`，权限拒绝会立即产生 `permission_denied` attention。默认还禁止 Agent、Task、Workflow 等二次编排工具；只有任务确实需要、且调用方能接受额外进程与生命周期时才传 `--allow-orchestration`。
+
 ### 2.2 `output directory already contains a run`
 
 `--output-dir` 是一次运行的不可复用证据目录。发现既有 receipt 或 result 时，runtime 会拒绝覆盖，以免把两次运行的信任链和日志混在一起。

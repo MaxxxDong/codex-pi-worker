@@ -765,6 +765,162 @@ test("Agy backend rejects unsupported Pi-only features and effort levels", () =>
   }
 });
 
+test("Claude backend maps stream events, tools, usage, and owned CLI arguments", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-claude-stream-"));
+  const marker = join(temporary, "claude-args.json");
+  const fake = fakeLauncher(temporary, `
+import {writeFileSync} from "node:fs";
+writeFileSync(process.env.CLAUDE_TEST_ARGS, JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({type:"system",subtype:"init",session_id:"claude-session-1"}));
+console.log(JSON.stringify({type:"assistant",session_id:"claude-session-1",message:{model:"deepseek/deepseek-v4-flash",stop_reason:"tool_use",content:[{type:"tool_use",id:"tool-1",name:"Read",input:{file_path:"README.md"}}],usage:{input_tokens:10,output_tokens:3}}}));
+console.log(JSON.stringify({type:"user",session_id:"claude-session-1",message:{content:[{type:"tool_result",tool_use_id:"tool-1",content:"ok"}]}}));
+console.log(JSON.stringify({type:"assistant",session_id:"claude-session-1",message:{model:"deepseek/deepseek-v4-flash",stop_reason:"end_turn",content:[{type:"text",text:"CLAUDE_DONE"}],usage:{input_tokens:12,output_tokens:4}}}));
+console.log(JSON.stringify({type:"result",subtype:"success",is_error:false,session_id:"claude-session-1",result:"CLAUDE_DONE",num_turns:2,duration_ms:1200,duration_api_ms:900,total_cost_usd:0.01,usage:{input_tokens:22,output_tokens:7,cache_read_input_tokens:5,output_tokens_details:{thinking_tokens:2}}}));`);
+  const env = testEnv(temporary, "/missing-pi");
+  env.CLAUDE_WORKER_LAUNCHER = fake;
+  env.CLAUDE_TEST_ARGS = marker;
+  try {
+    const receipt = command(["dispatch", "--backend", "claude", "--run-id", "claude-stream", "--mode", "read", "--workdir", temporary, "--", "--provider", "commandcode", "--model", "deepseek/deepseek-v4-flash", "--allow-orchestration", "task"], env).json;
+    const result = command(["wait", "--full", "--run-id", "claude-stream", "--timeout", "10"], env).json.results[0];
+    const args = JSON.parse(readFileSync(marker, "utf8"));
+    assert.equal(receipt.backend, "claude");
+    assert.equal(receipt.sessionDir, null);
+    assert.equal(result.state, "success");
+    assert.equal(result.backend, "claude");
+    assert.equal(result.provider, "commandcode");
+    assert.equal(result.model, "deepseek/deepseek-v4-flash");
+    assert.equal(result.observedProvider, "claude");
+    assert.equal(result.observedModel, "deepseek/deepseek-v4-flash");
+    assert.equal(result.thinking, "max");
+    assert.equal(result.finalText, "CLAUDE_DONE");
+    assert.equal(result.conversationId, "claude-session-1");
+    assert.equal(result.backendStatus, "SUCCESS");
+    assert.equal(result.backendTurns, 2);
+    assert.equal(result.assistantCalls, 2);
+    assert.equal(result.usage.cache_read_input_tokens, 5);
+    assert.equal(result.usage.total_cost_usd, 0.01);
+    assert.equal(result.usage.duration_ms, 1200);
+    assert.deepEqual(result.tools, [{ name: "Read", count: 1, errorCount: 0 }]);
+    assert.equal(args[args.indexOf("--permission-mode") + 1], "plan");
+    assert.equal(args.includes("--disallowedTools"), false);
+    assert.equal(args[args.indexOf("--effort") + 1], "max");
+    assert.equal(args[args.indexOf("--output-format") + 1], "stream-json");
+    assert.equal(args.includes("--provider"), false);
+    assert.equal(args.includes("--bare"), false);
+    assert.equal(args.includes("--safe-mode"), false);
+    assert.deepEqual(args.slice(-2), ["-p", "task"]);
+    command(["cleanup", "--reviewed", "yes", "--run-id", "claude-stream"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Claude backend preserves partial output and classifies an error terminal", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-claude-error-"));
+  const fake = fakeLauncher(temporary, `
+console.log(JSON.stringify({type:"system",subtype:"init",session_id:"claude-error"}));
+console.log(JSON.stringify({type:"assistant",session_id:"claude-error",message:{model:"deepseek/deepseek-v4-flash",content:[{type:"text",text:"PARTIAL"}]}}));
+console.log(JSON.stringify({type:"result",subtype:"error_during_execution",is_error:true,session_id:"claude-error",result:"PARTIAL",errors:["HTTP 503 service unavailable"],num_turns:1,usage:{input_tokens:2,output_tokens:1}}));`);
+  const env = testEnv(temporary, "/missing-pi");
+  env.CLAUDE_WORKER_LAUNCHER = fake;
+  try {
+    command(["dispatch", "--backend", "claude", "--run-id", "claude-error", "--workdir", temporary, "--", "--provider", "commandcode", "task"], env);
+    const first = command(["wait", "--full", "--run-id", "claude-error", "--timeout", "10"], env, true);
+    const waited = first.status === 3 ? first : command(["wait", "--full", "--run-id", "claude-error", "--timeout", "10"], env, true);
+    assert.equal(waited.status, 3);
+    const result = waited.json.results[0];
+    assert.equal(result.state, "failed");
+    assert.equal(result.reason, "HTTP 503 service unavailable");
+    assert.equal(result.finalText, "PARTIAL");
+    assert.equal(result.attention.category, "provider_5xx");
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Claude permission denial wakes wait immediately", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-claude-permission-"));
+  const fake = fakeLauncher(temporary, `
+console.log(JSON.stringify({type:"system",subtype:"init",session_id:"claude-permission"}));
+console.log(JSON.stringify({type:"system",subtype:"permission_denied",session_id:"claude-permission",tool_name:"Bash"}));
+await new Promise((resolve) => setTimeout(resolve, 500));
+console.log(JSON.stringify({type:"result",subtype:"success",is_error:false,session_id:"claude-permission",result:"RECOVERED",num_turns:1,usage:{input_tokens:1,output_tokens:1}}));`);
+  const env = testEnv(temporary, "/missing-pi");
+  env.CLAUDE_WORKER_LAUNCHER = fake;
+  try {
+    command(["dispatch", "--backend", "claude", "--run-id", "claude-permission", "--workdir", temporary, "--", "task"], env);
+    const alert = command(["wait", "--full", "--run-id", "claude-permission", "--timeout", "10"], env, true);
+    assert.equal(alert.status, 4);
+    assert.equal(alert.json.alerts[0].category, "permission_denied");
+    assert.match(alert.json.alerts[0].detail, /Bash/);
+    const final = command(["wait", "--full", "--run-id", "claude-permission", "--timeout", "10"], env);
+    assert.equal(final.json.results[0].state, "success");
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Claude backend continues the exact session in the same managed worktree", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-claude-continue-"));
+  const source = join(temporary, "source");
+  mkdirSync(source);
+  execFileSync("git", ["-C", source, "init", "-q"]);
+  execFileSync("git", ["-C", source, "config", "user.email", "pi-worker@test.invalid"]);
+  execFileSync("git", ["-C", source, "config", "user.name", "Pi Worker Test"]);
+  writeFileSync(join(source, "base.txt"), "base\n");
+  execFileSync("git", ["-C", source, "add", "."]);
+  execFileSync("git", ["-C", source, "commit", "-qm", "base"]);
+  const fake = fakeLauncher(temporary, `
+import {writeFileSync} from "node:fs";
+const args=process.argv.slice(2);
+const resumed=args.includes("--resume") ? args[args.indexOf("--resume")+1] : null;
+writeFileSync(resumed ? "continued-args.json" : "first-args.json", JSON.stringify(args));
+writeFileSync(resumed ? "continued.txt" : "first.txt", resumed ?? "first");
+console.log(JSON.stringify({type:"system",subtype:"init",session_id:resumed ? "claude-second" : "claude-first"}));
+console.log(JSON.stringify({type:"result",subtype:"success",is_error:false,session_id:resumed ? "claude-second" : "claude-first",result:resumed ? "SECOND" : "FIRST",num_turns:1,usage:{input_tokens:1,output_tokens:1}}));`);
+  const env = testEnv(temporary, "/missing-pi");
+  env.CLAUDE_WORKER_LAUNCHER = fake;
+  try {
+    const receipt = command(["dispatch", "--backend", "claude", "--run-id", "claude-continue", "--mode", "write", "--source", source, "--", "--provider", "commandcode", "first"], env).json;
+    const first = command(["wait", "--full", "--run-id", "claude-continue", "--timeout", "10"], env).json.results[0];
+    assert.equal(first.conversationId, "claude-first");
+    const firstArgs = JSON.parse(readFileSync(join(receipt.workdir, "first-args.json"), "utf8"));
+    assert.equal(firstArgs[firstArgs.indexOf("--permission-mode") + 1], "auto");
+    assert.match(firstArgs[firstArgs.indexOf("--disallowedTools") + 1], /Agent/);
+    command(["continue", "--run-id", "claude-continue", "--", "second"], env);
+    const second = command(["wait", "--full", "--run-id", "claude-continue", "--timeout", "10"], env).json.results[0];
+    assert.equal(second.finalText, "SECOND");
+    assert.equal(second.conversationId, "claude-second");
+    assert.equal(second.turns[0].conversationId, "claude-first");
+    assert.equal(readFileSync(join(receipt.workdir, "continued.txt"), "utf8"), "claude-first");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "claude-continue"], env);
+    assert.ok(!existsSync(receipt.workdir));
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Claude backend rejects unsupported Pi-only features and invalid options", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-claude-options-"));
+  const env = testEnv(temporary, "/missing");
+  try {
+    const capability = command(["dispatch", "--backend", "claude", "--run-id", "claude-capability", "--workdir", temporary, "--capability", "docs", "--", "task"], env, true);
+    assert.equal(capability.status, 2);
+    assert.match(capability.stderr, /does not support Pi capabilities/);
+    const live = command(["dispatch", "--backend", "claude", "--run-id", "claude-live", "--workdir", temporary, "--live", "--", "task"], env, true);
+    assert.equal(live.status, 2);
+    assert.match(live.stderr, /does not support --live/);
+    const provider = command(["dispatch", "--backend", "claude", "--run-id", "claude-provider", "--workdir", temporary, "--", "--provider", "unknown", "task"], env, true);
+    assert.equal(provider.status, 2);
+    assert.match(provider.stderr, /provider must be commandcode or native/);
+    const effort = command(["dispatch", "--backend", "claude", "--run-id", "claude-effort", "--workdir", temporary, "--", "--effort", "minimal", "task"], env, true);
+    assert.equal(effort.status, 2);
+    assert.match(effort.stderr, /effort must be one of/);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
 test("continuation preserves the prior failure diagnosis", () => {
   const temporary = mkdtempSync(join(tmpdir(), "pi-worker-session-failure-"));
   const fake = fakeLauncher(temporary, `
@@ -1095,6 +1251,7 @@ test("the public wrapper executes its adjacent staged runtime", () => {
     const profileOutput = JSON.parse(profiles.stdout);
     const configured = profileOutput.models;
     assert.deepEqual(profileOutput.backends.agy, { efforts: ["low", "medium", "high"], defaultEffort: "high", live: false });
+    assert.deepEqual(profileOutput.backends.claude, { efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "max", live: false });
     assert.ok(configured.some((profile) => profile.id === "deepseek/deepseek-v4-flash"));
     assert.ok(configured.some((profile) => profile.id === "ahzm/glm-5.3" && profile.defaultThinking === "max"));
     assert.ok(configured.some((profile) => profile.id === "commandcode/Qwen/Qwen3.8-Flash" && profile.defaultThinking === "max"));

@@ -1,6 +1,6 @@
 ---
 name: pi-worker
-description: Delegate implementation, repair, review, test, repository search, or web research through Pi or Agy while Codex reviews the result.
+description: Delegate implementation, repair, review, test, repository search, or web research through Pi, Agy, or Claude Code while Codex reviews the result.
 ---
 
 # Pi Worker
@@ -20,18 +20,19 @@ Use `/Users/max/.codex/skills/pi-worker/bin/pi-worker` as the only entry. Run `p
 - `result.json.state` follows one lifecycle only: `starting -> running -> stopping -> finalizing -> success|failed|cancelled`. `activity` is independent and may be `waiting_event`, `waiting_model`, or `running_tools`; `waiting_model` only means that no tool is active while Pi awaits the model, not that the Worker is reading files or making useful progress. `activitySeconds`, `firstToolAt`, `lastToolAt`, `lastEventType`, and `activeTools` make that distinction observable without retaining prompts or tool arguments.
 - Worker completion freezes persistent `result.json`, optional `changes.patch`, and failure-only `failure.log`. `wait` returns a compact receipt by default; use `--full` only when the complete terminal object is required. Raw streaming JSONL is not retained.
 - Completion and later dispatches never delete a result-bearing run automatically. Codex reviews the result and patch first, then runs `cleanup --reviewed yes` to delete the run, session, and managed worktree.
-- Pi runs get a managed session inside the run directory. Agy runs persist the exact returned `conversationId` and resume it with `--conversation`; both backends reuse the same worktree. Review-gated cleanup deletes Worker-owned state, while Agy remains responsible for its own account-level conversation store.
-- While Pi is running, it uses a small writable profile copied from the current host configuration and keeps installed packages shared. Agy uses its native login, model catalog, plugins, MCP and Skills directly without copying them into a second profile.
+- Pi runs get a managed session inside the run directory. Agy and Claude runs persist the exact returned `conversationId`; continuation resumes it through the backend's native flag. All backends reuse the same worktree. Review-gated cleanup deletes Worker-owned state, while each CLI remains responsible for its account-level conversation store.
+- While Pi is running, it uses a small writable profile copied from the current host configuration and keeps installed packages shared. Agy and Claude use their native plugins, MCP and Skills directly without copying them into a second profile.
 - All Workers reuse the same host npm, pnpm, uv, pip, and Poetry caches. Review cleanup performs GC only when no peer Worker is active: files unused for 90 days are removed first, then the oldest rebuildable files until the combined cache is at most 20 GiB. It never uses whole-cache purge commands.
-- Pi Workers load configured Pi Skills plus the coding runtime. Context7, Lens, Context Mode, and Playwright load only through `--capability docs`, `lens`, `context`, or `browser`. These Pi-only capability flags are rejected for Agy instead of being silently ignored.
+- Pi Workers load configured Pi Skills plus the coding runtime. Context7, Lens, Context Mode, and Playwright load only through `--capability docs`, `lens`, `context`, or `browser`. These Pi-only capability flags are rejected for Agy and Claude instead of being silently ignored.
 - A provider selected explicitly by `--provider NAME` loads a matching user-level `~/.pi/agent/extensions/NAME.ts|js|mjs` when present. Other global and project extensions remain outside the default path.
 - Headless Workers pass Pi's native `--offline` switch so startup skips version, package, telemetry, and remote catalog checks; configured model requests still use the network normally.
-- Success requires process exit `0` and the backend's native terminal event: Pi `agent_settled` or Agy `result.status=SUCCESS`. An Agy `ERROR` carrying partial text remains a failure, with the text preserved for diagnosis. Hard and no-event idle timeouts are disabled by default; use `--hard-timeout` or `--idle-timeout` only when a task needs an explicit limit.
+- Success requires process exit `0` and the backend's native terminal event: Pi `agent_settled`, Agy `result.status=SUCCESS`, or Claude `result` with `subtype=success` and `is_error=false`. Error terminals carrying partial text remain failures, with the text preserved for diagnosis. Hard and no-event idle timeouts are disabled by default; use `--hard-timeout` or `--idle-timeout` only when a task needs an explicit limit.
 - `wait --timeout` limits only that waiting command. It never cancels a Worker. Use `cancel` to ask the supervisor to stop its child, finalize evidence, and return `cancelled`; never kill the supervisor directly.
 - Normal dispatch and continuation use JSON headless mode. Add `--live` only when an active turn must accept `steer`; long ordinary tasks avoid RPC serialization overhead. Provider, transport, permission denial, ignored-reasoning, repeated tool, extension, compaction, prompt, or RPC shutdown errors wake `wait` immediately with state `attention`. Distinct attention events are delivered once and in order, with at most eight retained per turn.
 - If a backend produces no stdout or stderr event for 60 seconds after launch, `startup_silent` wakes `wait` without stopping the Worker. Override with `--startup-attention SECONDS`; zero disables only this soft notification. It is not a task timeout.
 - `--backend pi` is the compatibility default. `--backend agy` calls Agy directly with `stream-json`, a 24-hour internal print wait, and `plan` for read tasks or `accept-edits` for write tasks. It does not nest `agy-staff` jobs, does not impose a five-minute task limit, and does not default to `--dangerously-skip-permissions`; a trusted one-off caller may pass that Agy flag explicitly after `--`.
 - Agy accepts `--effort low|medium|high` or the common `--thinking` alias; an effort suffix in the model ID supplies the default, otherwise High is used. Agy currently has no Max effort. `--live`/`steer` remain Pi-only; use `continue` for an Agy follow-up.
+- `--backend claude` calls Claude Code directly. `--provider commandcode` is the default and uses Pi's existing CommandCode credential with `deepseek/deepseek-v4-flash` Max through an ephemeral loopback Messages bridge; `--provider native` uses the current Claude login. Neither path changes global Claude settings. Read/write use `plan`/`auto`; internal Agent/Task/Workflow orchestration is disabled unless `--allow-orchestration` is explicit. Claude supports `continue`, but not Pi capability flags, `--live`, or `steer`.
 - `result.json.usage` aggregates every assistant model call in the run, including nested cost fields, cache reads, and reported reasoning tokens. `reportedReasoningTokens` is provider-reported evidence, while `thinking` remains the requested level.
 
 ## Commands
@@ -54,6 +55,11 @@ $PI_WORKER dispatch --run-id fix-1 --mode write --source /absolute/repo -- \
 # Run the same lifecycle through Agy; no Pi provider/profile is involved.
 $PI_WORKER dispatch --backend agy --run-id agy-fix --mode write --source /absolute/repo -- \
   --model gemini-3.8-flash-high --effort high \
+  "Implement the bounded fix and run focused tests."
+
+# Run Claude Code with Claude Messages and Pi's existing CommandCode credential.
+$PI_WORKER dispatch --backend claude --run-id claude-fix --mode write --source /absolute/repo -- \
+  --provider commandcode --model deepseek/deepseek-v4-flash --effort max \
   "Implement the bounded fix and run focused tests."
 
 # Add optional extension/MCP + Skill capabilities before `--`; other configured Pi Skills load automatically.

@@ -1,6 +1,6 @@
 # Codex Pi Worker
 
-面向 Windows 与 macOS Codex 的后台子代理编排器。Codex 负责拆任务、审核和最终验收；macOS 可在同一生命周期下选择 Pi 或 Agy 完成分析、实现、修复、代码搜索或联网研究。
+面向 Windows 与 macOS Codex 的后台子代理编排器。Codex 负责拆任务、审核和最终验收；macOS 可在同一生命周期下选择 Pi、Agy 或 Claude Code 完成分析、实现、修复、代码搜索或联网研究。
 
 它不是 Codex 原生 `spawn_agent` 的替代实现，也不会更换 Codex 主模型。它是一套独立的 Skill + lifecycle runtime；执行器只是可替换的最内层适配器，worktree、事件通知、续跑、并行、审核后清理和结果合同只维护一份。
 
@@ -18,12 +18,12 @@
 | 失败早通知 | provider/runtime 错误、连续工具失败和重试失败会立即发可重复 `attention` |
 | Windows 兼容 | UTF-8/CP936 安全 JSON、`CREATE_NO_WINDOW`、进程树终止、长路径清理 |
 | macOS 原生链路 | JSON headless、POSIX 事件唤醒、轻量 worktree、审核后清理和共享缓存 LRU |
-| 多执行器 | macOS 默认 `--backend pi`，也可直接使用 `--backend agy`；不嵌套 Agy 的另一套 job/wait/state |
+| 多执行器 | macOS 默认 `--backend pi`，也可直接使用 `--backend agy|claude`；三个执行器共享一套 job/wait/state |
 | 证据控制 | JSON result、紧凑事件、stderr、binary patch 与日志容量上限 |
 
 ## 快速开始
 
-Windows 要求 Python 3.12+、Node.js 22.19+、Git 和 Pi CLI 0.83+。macOS 使用 Node.js、Git 和 Pi CLI 0.83+，Agy 后端另需 Agy CLI 1.1.8+ 及有效登录。完整安装和私有 provider 配置见 [Windows 安装指南](docs/installation.md)、[macOS 安装指南](docs/macos.md) 与 [配置指南](docs/configuration.md)。
+Windows 要求 Python 3.12+、Node.js 22.19+、Git 和 Pi CLI 0.83+。macOS 使用 Node.js、Git 和 Pi CLI 0.83+；Agy 后端另需 Agy CLI 1.1.8+，Claude 后端另需 Claude Code 2.1.252+。完整安装和私有 provider 配置见 [Windows 安装指南](docs/installation.md)、[macOS 安装指南](docs/macos.md) 与 [配置指南](docs/configuration.md)。
 
 ```powershell
 npm install -g @earendil-works/pi-coding-agent@0.83.0
@@ -86,6 +86,9 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker profiles
 
 ### 2026-09-04
 
+- macOS v0.2.2 增加直接 Claude Code 后端：支持 native Claude 与 CommandCode DeepSeek Flash、Claude 原生 stream-json/tool/session、同 run `continue`、attention 和统一清理。
+- CommandCode 模式从 Pi 的 `auth.json` 只在内存读取现有凭据；Claude Messages 通过临时本机回环桥转换到 CommandCode Chat Completions，不改全局 Claude 设置，不保存 prompt 或 Key。
+- Claude read/write 默认分别使用 `plan`/`auto`；默认禁用 Claude 内部二次编排以避免权限循环，确有需要可显式传 `--allow-orchestration`。
 - macOS v0.2.1 修复多次 attention 的漏报与重复投递，增加不杀任务的启动静默提醒、流式状态写入节流、终态后台进程组清理，以及 Node/Pi 可执行文件的固定路径与 `PATH` 回退。
 - macOS v0.2.0 增加直接 Agy 后端：共享现有 worktree、事件等待、取消、补丁、清理和结果合同；使用 Agy 原生 `stream-json`、`conversation_id` 续跑和 usage，不复制 `agy-staff` 的第二套生命周期。
 - Agy 错误终态即使包含部分回答也不会伪装成成功；未知模型、认证、限流、5xx、传输与裸 `EOF` 会进入现有失败/attention 路径。

@@ -10,6 +10,7 @@ macOS 实现位于仓库的 `macos/`，使用 Node.js 运行，不依赖 Windows
 - Pi CLI 0.83+；当前验证版本为 0.84.1
 - 已配置的 `~/.pi/agent/auth.json`、`models.json` 与 `settings.json`
 - 可选 Agy CLI 1.1.8+；仅使用 `--backend agy` 时需要有效 Agy 登录
+- 可选 Claude Code 2.1.252+；仅使用 `--backend claude` 时需要。CommandCode 模式复用 Pi 中已有的 `commandcode` 凭据
 
 ## 安装
 
@@ -44,6 +45,17 @@ $HOME/.codex/skills/pi-worker/bin/pi-worker dispatch \
 ```
 
 Agy 使用原生 `stream-json`，终态 `conversation_id` 用于 `continue`。默认内部 print wait 为 24 小时，只避免 Agy 自带的五分钟截断；Worker 自身仍只在调用方显式设置 `--hard-timeout` 时限制寿命。`--capability`、`--live` 和 `steer` 当前只属于 Pi。
+
+Claude Code 可复用同一生命周期，默认让 Claude Messages 经本机临时桥调用 CommandCode DeepSeek Flash：
+
+```bash
+$HOME/.codex/skills/pi-worker/bin/pi-worker dispatch \
+  --backend claude --run-id claude-fix --mode write --source /absolute/repo -- \
+  --provider commandcode --model deepseek/deepseek-v4-flash --effort max \
+  "Implement the bounded fix and run focused tests."
+```
+
+桥仅监听 `127.0.0.1`，只在内存读取 Pi 的 CommandCode Key，随 Claude 进程退出；不会修改 `~/.claude/settings.json`。Claude 的原生 Skill、MCP、插件和 `CLAUDE.md` 保持加载。默认禁止内部 Agent/Task/Workflow 编排，可用 `--allow-orchestration` 显式开放；`continue` 使用同一 Claude session 和 worktree。
 
 `result.json` 只有一套轻量生命周期：`starting -> running -> stopping -> finalizing -> success|failed|cancelled`。`activity` 单独表示 `waiting_event`、`waiting_model` 或 `running_tools`；它不判断 Codex 任务是否完成。`status` 会派生进程存活信息并收口所有已消失 supervisor，运行时不需要额外数据库或心跳进程。
 

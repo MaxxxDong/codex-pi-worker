@@ -82,3 +82,21 @@ pi-worker dispatch --backend agy --run-id review-1 --mode read --workdir /absolu
 - 默认不传 `--dangerously-skip-permissions`。可信单次任务如明确需要，可把该 Agy 原生参数放在 `--` 后；不要写入全局默认。
 - `--json-schema` 等非生命周期参数会直传 Agy。`--model`、effort、输出格式、conversation、print timeout 和执行 mode 由 Worker 统一管理。
 - Agy 的 account-level conversation 数据由 Agy 自身管理；`cleanup` 只删除 Worker 拥有的 result、TMP 和 worktree。
+
+## Claude Code 后端
+
+macOS 可通过 `--backend claude` 直接调用 Claude Code。默认 provider 是 `commandcode`，默认模型是 `deepseek/deepseek-v4-flash`，默认 effort 是 `max`：
+
+```bash
+pi-worker dispatch --backend claude --run-id claude-fix --mode write --source /absolute/repo -- \
+  --provider commandcode --model deepseek/deepseek-v4-flash --effort max \
+  "Implement the bounded fix and run focused tests."
+```
+
+CommandCode 的 OSS 模型不能直接使用其 Anthropic Messages endpoint。Worker 因此让 Claude Code 保持 Messages 输入，在本次进程内启动仅监听 `127.0.0.1` 的临时桥，再转换到 CommandCode Chat Completions。桥只从 Pi 的 `auth.json` 在内存读取 `commandcode` Key，不写入 result、日志、Claude 配置或仓库；Claude 退出后桥立即终止。
+
+- `--provider native` 使用当前 Claude Code 登录和全局模型配置，不启动桥。
+- read 使用 Claude `plan`，write 使用 `auto`，in-place 使用 `acceptEdits`；显式 `--dangerously-skip-permissions` 仍由调用方自行承担。
+- 默认通过 `--disallowedTools` 禁止 Claude 再派生 Agent、Task、Workflow 或定时任务，避免后台 Worker 形成不可见的第二层生命周期；确需内部编排时显式传 `--allow-orchestration`。
+- Claude 的 Skill、MCP、插件和 `CLAUDE.md` 仍按 Claude Code 原生规则加载；仅 CommandCode endpoint、模型和凭据通过本次命令级 `--settings` 覆盖，用户全局文件保持不变。
+- Claude 当前不支持 Worker 的 `--capability`、`--live` 或 `steer`；`continue` 通过 Claude session ID 续跑并复用同一 worktree。

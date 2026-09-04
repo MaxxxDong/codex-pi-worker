@@ -25,6 +25,7 @@ import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { AGY_PROFILES, agyLaunchArgs, agyLauncher, selectAgy, summarizeAgyStream } from "./agy-backend.mjs";
+import { CLAUDE_PROFILES, claudeLaunchArgs, claudeLauncher, selectClaude, summarizeClaudeStream } from "./claude-backend.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const DEFAULT_ROOT = process.platform === "darwin"
@@ -61,7 +62,7 @@ const PROFILES = new Map([
 ]);
 const ATTENTION_PATTERNS = [
   ["authentication", /(?:\b401\b|\b403\b|unauthori[sz]ed|invalid (?:api )?key|authentication failed|invalid_grant|oauth token refresh failed)/i],
-  ["request_rejected", /(?:data[_ ]inspection[_ ]failed|inappropriate content|invalid_request_error)/i],
+  ["request_rejected", /(?:\b400\b|data[_ ]inspection[_ ]failed|inappropriate content|invalid_request_error)/i],
   ["rate_limit", /(?:\b429\b|rate[ -]?limit|too many requests)/i],
   ["provider_5xx", /(?:\b50[0-4]\b|internal server error|bad gateway|service unavailable|gateway timeout)/i],
   ["permission_denied", /(?:permission.*(?:denied|cannot prompt)|auto-denied|denied\s+\d*\s*required action)/i],
@@ -97,7 +98,7 @@ function parseArgs(argv) {
 
 function usage() {
   return `pi-worker commands:
-  dispatch --run-id ID [--backend pi|agy] [--mode read|write|in-place] [--source DIR|--workdir DIR]
+  dispatch --run-id ID [--backend pi|agy|claude] [--mode read|write|in-place] [--source DIR|--workdir DIR]
            [--capability docs|lens|context|browser] [--live] [--idle-timeout SECONDS]
            [--hard-timeout SECONDS] [--startup-attention SECONDS] -- BACKEND_ARGS PROMPT
   continue --run-id ID [--live] [--idle-timeout SECONDS] [--startup-attention SECONDS] -- PROMPT
@@ -792,7 +793,9 @@ async function supervise(options, piArgs) {
   const { prompt, args: launchArgs } = extractPrompt(piArgs);
   const launcher = backend === "agy"
     ? agyLauncher()
-    : (process.env.PI_WORKER_LAUNCHER ?? resolve(dirname(SCRIPT), "../bin/pi-worker"));
+    : backend === "claude"
+      ? claudeLauncher(initial.provider)
+      : (process.env.PI_WORKER_LAUNCHER ?? resolve(dirname(SCRIPT), "../bin/pi-worker"));
   const childArgs = backend === "agy"
     ? agyLaunchArgs({
       args: launchArgs,
@@ -801,7 +804,22 @@ async function supervise(options, piArgs) {
       hardTimeoutSeconds: initial.hardTimeoutSeconds,
       conversationId: initial.resumeConversationId ?? null,
     })
-    : (live ? ["--mode", "rpc", ...launchArgs] : [...launchArgs, prompt]);
+    : backend === "claude"
+      ? claudeLaunchArgs({
+        args: launchArgs,
+        prompt,
+        mode: {
+          model: initial.model,
+          thinking: initial.thinking,
+          permissionMode: initial.mode === "read" ? "plan" : (initial.mode === "write" ? "auto" : "acceptEdits"),
+        },
+        conversationId: initial.resumeConversationId ?? null,
+        allowOrchestration: initial.backendOptions?.allowOrchestration === true,
+        systemPrompt: initial.mode === "read"
+          ? READ_ONLY_PROMPT
+          : "Treat the current working directory as the task root. Write only inside it or TMPDIR; never switch to or edit another checkout.",
+      })
+      : (live ? ["--mode", "rpc", ...launchArgs] : [...launchArgs, prompt]);
   const tmp = join(directory, "tmp");
   mkdirSync(tmp, { recursive: true, mode: 0o700 });
   atomicJson(resultPath, { ...initial, state: "starting", activity: "waiting_event", supervisorPid: process.pid, startedAt: new Date().toISOString() });
@@ -1055,7 +1073,9 @@ async function supervise(options, piArgs) {
     }
     const summaryPromise = backend === "agy"
       ? summarizeAgyStream(child.stdout, { onActivity: markActivity, onAttention: markAttention, onSettled, classifyAttention })
-      : summarizeStream(child.stdout, markActivity, markAttention, onResponse, onSettled);
+      : backend === "claude"
+        ? summarizeClaudeStream(child.stdout, { onActivity: markActivity, onAttention: markAttention, onSettled, classifyAttention })
+        : summarizeStream(child.stdout, markActivity, markAttention, onResponse, onSettled);
     const stderrPromise = collectTail(child.stderr, markActivity, markAttention);
     hardTimeout = initial.hardTimeoutSeconds > 0 ? setTimeout(() => {
       stopForTimeout("hard");
@@ -1100,7 +1120,7 @@ async function supervise(options, piArgs) {
   const reason = success ? null : (
     (cancelRequested ? cancelReason : null) ?? patchError ?? playwrightCleanupError ?? launchError
     ?? (timedOut ? `${timeoutType} timeout` : null) ?? summary.lastAssistant?.error
-    ?? (!summary.settled ? (backend === "agy" ? "missing Agy terminal result" : "missing agent_settled") : null)
+    ?? (!summary.settled ? (backend === "agy" ? "missing Agy terminal result" : backend === "claude" ? "missing Claude terminal result" : "missing agent_settled") : null)
     ?? (emptyFinal ? "empty final response" : `exit ${exitCode}`)
   );
   const reasonCode = success ? null : (
@@ -1146,7 +1166,11 @@ async function supervise(options, piArgs) {
     assistantCalls: summary.assistantCalls,
     reportedReasoningTokens: Number.isFinite(summary.usage?.reasoning)
       ? summary.usage.reasoning
-      : (Number.isFinite(summary.usage?.thinking_tokens) ? summary.usage.thinking_tokens : null),
+      : (Number.isFinite(summary.usage?.thinking_tokens)
+        ? summary.usage.thinking_tokens
+        : (Number.isFinite(summary.usage?.output_tokens_details?.thinking_tokens)
+          ? summary.usage.output_tokens_details.thinking_tokens
+          : null)),
     tools: summary.tools,
     attention,
     attentions,
@@ -1176,19 +1200,23 @@ function dispatch(options, piArgs) {
   const root = stateRoot(options);
   const runId = validateRunId(one(options, "run-id"));
   const backend = one(options, "backend", "pi");
-  if (!["pi", "agy"].includes(backend)) fail("--backend must be pi or agy");
+  if (!["pi", "agy", "claude"].includes(backend)) fail("--backend must be pi, agy, or claude");
   const mode = one(options, "mode", one(options, "source") ? "write" : "read");
   if (!["read", "write", "in-place"].includes(mode)) fail("--mode must be read, write, or in-place");
   if (piArgs.length === 0) fail("dispatch requires backend arguments after --");
   const capabilities = options.get("capability") ?? [];
-  if (backend === "agy" && capabilities.length > 0) fail("Agy backend does not support Pi capabilities");
-  if (backend === "agy" && options.has("live")) fail("Agy backend does not support --live; use continue after completion");
+  if (backend !== "pi" && capabilities.length > 0) fail(`${backend} backend does not support Pi capabilities`);
+  if (backend !== "pi" && options.has("live")) fail(`${backend} backend does not support --live; use continue after completion`);
   let selection;
   let effectiveArgs;
   try {
     if (backend === "agy") {
       const { prompt, args } = extractPrompt(piArgs);
       selection = selectAgy(args);
+      effectiveArgs = [...selection.args, prompt];
+    } else if (backend === "claude") {
+      const { prompt, args } = extractPrompt(piArgs);
+      selection = selectClaude(args);
       effectiveArgs = [...selection.args, prompt];
     } else {
       selection = applyDispatchProfile(piArgs);
@@ -1257,7 +1285,8 @@ function dispatch(options, piArgs) {
     provider: selection.provider ?? null,
     model: selection.model,
     thinking: selection.thinking,
-    backendArgs: backend === "agy" ? selection.args : null,
+    backendArgs: backend === "pi" ? null : selection.args,
+    backendOptions: backend === "claude" ? { allowOrchestration: selection.allowOrchestration } : null,
     capabilities,
     live: options.has("live"),
     hardTimeoutSeconds,
@@ -1280,15 +1309,16 @@ function continueRun(options, promptArgs) {
   const previous = readJson(resultPath);
   if (!terminal(previous)) fail(`run is not ready to continue: ${runId}`);
   const backend = previous.backend ?? "pi";
-  if (backend === "agy" && options.has("live")) fail("Agy backend does not support --live; continue as a normal headless turn");
+  if (backend !== "pi" && options.has("live")) fail(`${backend} backend does not support --live; continue as a normal headless turn`);
   if (promptArgs.length === 0) fail("continue requires a prompt after --");
   if (backend === "pi" && (!previous.sessionDir || !existsSync(previous.sessionDir))) fail(`managed session is unavailable: ${runId}`);
   if (backend === "agy" && !previous.conversationId) fail(`Agy conversation is unavailable: ${runId}`);
+  if (backend === "claude" && !previous.conversationId) fail(`Claude session is unavailable: ${runId}`);
   if (!existsSync(previous.workdir)) fail(`worker directory is unavailable: ${previous.workdir}`);
   let effectiveArgs;
-  if (backend === "agy") {
+  if (backend === "agy" || backend === "claude") {
     const { prompt, args } = extractPrompt(promptArgs);
-    if (args.length > 0) fail("Agy continue accepts only one prompt after --");
+    if (args.length > 0) fail(`${backend} continue accepts only one prompt after --`);
     effectiveArgs = [...(previous.backendArgs ?? []), prompt];
   } else {
     const selection = applyDispatchProfile([
@@ -1335,7 +1365,7 @@ function continueRun(options, promptArgs) {
         supervisorPid: null,
         childPid: null,
         agentDir,
-        resumeConversationId: backend === "agy" ? previous.conversationId : null,
+        resumeConversationId: backend === "pi" ? null : previous.conversationId,
         turnIndex: (previous.turnIndex ?? 1) + 1,
         turns,
         firstEventAt: null,
@@ -1735,6 +1765,7 @@ else if (command === "profiles") console.log(JSON.stringify({
   backends: {
     pi: { capabilities: ["docs", "lens", "context", "browser"], live: true },
     agy: { efforts: AGY_PROFILES.efforts, defaultEffort: AGY_PROFILES.defaultEffort, live: false },
+    claude: { efforts: CLAUDE_PROFILES.efforts, defaultEffort: CLAUDE_PROFILES.defaultEffort, live: false },
   },
   models: [...PROFILES].map(([id, profile]) => ({ id, ...profile })),
   capabilities: ["docs", "lens", "context", "browser"],
