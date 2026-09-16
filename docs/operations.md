@@ -1,5 +1,7 @@
 # 运行、产物、通知和清理
 
+> 说明：本文档主要面向 Windows 平台的 Python 运行时操作；macOS 平台的 Subworker (v0.3.1) 多执行器操作与命令请参考 [macOS 安装与指南](macos.md) 与 [macOS SKILL.md](../macos/SKILL.md)。
+
 ## 一轮标准流程
 
 ### 1. 写任务文件

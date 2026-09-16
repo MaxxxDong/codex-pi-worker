@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { createStdoutScan, isCorruptedJson } from "./stream-scan.mjs";
 
 const AGY_EFFORTS = ["low", "medium", "high"];
 const OWNED_FLAGS = new Set([
@@ -71,10 +72,13 @@ export function agyLauncher() {
   return existsSync(local) ? local : "agy";
 }
 
-export function agyLaunchArgs({ args, prompt, mode, hardTimeoutSeconds, conversationId = null }) {
+export function agyLaunchArgs({ args, prompt, mode, hardTimeoutSeconds, conversationId = null, workdir = null }) {
   const timeout = hardTimeoutSeconds > 0 ? `${Math.ceil(hardTimeoutSeconds)}s` : "24h";
+  const explicitAddDirs = optionValues(args, ["--add-dir"]);
+  const addDirArgs = workdir && !explicitAddDirs.includes(workdir) ? ["--add-dir", workdir] : [];
   return [
     ...args,
+    ...addDirArgs,
     "--model", mode.model,
     "--effort", mode.thinking,
     "--output-format", "stream-json",
@@ -119,75 +123,87 @@ export async function summarizeAgyStream(stream, { onActivity, onAttention, onSe
     backendDeniedActionCount: 0,
   };
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  const scan = createStdoutScan({ classifyAttention });
   for await (const line of lines) {
+    let event;
     try {
-      const event = JSON.parse(line);
-      if (event.event === "init") {
-        summary.conversationId = event.conversation_id ?? event.init?.conversation_id ?? null;
-        summary.lastAssistant = {
-          provider: "agy",
-          model: event.init?.model ?? null,
-          stopReason: null,
-          error: null,
-          usage: null,
-          text: "",
-        };
-        onActivity({ type: "backend_init" });
-        continue;
-      }
-      if (event.event === "step_update") {
-        const step = event.step_update ?? {};
-        if (step.step_type === "agent_response" && step.state === "DONE") summary.assistantCalls += 1;
-        if (isToolStep(step)) {
-          const terminal = /DONE|ERROR|FAILED/i.test(String(step.state ?? ""));
-          if (terminal) addTool(summary.tools, step);
-          onActivity({
-            type: terminal ? "tool_execution_end" : "tool_execution_start",
-            toolCallId: step.step_index ?? step.id,
-            toolName: toolName(step),
-            isError: /ERROR|FAILED/i.test(String(step.state ?? "")),
-          });
-        } else {
-          onActivity({ type: "backend_step" });
-        }
-        continue;
-      }
-      if (event.event !== "result") {
-        onActivity({ type: event.event ?? "backend_event" });
-        continue;
-      }
-      const result = event.result ?? {};
-      const status = String(result.status ?? "").toUpperCase();
-      const success = ["SUCCESS", "DONE", "COMPLETED"].includes(status);
-      const response = String(result.response ?? "");
-      const deniedActionCount = Array.isArray(result.denied_actions) ? result.denied_actions.length : 0;
-      const deniedError = success && !response.trim() && deniedActionCount > 0
-        ? `Agy denied ${deniedActionCount} required action${deniedActionCount === 1 ? "" : "s"}; grant the required permission or explicitly allow trusted tools.`
-        : null;
-      const error = deniedError ?? (success ? null : (result.error || `agy status ${status || "ERROR"}`));
-      summary.settled = true;
-      summary.backendStatus = status || null;
-      summary.backendDeniedActionCount = deniedActionCount;
-      summary.conversationId = result.conversation_id ?? summary.conversationId;
-      summary.usage = result.usage ?? {};
-      summary.backendTurns = Number.isFinite(Number(result.num_turns)) ? Number(result.num_turns) : null;
-      if (summary.assistantCalls === 0) summary.assistantCalls = summary.backendTurns ?? 0;
-      summary.structuredOutput = result.structured_output ?? null;
-      summary.lastAssistant = {
-        provider: "agy",
-        model: summary.lastAssistant?.model ?? null,
-        stopReason: error ? "error" : "stop",
-        error,
-        usage: result.usage ?? null,
-        text: response,
-      };
-      const category = classifyAttention(error);
-      if (category) onAttention(category, error);
-      onActivity({ type: "agent_settled" });
-      onSettled();
+      event = JSON.parse(line);
     } catch {
       // Malformed stdout cannot prove completion and is intentionally not retained.
+      const hit = scan.noteLine(line);
+      if (hit) onAttention(hit.category, hit.detail);
+      if (isCorruptedJson(line)) {
+        throw new Error(`Corrupted protocol JSON: malformed JSON frame; line: ${String(line ?? "").trim().slice(0, 200)}`);
+      }
+      continue;
     }
+    if (!event || typeof event !== "object" || Array.isArray(event)) {
+      throw new Error(`Corrupted protocol frame: expected non-null object, got ${event === null ? "null" : Array.isArray(event) ? "array" : typeof event}`);
+    }
+    scan.noteSuccess();
+    if (event.event === "init") {
+      summary.conversationId = event.conversation_id ?? event.init?.conversation_id ?? null;
+      summary.lastAssistant = {
+        provider: "agy",
+        model: event.init?.model ?? null,
+        stopReason: null,
+        error: null,
+        usage: null,
+        text: "",
+      };
+      onActivity({ type: "backend_init" });
+      continue;
+    }
+    if (event.event === "step_update") {
+      const step = event.step_update ?? {};
+      if (step.step_type === "agent_response" && step.state === "DONE") summary.assistantCalls += 1;
+      if (isToolStep(step)) {
+        const terminal = /DONE|ERROR|FAILED/i.test(String(step.state ?? ""));
+        if (terminal) addTool(summary.tools, step);
+        onActivity({
+          type: terminal ? "tool_execution_end" : "tool_execution_start",
+          toolCallId: step.step_index ?? step.id,
+          toolName: toolName(step),
+          isError: /ERROR|FAILED/i.test(String(step.state ?? "")),
+        });
+      } else {
+        onActivity({ type: "backend_step" });
+      }
+      continue;
+    }
+    if (event.event !== "result") {
+      onActivity({ type: event.event ?? "backend_event" });
+      continue;
+    }
+    const result = event.result ?? {};
+    const status = String(result.status ?? "").toUpperCase();
+    const success = ["SUCCESS", "DONE", "COMPLETED"].includes(status);
+    const response = String(result.response ?? "");
+    const deniedActionCount = Array.isArray(result.denied_actions) ? result.denied_actions.length : 0;
+    const deniedError = success && !response.trim() && deniedActionCount > 0
+      ? `Agy denied ${deniedActionCount} required action${deniedActionCount === 1 ? "" : "s"}; grant the required permission or explicitly allow trusted tools.`
+      : null;
+    const error = deniedError ?? (success ? null : (result.error || `agy status ${status || "ERROR"}`));
+    summary.settled = true;
+    summary.backendStatus = status || null;
+    summary.backendDeniedActionCount = deniedActionCount;
+    summary.conversationId = result.conversation_id ?? summary.conversationId;
+    summary.usage = result.usage ?? {};
+    summary.backendTurns = Number.isFinite(Number(result.num_turns)) ? Number(result.num_turns) : null;
+    if (summary.assistantCalls === 0) summary.assistantCalls = summary.backendTurns ?? 0;
+    summary.structuredOutput = result.structured_output ?? null;
+    summary.lastAssistant = {
+      provider: "agy",
+      model: summary.lastAssistant?.model ?? null,
+      stopReason: error ? "error" : "stop",
+      error,
+      usage: result.usage ?? null,
+      text: response,
+    };
+    const category = classifyAttention(error);
+    if (category) onAttention(category, error);
+    onActivity({ type: "agent_settled" });
+    onSettled();
   }
   return summary;
 }

@@ -23,18 +23,40 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { createStderrScan, createStdoutScan, isCorruptedJson } from "./stream-scan.mjs";
+import { buildRetryGuidance, nextRetryCount, parseRetryAttempt } from "./retry-policy.mjs";
 import { fileURLToPath } from "node:url";
 import { AGY_PROFILES, agyLaunchArgs, agyLauncher, selectAgy, summarizeAgyStream } from "./agy-backend.mjs";
 import { CLAUDE_PROFILES, claudeLaunchArgs, claudeLauncher, selectClaude, summarizeClaudeStream } from "./claude-backend.mjs";
+import { diagnoseRuns } from "./diagnose.mjs";
+import { applyNativePermissions } from "./native-permissions.mjs";
+import { GROK_PROFILES, grokLauncher, grokLaunchArgs, selectGrok, createGrokSession, cleanupGrokSession } from "./grok-backend.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
-const DEFAULT_ROOT = process.platform === "darwin"
-  ? join(homedir(), "Library", "Application Support", "pi-worker", "runs")
-  : join(homedir(), ".local", "state", "pi-worker", "runs");
 const FALLBACK_MS = 15_000;
 const PROGRESS_WRITE_MS = 250;
 const DEFAULT_STARTUP_ATTENTION_SECONDS = 60;
+const DEFAULT_SILENT_REMINDER_SECONDS = 600;
+const DEFAULT_PROGRESS_REMINDER_SECONDS = 600;
 const ATTENTION_LIMIT = 8;
+const SETTLE_GRACE_SECONDS = 8;
+const DEFAULT_CONSUMER = "default";
+const WORKER_VERSION = "0.4.1";
+const WORKER_BRAND = "subworker";
+const ENV_PREFIX = "SUBWORKER_";
+const LEGACY_ENV_PREFIX = "PI_WORKER_";
+function prefixed(name) { return ENV_PREFIX + name; }
+function legacy(name) { return LEGACY_ENV_PREFIX + name; }
+// PI_WORKER_* remains a compatibility input; SUBWORKER_* is the canonical spelling.
+function envVar(name) {
+  return process.env[prefixed(name)] ?? process.env[legacy(name)];
+}
+const PHYSICAL_STATE_ROOT = process.platform === "darwin"
+  ? join(homedir(), "Library", "Application Support", "pi-worker", "runs")
+  : join(homedir(), ".local", "state", "pi-worker", "runs");
+// Public storage path stays pi-worker/runs: existing runs, worktrees and session
+// directories hold absolute paths that must keep resolving.
+const DEFAULT_ROOT = envVar("STATE_ROOT") ?? PHYSICAL_STATE_ROOT;
 const CACHE_MAX_BYTES = 20 * 1024 * 1024 * 1024;
 const CACHE_STALE_MS = 90 * 24 * 60 * 60 * 1000;
 const CACHE_GC_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -67,7 +89,7 @@ const ATTENTION_PATTERNS = [
   ["provider_5xx", /(?:\b50[0-4]\b|internal server error|bad gateway|service unavailable|gateway timeout)/i],
   ["permission_denied", /(?:permission.*(?:denied|cannot prompt)|auto-denied|denied\s+\d*\s*required action)/i],
   ["reasoning_ignored", /(?:(?:reasoning|thinking).*(?:ignored|unsupported|not supported)|(?:ignored|unsupported).*(?:reasoning|thinking))/i],
-  ["transport", /(?:broken pipe|ECONNRESET|socket hang up|connection reset|connection error|unexpected eof|\bEOF\b|stream (?:ended before a terminal response event|was interrupted)|fetch failed)/i],
+  ["transport", /(?:broken pipe|ECONNRESET|socket hang up|connection reset|connection error|unexpected eof|\bEOF\b|stream (?:ended before a terminal response event|was interrupted)|upstream stream ended before terminal chunk|fetch failed)/i],
 ];
 
 function fail(message, code = 2) {
@@ -97,16 +119,17 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  return `pi-worker commands:
-  dispatch --run-id ID [--backend pi|agy|claude] [--mode read|write|in-place] [--source DIR|--workdir DIR]
+  return `subworker commands:
+  dispatch --run-id ID [--backend pi|agy|claude|grok] [--mode read|write|in-place] [--source DIR|--workdir DIR]
            [--capability docs|lens|context|browser] [--live] [--idle-timeout SECONDS]
-           [--hard-timeout SECONDS] [--startup-attention SECONDS] -- BACKEND_ARGS PROMPT
-  continue --run-id ID [--live] [--idle-timeout SECONDS] [--startup-attention SECONDS] -- PROMPT
+           [--hard-timeout SECONDS] [--startup-attention SECONDS] [--silent-reminder SECONDS] [--progress-reminder SECONDS] -- BACKEND_ARGS PROMPT
+  continue --run-id ID [--live] [--idle-timeout SECONDS] [--startup-attention SECONDS] [--silent-reminder SECONDS] [--progress-reminder SECONDS] -- PROMPT
   steer --run-id ID [--timeout SECONDS] -- MESSAGE
   cancel --run-id ID [--run-id ID...] [--reason TEXT] [--timeout SECONDS]
-  wait --run-id ID [--run-id ID...] [--timeout SECONDS] [--full]
+  wait --run-id ID [--run-id ID...] [--consumer NAME] [--timeout SECONDS] [--full]
   cleanup --reviewed yes --run-id ID [--run-id ID...]
   status --run-id ID [--run-id ID...]
+  diagnose --run-id ID [--run-id ID...]
   cache-status
   profiles`;
 }
@@ -116,7 +139,40 @@ function one(options, name, fallback = undefined) {
 }
 
 function stateRoot(options) {
-  return resolve(one(options, "state-root", process.env.PI_WORKER_STATE_ROOT ?? DEFAULT_ROOT));
+  return resolve(one(options, "state-root", process.env[prefixed("STATE_ROOT")] ?? process.env[legacy("STATE_ROOT")] ?? DEFAULT_ROOT));
+}
+
+// SUBWORKER_* is canonical; PI_CODING_AGENT_DIR is a Pi-owned variable that must
+// keep its name and precedence for extensions, capabilities and Playwright.
+function agentSourceRoot() {
+  return resolve(envVar("AGENT_SOURCE") ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"));
+}
+
+function launcherOverride() {
+  return process.env[prefixed("LAUNCHER")] ?? process.env[legacy("LAUNCHER")] ?? null;
+}
+
+// Backend CLI versions are not derivable from the Pi agent profile package.
+// Recording a guessed value for Agy/Claude would be wrong; only a confirmed
+// version may be recorded, so this stays null. No per-invocation CLI --version
+// scan is added; the value is fixed at dispatch time.
+function backendVersion() {
+  return null;
+}
+
+// Dispatcher identity is recorded at dispatch time from confirmed environment
+// sources only. PI_SESSION_ID is set by the pi CLI for its own session dir;
+// CODEX_THREAD_ID identifies the scheduling Codex thread; the Claude Code
+// variables only apply to that backend's runs.
+function dispatcherFacts() {
+  const facts = {};
+  if (process.env.CODEX_THREAD_ID) facts.threadId = process.env.CODEX_THREAD_ID;
+  if (process.env.PI_SESSION_ID) facts.piSessionId = process.env.PI_SESSION_ID;
+  if (process.env.CLAUDE_CODE_SESSION_ID) facts.claudeSessionId = process.env.CLAUDE_CODE_SESSION_ID;
+  if (process.env.CLAUDE_PROJECT_DIR) facts.claudeProjectDir = process.env.CLAUDE_PROJECT_DIR;
+  const piBin = envVar("PI_BIN");
+  if (piBin) facts.piBin = piBin;
+  return facts;
 }
 
 function validateRunId(runId) {
@@ -219,7 +275,7 @@ function replacePiOption(piArgs, name, value) {
 
 function providerExtensionArgs(provider) {
   if (!/^[A-Za-z0-9._-]+$/.test(provider)) return [];
-  const source = resolve(process.env.PI_WORKER_AGENT_SOURCE ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"));
+  const source = agentSourceRoot();
   const extension = ["ts", "js", "mjs"].map((suffix) => join(source, "extensions", `${provider}.${suffix}`)).find(existsSync);
   return extension ? ["--extension", extension] : [];
 }
@@ -422,77 +478,98 @@ function messageText(message) {
 }
 
 async function summarizeStream(stream, onActivity, onAttention, onResponse = () => {}, onSettled = () => {}) {
-  const summary = { settled: false, lastAssistant: null, usage: {}, assistantCalls: 0, tools: [], playwrightUsed: false, consecutiveToolErrors: 0, lastToolErrorKey: null };
+  const summary = { settled: false, lastAssistant: null, usage: {}, assistantCalls: 0, tools: [], playwrightUsed: false, consecutiveToolErrors: 0, lastToolErrorKey: null, providerRetryCount: null };
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  const scan = createStdoutScan({ classifyAttention });
   for await (const line of lines) {
+    let event;
     try {
-      const event = JSON.parse(line);
-      onActivity(event);
-      if (event.type === "agent_settled") {
-        summary.settled = true;
-        onSettled();
-      }
-      if (event.type === "tool_execution_start" && event.toolName === "bash") {
-        summary.playwrightUsed ||= /(?:pi-playwright|playwright-browser|pw\.js)/.test(JSON.stringify(event));
-      }
-      if (event.type === "tool_execution_end") {
-        const error = Boolean(event.isError ?? event.result?.isError);
-        const name = event.toolName ?? null;
-        let tool = summary.tools.find((entry) => entry.name === name);
-        if (!tool) {
-          tool = { name, count: 0, errorCount: 0 };
-          summary.tools.push(tool);
-        }
-        tool.count += 1;
-        if (error) {
-          tool.errorCount += 1;
-          tool.lastError = redactText(JSON.stringify(event.result ?? event.error ?? "tool failed")).slice(0, TOOL_ERROR_BYTES);
-          const errorKey = String(name) + "\\0" + tool.lastError;
-          summary.consecutiveToolErrors = summary.lastToolErrorKey === errorKey
-            ? summary.consecutiveToolErrors + 1
-            : 1;
-          summary.lastToolErrorKey = errorKey;
-        } else {
-          summary.consecutiveToolErrors = 0;
-          summary.lastToolErrorKey = null;
-        }
-        if (summary.consecutiveToolErrors >= 3) onAttention("repeated_tool_errors", tool.lastError);
-      }
-      if (event.type === "auto_retry_start" && Number(event.attempt ?? 0) >= 2) onAttention("provider_retry", JSON.stringify(event));
-      if (event.type === "auto_retry_end" && event.success === false) onAttention("provider_retry_failed", JSON.stringify(event));
-      if (event.type === "extension_error") onAttention("extension_error", JSON.stringify(event));
-      if (event.type === "compaction_end" && !event.result && !event.aborted) onAttention("compaction_error", JSON.stringify(event));
-      if (event.type === "response") onResponse(event);
-      if (event.type === "message_end" && event.message?.role === "assistant") {
-        summary.usage = addUsage(summary.usage, event.message.usage);
-        summary.assistantCalls += 1;
-        summary.lastAssistant = {
-          provider: event.message.provider ?? null,
-          model: event.message.model ?? null,
-          stopReason: event.message.stopReason ?? null,
-          error: event.message.errorMessage ?? null,
-          usage: event.message.usage ?? null,
-          text: messageText(event.message),
-        };
-        const attention = classifyAttention(event.message.errorMessage);
-        if (attention) onAttention(attention, event.message.errorMessage);
-      }
+      event = JSON.parse(line);
     } catch {
       // Malformed output cannot prove completion, but does not need permanent storage.
+      const hit = scan.noteLine(line);
+      if (hit) onAttention(hit.category, hit.detail);
+      if (isCorruptedJson(line)) {
+        throw new Error(`Corrupted protocol JSON: malformed JSON frame; line: ${String(line ?? "").trim().slice(0, 200)}`);
+      }
+      continue;
+    }
+    if (!event || typeof event !== "object" || Array.isArray(event)) {
+      throw new Error(`Corrupted protocol frame: expected non-null object, got ${event === null ? "null" : Array.isArray(event) ? "array" : typeof event}`);
+    }
+    scan.noteSuccess();
+    onActivity(event);
+    if (event.type === "agent_settled") {
+      summary.settled = true;
+      onSettled();
+    }
+    if (event.type === "tool_execution_start" && event.toolName === "bash") {
+      summary.playwrightUsed ||= /(?:pi-playwright|playwright-browser|pw\.js)/.test(JSON.stringify(event));
+    }
+    if (event.type === "tool_execution_end") {
+      const error = Boolean(event.isError ?? event.result?.isError);
+      const name = event.toolName ?? null;
+      let tool = summary.tools.find((entry) => entry.name === name);
+      if (!tool) {
+        tool = { name, count: 0, errorCount: 0 };
+        summary.tools.push(tool);
+      }
+      tool.count += 1;
+      if (error) {
+        tool.errorCount += 1;
+        tool.lastError = redactText(JSON.stringify(event.result ?? event.error ?? "tool failed")).slice(0, TOOL_ERROR_BYTES);
+        const errorKey = String(name) + "\\0" + tool.lastError;
+        summary.consecutiveToolErrors = summary.lastToolErrorKey === errorKey
+          ? summary.consecutiveToolErrors + 1
+          : 1;
+        summary.lastToolErrorKey = errorKey;
+      } else {
+        summary.consecutiveToolErrors = 0;
+        summary.lastToolErrorKey = null;
+      }
+      if (summary.consecutiveToolErrors >= 3) onAttention("repeated_tool_errors", tool.lastError);
+    }
+    if (event.type === "auto_retry_start") {
+      summary.providerRetryCount = nextRetryCount(summary.providerRetryCount, parseRetryAttempt(event));
+      onAttention("provider_retry", JSON.stringify(event));
+    }
+    if (event.type === "auto_retry_end" && event.success === false) onAttention("provider_retry_failed", JSON.stringify(event));
+    if (event.type === "extension_error") onAttention("extension_error", JSON.stringify(event));
+    if (event.type === "compaction_end" && !event.result && !event.aborted) onAttention("compaction_error", JSON.stringify(event));
+    if (event.type === "response") onResponse(event);
+    if (event.type === "message_end" && event.message?.role === "assistant") {
+      summary.usage = addUsage(summary.usage, event.message.usage);
+      summary.assistantCalls += 1;
+      summary.lastAssistant = {
+        provider: event.message.provider ?? null,
+        model: event.message.model ?? null,
+        stopReason: event.message.stopReason ?? null,
+        error: event.message.errorMessage ?? null,
+        usage: event.message.usage ?? null,
+        text: messageText(event.message),
+      };
+      const attention = classifyAttention(event.message.errorMessage);
+      if (attention) onAttention(attention, event.message.errorMessage);
     }
   }
   return summary;
 }
 
 function collectTail(stream, onActivity, onAttention) {
-  return new Promise((resolveTail) => {
+  return new Promise((resolveTail, rejectTail) => {
     let tail = "";
+    const scan = createStderrScan({ classifyAttention });
     stream.setEncoding("utf8");
+    stream.on("error", (error) => rejectTail(error));
     stream.on("data", (chunk) => {
-      onActivity(null);
-      tail = (tail + chunk).slice(-FAILURE_TAIL_BYTES);
-      const attention = classifyAttention(chunk);
-      if (attention) onAttention(attention, chunk);
+      try {
+        onActivity(null);
+        tail = (tail + chunk).slice(-FAILURE_TAIL_BYTES);
+        const hit = scan.push(chunk);
+        if (hit) onAttention(hit.category, hit.detail);
+      } catch (error) {
+        rejectTail(error);
+      }
     });
     stream.on("end", () => resolveTail(tail.trim()));
   });
@@ -500,14 +577,69 @@ function collectTail(stream, onActivity, onAttention) {
 
 function eventDirectory(directory) {
   const key = createHash("sha256").update(resolve(directory)).digest("hex");
+  // Keep the physical event path: legacy default receipts and live waiters of
+  // running runs live here, so renaming the directory would strand them.
   return join(tmpdir(), "pi-worker-events", key);
 }
 
-function attentionReceipt(directory, attention) {
-  const key = createHash("sha256")
-    .update(String(attention.detectedAt ?? "") + "\\0" + String(attention.category ?? ""))
-    .digest("hex");
-  return join(eventDirectory(directory), "attention-" + key + ".json");
+// Receipt identity and scope live in exactly one place so that readiness
+// checks (pendingAttention) and atomic claims (claimAttention) always agree on
+// the same file:
+//  - The default consumer maps to the legacy global receipt (no suffix), so
+//    old waiters and the default path share one delivery and old receipts keep
+//    working. A later switch of the default resolution cannot strand either.
+//  - Any explicitly named consumer gets its own suffixed receipt namespace and
+//    is never shadowed by the legacy default receipt.
+//  - New attention records carry a content fingerprint; the receipt key uses
+//    both detectedAt and the fingerprint so two alerts of the same category
+//    detected within the same millisecond with different details get distinct
+//    receipts, while recurring alerts in subsequent turns remain independently
+//    consumable. Records written before fingerprints existed keep their legacy
+//    detectedAt+category key so past receipts stay valid.
+function attentionReceipt(directory, attention, consumer = null) {
+  const scope = consumer === DEFAULT_CONSUMER ? null : consumer;
+  const keyMaterial = attention?.fingerprint
+    ? String(attention.detectedAt ?? "") + "\0" + String(attention.fingerprint)
+    : String(attention.detectedAt ?? "") + "\\0" + String(attention.category ?? "");
+  const key = createHash("sha256").update(keyMaterial).digest("hex");
+  return join(eventDirectory(directory), "attention-" + key + (scope ? "-" + createHash("sha256").update(scope).digest("hex").slice(0, 16) : "") + ".json");
+}
+
+// Atomic wx claim: exactly one concurrent waiter with the same consumer wins;
+// EEXIST means another waiter already claimed it (a regular receipt file is in
+// place). Any other failure - including an EEXIST whose target is a directory
+// or a broken link - is a real IO fault and must surface, never be mistaken
+// for an already-notified delivery.
+function claimAttention(directory, attention, consumer) {
+  const receipt = attentionReceipt(directory, attention, consumer);
+  mkdirSync(eventDirectory(directory), { recursive: true, mode: 0o700 });
+  let handle;
+  try {
+    handle = openSync(receipt, "wx", 0o600);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      let existing = null;
+      try {
+        existing = statSync(receipt);
+      } catch {}
+      if (existing?.isFile()) return null;
+      throw new Error(`receipt path is not a claimable file: ${receipt}`);
+    }
+    throw error;
+  }
+  try {
+    writeFileSync(handle, `${JSON.stringify({ consumer, claimedAt: new Date().toISOString(), delivered: false })}\n`);
+  } finally {
+    closeSync(handle);
+  }
+  return receipt;
+}
+
+function consumerName(value) {
+  const candidate = String(value ?? "").trim();
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(candidate)) return candidate;
+  if (!candidate) return null;
+  fail(`--consumer must be letters, digits, dot, underscore, or hyphen: ${candidate}`);
 }
 
 function attentionEvents(value) {
@@ -519,7 +651,14 @@ function attentionFingerprint(category, detail) {
   return createHash("sha256").update(String(category) + "\0" + String(detail)).digest("hex");
 }
 
-function notifyWaiter(directory) {
+// A fingerprint distinguishes two same-category alerts that share a detection
+// millisecond. Records that predate fingerprints have none and keep their
+// legacy receipt path; only new records carry one.
+function fingerprintOf(entry) {
+  return entry?.fingerprint ?? attentionFingerprint(String(entry?.category ?? ""), String(entry?.detail ?? ""));
+}
+
+function notifyWaiter(directory, consumer = null) {
   const waiters = eventDirectory(directory);
   if (!existsSync(waiters)) return;
   for (const name of readdirSync(waiters).filter((entry) => /^\d+\.json$/.test(entry))) {
@@ -529,6 +668,7 @@ function notifyWaiter(directory) {
       try { unlinkSync(path); } catch {}
       continue;
     }
+    if (consumer && waiter?.consumer && waiter.consumer !== consumer) continue;
     try {
       process.kill(waiter.pid, "SIGUSR1");
     } catch {
@@ -539,8 +679,8 @@ function notifyWaiter(directory) {
 
 function cacheCandidates() {
   const home = homedir();
-  if (process.env.PI_WORKER_TEST_CACHE_ROOTS) {
-    return process.env.PI_WORKER_TEST_CACHE_ROOTS.split(delimiter).map((path) => resolve(path));
+  if (process.env[prefixed("TEST_CACHE_ROOTS")] || process.env[legacy("TEST_CACHE_ROOTS")]) {
+    return String(envVar("TEST_CACHE_ROOTS")).split(delimiter).map((path) => resolve(path));
   }
   return [
     join(home, ".cache", "uv"),
@@ -575,8 +715,8 @@ function cacheSize(path) {
 function cacheReport() {
   const entries = cacheCandidates().filter(existsSync).map((path) => ({ path, bytes: cacheSize(path) }));
   return {
-    maxBytes: process.env.PI_WORKER_TEST_CACHE_ROOTS
-      ? Number(process.env.PI_WORKER_CACHE_MAX_BYTES ?? CACHE_MAX_BYTES)
+    maxBytes: (process.env[prefixed("TEST_CACHE_ROOTS")] || process.env[legacy("TEST_CACHE_ROOTS")])
+      ? Number(envVar("CACHE_MAX_BYTES") ?? CACHE_MAX_BYTES)
       : CACHE_MAX_BYTES,
     totalBytes: entries.reduce((total, entry) => total + entry.bytes, 0),
     entries,
@@ -656,7 +796,7 @@ function compactCacheReceipt(receipt) {
 
 function cacheGc(root) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
-  if (process.env.CODEX_SANDBOX === "seatbelt" && !process.env.PI_WORKER_TEST_CACHE_ROOTS) {
+  if (process.env.CODEX_SANDBOX === "seatbelt" && !process.env[prefixed("TEST_CACHE_ROOTS")] && !process.env[legacy("TEST_CACHE_ROOTS")]) {
     return { skipped: "shared cache GC requires host filesystem permissions", ...cacheReport() };
   }
   const receiptPath = join(root, ".cache-gc.json");
@@ -748,7 +888,7 @@ function closePlaywrightSession(env, cwd) {
 }
 
 function prepareAgentProfile(directory) {
-  const source = resolve(process.env.PI_WORKER_AGENT_SOURCE ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"));
+  const source = agentSourceRoot();
   const target = join(directory, "agent");
   if (existsSync(target)) return target;
   mkdirSync(target, { recursive: true, mode: 0o700 });
@@ -791,11 +931,13 @@ async function supervise(options, piArgs) {
   const backend = initial.backend ?? "pi";
   const live = initial.live === true;
   const { prompt, args: launchArgs } = extractPrompt(piArgs);
+  const customPiLauncher = process.env.SUBWORKER_LAUNCHER ?? process.env.PI_WORKER_LAUNCHER;
   const launcher = backend === "agy"
     ? agyLauncher()
     : backend === "claude"
       ? claudeLauncher(initial.provider)
-      : (process.env.PI_WORKER_LAUNCHER ?? resolve(dirname(SCRIPT), "../bin/pi-worker"));
+      : backend === "grok" ? grokLauncher() : (customPiLauncher ?? resolve(dirname(SCRIPT), "../bin/subworker"));
+  const defaultPiArgs = live ? ["--mode", "rpc", ...launchArgs] : [...launchArgs, prompt];
   const childArgs = backend === "agy"
     ? agyLaunchArgs({
       args: launchArgs,
@@ -803,6 +945,7 @@ async function supervise(options, piArgs) {
       mode: { model: initial.model, thinking: initial.thinking, readOnly: initial.mode === "read" },
       hardTimeoutSeconds: initial.hardTimeoutSeconds,
       conversationId: initial.resumeConversationId ?? null,
+      workdir: initial.workdir ?? null,
     })
     : backend === "claude"
       ? claudeLaunchArgs({
@@ -819,7 +962,16 @@ async function supervise(options, piArgs) {
           ? READ_ONLY_PROMPT
           : "Treat the current working directory as the task root. Write only inside it or TMPDIR; never switch to or edit another checkout.",
       })
-      : (live ? ["--mode", "rpc", ...launchArgs] : [...launchArgs, prompt]);
+      : backend === "grok"
+        ? grokLaunchArgs({
+          args: launchArgs, prompt,
+          mode: { model: initial.model, thinking: initial.thinking, readOnly: initial.mode === "read" },
+          session: initial.grokSession,
+          conversationId: initial.resumeConversationId,
+          workdir: initial.workdir,
+          systemPrompt: initial.mode === "read" ? READ_ONLY_PROMPT : "Treat the current working directory as the task root. Write only inside it or TMPDIR; never switch to or edit another checkout.",
+        })
+        : (customPiLauncher ? defaultPiArgs : ["exec", ...defaultPiArgs]);
   const tmp = join(directory, "tmp");
   mkdirSync(tmp, { recursive: true, mode: 0o700 });
   atomicJson(resultPath, { ...initial, state: "starting", activity: "waiting_event", supervisorPid: process.pid, startedAt: new Date().toISOString() });
@@ -836,13 +988,14 @@ async function supervise(options, piArgs) {
   const attentions = Array.isArray(initial.attentions)
     ? [...initial.attentions]
     : (initial.attention ? [initial.attention] : []);
-  const attentionFingerprints = new Set(attentions.map((entry) => attentionFingerprint(entry.category, entry.detail)));
+  const attentionFingerprints = new Set(attentions.map((entry) => fingerprintOf(entry)));
   let attention = attentions.at(-1) ?? null;
   const agentDir = backend === "pi" ? (initial.agentDir ?? prepareAgentProfile(directory)) : null;
   const runEnv = {
     ...process.env,
     ...cacheEnvironment(),
     ...(agentDir ? { PI_CODING_AGENT_DIR: agentDir } : {}),
+    ...(backend === "grok" ? { GROK_HOME: initial.grokSession.home } : {}),
     TMPDIR: tmp,
     TMP: tmp,
     TEMP: tmp,
@@ -853,11 +1006,22 @@ async function supervise(options, piArgs) {
   let forceTimer = null;
   let rpcShutdownTimer = null;
   let startupAttentionTimer = null;
+  let silentReminderTimer = null;
+  let silentPeriodStartedAt = null;
+  let silentSpanNotified = false;
+  let progressStallTimer = null;
+  let progressStallSpanStartedAt = null;
+  let progressStallNotified = false;
+  let settleGraceStartedAt = null;
+  let settleGraceTimer = null;
   let steerFallback = null;
   let steerSignal = null;
   let cancelSignal = null;
   let hardTimeout = null;
   let child;
+  let settled = false;
+  let settleShutdownMarked = false;
+  let settleSink = null;
   const activeTools = new Map();
   let firstEventAt = initial.firstEventAt ?? null;
   let firstToolAt = initial.firstToolAt ?? null;
@@ -883,6 +1047,50 @@ async function supervise(options, piArgs) {
     progressWrites += 1;
     atomicJson(resultPath, { ...current, ...snapshot, progressWrites });
     lastProgressWriteMs = Date.now();
+  };
+  const progressReminderSeconds = Number(initial.progressReminderSeconds ?? (initial.mode === "read" ? 0 : DEFAULT_PROGRESS_REMINDER_SECONDS));
+  const clearProgressStallTimer = () => {
+    if (progressStallTimer) clearTimeout(progressStallTimer);
+    progressStallTimer = null;
+  };
+  // Bound to markAttention once the try block below defines it; the stall
+  // timer lives at function scope because updateProgress arms it per event.
+  let stallAttentionHook = null;
+  // A stall span is a stretch without any tool start/end boundary. Only tool
+  // boundaries open a fresh span: model chunks/thinking keep streaming without
+  // restarting it, an active tool suppresses alerts, and the window before the
+  // first backend event belongs to startup_silent alone. One span raises at
+  // most one progress_stalled alert; the alert never judges or stops the run.
+  // A span suppressed because silent_reminder owns the stretch is closed
+  // instead, so the first real model event after the silence reopens it.
+  const beginProgressStallSpan = () => {
+    if (progressReminderSeconds <= 0 || timedOut || settled || cancelRequested || progressState !== "running") return;
+    progressStallSpanStartedAt = Date.now();
+    progressStallNotified = false;
+    clearProgressStallTimer();
+    progressStallTimer = setTimeout(() => {
+      progressStallTimer = null;
+      if (timedOut || settled || cancelRequested || progressState !== "running") return;
+      if (activeTools.size > 0 || progressStallNotified || progressStallSpanStartedAt === null) return;
+      // A stretch of total backend silence belongs to silent_reminder. When the
+      // configured silent interval (which may differ from the progress
+      // interval, or be 0 to disable it) has elapsed with no event at all, that
+      // reminder owns the alert for this stretch. Close the stall span so the
+      // first real non-tool model event after the silence opens a fresh
+      // reminder window; leaving the span open with no timer would never
+      // notify again. Chunks themselves never reset the clock.
+      const silentReminderSeconds = Number(initial.silentReminderSeconds ?? 0);
+      const quietMs = silentPeriodStartedAt === null ? Number.POSITIVE_INFINITY : Date.now() - silentPeriodStartedAt;
+      if (silentReminderSeconds > 0 && quietMs >= silentReminderSeconds * 1000) {
+        progressStallSpanStartedAt = null;
+        return;
+      }
+      progressStallNotified = true;
+      const spanSeconds = Math.round((Date.now() - progressStallSpanStartedAt) / 100) / 10;
+      const spanMark = new Date(progressStallSpanStartedAt).toISOString();
+      stallAttentionHook?.("progress_stalled", `No tool start or finish observed for ${spanSeconds} seconds since ${spanMark}; the worker is still running without observable tool progress.`);
+    }, progressReminderSeconds * 1000);
+    progressStallTimer.unref();
   };
   const updateProgress = (event = undefined, forcedState = null) => {
     const at = new Date().toISOString();
@@ -918,6 +1126,22 @@ async function supervise(options, piArgs) {
     if (activity !== progressActivity) activitySince = at;
     progressState = state;
     progressActivity = activity;
+    // Progress-stall timing: only tool start/end boundaries are observable
+    // tool progress, so only they reset the span (or close it while a tool is
+    // active). Chunks/thinking and other model output never reset the clock;
+    // after the last tool ends a fresh span starts, and a span closed by a
+    // silent_reminder-owned window reopens on the next real model event.
+    if (event !== undefined && progressState === "running") {
+      const isToolBoundary = event?.type === "tool_execution_start" || event?.type === "tool_execution_end";
+      if (isToolBoundary) {
+        clearProgressStallTimer();
+        progressStallSpanStartedAt = null;
+        progressStallNotified = false;
+        if (activeTools.size === 0) beginProgressStallSpan();
+      } else if (event !== null && activeTools.size === 0 && firstEventAt !== null && progressStallSpanStartedAt === null) {
+        beginProgressStallSpan();
+      }
+    }
     pendingProgress = {
       state,
       activity,
@@ -964,28 +1188,70 @@ async function supervise(options, piArgs) {
       idleTimer.unref();
     };
     const markActivity = (event) => {
-      resetIdle();
-      if (firstEventAt === null && startupAttentionTimer) {
-        clearTimeout(startupAttentionTimer);
-        startupAttentionTimer = null;
+      const now = Date.now();
+      if (firstEventAt === null) {
+        if (startupAttentionTimer) {
+          clearTimeout(startupAttentionTimer);
+          startupAttentionTimer = null;
+        }
       }
+      // One silent span runs from the last real backend event. Every real
+      // event restarts it and clears the notified flag, so a later quiet
+      // phase starts a fresh reminder cycle; one ongoing silence raises at
+      // most one reminder (never a repeating timer spam).
+      if (event !== null) {
+        if (silentSpanNotified) silentSpanNotified = false;
+        silentPeriodStartedAt = now;
+      }
+      resetIdle();
       updateProgress(event);
     };
     const markAttention = (category, detail) => {
       const safeDetail = redactText(detail).slice(-4_096);
       const fingerprint = attentionFingerprint(category, safeDetail);
-      if (attentionFingerprints.has(fingerprint) || attentions.length >= ATTENTION_LIMIT) return;
-      attentionFingerprints.add(fingerprint);
-      attention = {
+      const now = new Date().toISOString();
+      const duplicate = attentions.find((entry) => fingerprintOf(entry) === fingerprint);
+      if (duplicate) {
+        // Keep the original detectedAt: receipts are keyed on it (legacy) or on
+        // the content fingerprint and must not re-deliver on later repeats of
+        // the same error.
+        return;
+      }
+      // Simple bounded queue of at most ATTENTION_LIMIT entries: every new
+      // alert enters and the oldest leaves, so the window always reflects the
+      // newest errors (a late 401 is never hidden behind eight earlier ones).
+      if (attentions.length >= ATTENTION_LIMIT) {
+        const victim = attentions.shift();
+        attentionFingerprints.delete(fingerprintOf(victim));
+      }
+      // Current advice is advisory only: it never blocks continue, gates
+      // dispatch, stops tool tasks, or kills processes. Persist it at top
+      // level too so on-demand diagnose sees the same advice wait receives;
+      // wait alert spread and receipts are unchanged (same notifyWaiter path).
+      const entry = {
         category,
         detail: safeDetail,
-        detectedAt: new Date().toISOString(),
-        delivered: false,
+        fingerprint,
+        detectedAt: now,
+        retryGuidance: buildRetryGuidance({ category, terminal: false }),
       };
-      attentions.push(attention);
+      attentionFingerprints.add(fingerprint);
+      attentions.push(entry);
+      attention = entry;
       atomicJson(join(directory, "attention.json"), { events: attentions });
+      const live = readJson(resultPath);
+      if (live && !terminal(live)) {
+        atomicJson(resultPath, {
+          ...live,
+          attention: entry,
+          attentions,
+          providerRetryCount: live.providerRetryCount ?? null,
+          retryGuidance: entry.retryGuidance,
+        });
+      }
       notifyWaiter(directory);
     };
+    stallAttentionHook = markAttention;
     const steerDir = join(directory, "steer");
     const ackDir = join(steerDir, "acks");
     const cancelPath = join(directory, "cancel.json");
@@ -994,6 +1260,7 @@ async function supervise(options, piArgs) {
       const request = readJson(cancelPath);
       cancelRequested = true;
       cancelReason = request?.reason || "cancel requested";
+      clearProgressStallTimer();
       updateProgress(undefined, "stopping");
       stopChild();
     };
@@ -1043,10 +1310,7 @@ async function supervise(options, piArgs) {
       }
     };
     const onSettled = () => {
-      if (!live) return;
-      if (child.stdin.writable) child.stdin.end();
-      rpcShutdownTimer = setTimeout(() => stopForTimeout("rpc_shutdown"), 5_000);
-      rpcShutdownTimer.unref();
+      if (settleSink) settleSink();
     };
     if (live && process.platform !== "win32") {
       steerSignal = () => drainSteer();
@@ -1059,38 +1323,143 @@ async function supervise(options, piArgs) {
     atomicJson(resultPath, { ...readJson(resultPath), supervisorPid: process.pid, childPid: child.pid });
     updateProgress(undefined, "running");
     resetIdle();
-    if (initial.startupAttentionSeconds > 0 && firstEventAt === null) {
-      startupAttentionTimer = setTimeout(() => {
-        if (firstEventAt === null) {
-          markAttention("startup_silent", `No backend event received within ${initial.startupAttentionSeconds} seconds; the worker is still running.`);
-        }
-      }, initial.startupAttentionSeconds * 1000);
-      startupAttentionTimer.unref();
+    if (firstEventAt === null) {
+      if (initial.startupAttentionSeconds > 0) {
+        startupAttentionTimer = setTimeout(() => {
+          if (firstEventAt === null) {
+            markAttention("startup_silent", `No backend event received within ${initial.startupAttentionSeconds} seconds; the worker is still running.`);
+          }
+        }, initial.startupAttentionSeconds * 1000);
+        startupAttentionTimer.unref();
+      }
+    } else {
+      silentPeriodStartedAt = Date.now();
     }
     if (cancelRequested) {
       updateProgress(undefined, "stopping");
       stopChild();
     }
+    // Settled exit contract, shared by all three backends. The receipt that
+    // matters is the stdio close event, not child.exitCode: the child process
+    // may have exited while a background descendant still holds stdout open.
+    // From the terminal event we always start a bounded grace window; when it
+    // expires the process group is stopped precisely (this also stops
+    // background descendants that keep the pipe open) and the run fails
+    // explicitly instead of hanging on close forever.
+    let exitResolve = null;
+    const exitPromise = new Promise((resolveExit) => { exitResolve = resolveExit; });
+    const onClose = (code, childSignal) => {
+      if (settleGraceTimer) {
+        clearTimeout(settleGraceTimer);
+        settleGraceTimer = null;
+      }
+      exitResolve({ exitCode: code, signal: childSignal, launchError: null });
+    };
+    child.once("error", (error) => exitResolve({ exitCode: null, signal: null, launchError: error.message }));
+    child.once("close", onClose);
+    const armSettleGrace = () => {
+      if (settleGraceTimer || settleGraceStartedAt !== null) return;
+      settleGraceStartedAt = Date.now();
+      settleGraceTimer = setTimeout(() => {
+        settleGraceTimer = null;
+        if (settleShutdownMarked) return;
+        // Force the whole process group: the parent may already be gone while
+        // a background descendant still holds stdout open and delays close.
+        settleShutdownMarked = true;
+        stopChild();
+        markAttention("shutdown_problem", "Backend stayed alive after its terminal event; the process group was stopped.");
+      }, SETTLE_GRACE_SECONDS * 1000);
+      settleGraceTimer.unref();
+    };
+    settleSink = () => {
+      if (settled) return;
+      settled = true;
+      clearProgressStallTimer();
+      if (live) {
+        if (child.stdin.writable) child.stdin.end();
+        rpcShutdownTimer = setTimeout(() => stopForTimeout("rpc_shutdown"), 5_000);
+        rpcShutdownTimer.unref();
+      } else {
+        // Every headless settled receipt starts the same bounded grace window,
+        // regardless of idle/hard timeouts: close completion is the receipt.
+        armSettleGrace();
+      }
+    };
     const summaryPromise = backend === "agy"
       ? summarizeAgyStream(child.stdout, { onActivity: markActivity, onAttention: markAttention, onSettled, classifyAttention })
-      : backend === "claude"
-        ? summarizeClaudeStream(child.stdout, { onActivity: markActivity, onAttention: markAttention, onSettled, classifyAttention })
+      : backend === "claude" || backend === "grok"
+        ? summarizeClaudeStream(child.stdout, { onActivity: markActivity, onAttention: markAttention, onSettled, classifyAttention, backendName: backend })
         : summarizeStream(child.stdout, markActivity, markAttention, onResponse, onSettled);
     const stderrPromise = collectTail(child.stderr, markActivity, markAttention);
+    let streamError = null;
+    let handleStreamReject;
+    const streamRejectPromise = new Promise((_, reject) => {
+      handleStreamReject = reject;
+    });
+    summaryPromise.catch((err) => {
+      streamError ||= err;
+      stopChild();
+      stopOwnedProcessGroup(child);
+      handleStreamReject(err);
+    });
+    stderrPromise.catch((err) => {
+      streamError ||= err;
+      stopChild();
+      stopOwnedProcessGroup(child);
+      handleStreamReject(err);
+    });
     hardTimeout = initial.hardTimeoutSeconds > 0 ? setTimeout(() => {
       stopForTimeout("hard");
     }, initial.hardTimeoutSeconds * 1000) : null;
+    if (!live && initial.silentReminderSeconds > 0) {
+      const armSilentReminder = () => {
+        if (timedOut || settled) return;
+        silentReminderTimer = setTimeout(() => {
+          if (timedOut || settled) return;
+          const now = Date.now();
+          // One soft alert per silent span; real activity restarts the span
+          // and may therefore start a fresh reminder cycle later.
+          if (silentPeriodStartedAt !== null && !silentSpanNotified && now - silentPeriodStartedAt >= initial.silentReminderSeconds * 1000) {
+            silentSpanNotified = true;
+            const spanSeconds = Math.round((now - silentPeriodStartedAt) / 100) / 10;
+            const spanMark = new Date(silentPeriodStartedAt).toISOString();
+            markAttention("silent_reminder", `No backend event for ${spanSeconds} seconds since ${spanMark}; the worker is still running.`);
+          }
+          armSilentReminder();
+        }, initial.silentReminderSeconds * 1000);
+        silentReminderTimer.unref();
+      };
+      armSilentReminder();
+    }
     if (live) {
       sendRpc({ id: `prompt-${runId}`, type: "prompt", message: prompt });
       drainSteer();
     }
-    ({ exitCode, signal, launchError } = await new Promise((resolveExit) => {
-      child.once("error", (error) => resolveExit({ exitCode: null, signal: null, launchError: error.message }));
-      child.once("close", (code, childSignal) => resolveExit({ exitCode: code, signal: childSignal, launchError: null }));
-    }));
+    try {
+      ({ exitCode, signal, launchError } = await Promise.race([
+        exitPromise,
+        streamRejectPromise,
+      ]));
+    } catch (err) {
+      launchError = err.message;
+    }
     stopOwnedProcessGroup(child);
     updateProgress(undefined, "finalizing");
-    [summary, stderr] = await Promise.all([summaryPromise, stderrPromise]);
+    if (!launchError && !streamError) {
+      try {
+        [summary, stderr] = await Promise.all([summaryPromise, stderrPromise]);
+      } catch (err) {
+        launchError = err.message;
+      }
+    } else {
+      launchError ||= streamError?.message;
+      try {
+        [summary, stderr] = await Promise.all([
+          summaryPromise.catch(() => summary),
+          stderrPromise.catch(() => stderr),
+        ]);
+      } catch {}
+    }
   } catch (error) {
     launchError = error.message;
   } finally {
@@ -1099,6 +1468,9 @@ async function supervise(options, piArgs) {
     if (forceTimer) clearTimeout(forceTimer);
     if (rpcShutdownTimer) clearTimeout(rpcShutdownTimer);
     if (startupAttentionTimer) clearTimeout(startupAttentionTimer);
+    if (silentReminderTimer) clearTimeout(silentReminderTimer);
+    if (progressStallTimer) clearTimeout(progressStallTimer);
+    if (settleGraceTimer) clearTimeout(settleGraceTimer);
     if (progressTimer) clearTimeout(progressTimer);
     if (steerFallback) clearInterval(steerFallback);
     if (steerSignal) process.off("SIGUSR2", steerSignal);
@@ -1116,11 +1488,12 @@ async function supervise(options, piArgs) {
   try { patch = capturePatch(initial, directory); } catch (error) { patchError = error.message; }
   const assistantFailed = summary.lastAssistant?.stopReason === "error" || summary.lastAssistant?.error;
   const emptyFinal = !summary.lastAssistant?.text?.trim();
-  const success = !cancelRequested && exitCode === 0 && summary.settled && !assistantFailed && !emptyFinal && !launchError && !timedOut && !patchError && !playwrightCleanupError;
+  const success = !cancelRequested && exitCode === 0 && settled && summary.settled && !assistantFailed && !emptyFinal && !launchError && !timedOut && !settleShutdownMarked && !patchError && !playwrightCleanupError;
   const reason = success ? null : (
     (cancelRequested ? cancelReason : null) ?? patchError ?? playwrightCleanupError ?? launchError
     ?? (timedOut ? `${timeoutType} timeout` : null) ?? summary.lastAssistant?.error
-    ?? (!summary.settled ? (backend === "agy" ? "missing Agy terminal result" : backend === "claude" ? "missing Claude terminal result" : "missing agent_settled") : null)
+    ?? (!summary.settled ? (backend === "agy" ? "missing Agy terminal result" : backend === "claude" ? "missing Claude terminal result" : backend === "grok" ? "missing Grok terminal result" : "missing agent_settled") : null)
+    ?? (settleShutdownMarked ? "unclean shutdown after the terminal event" : null)
     ?? (emptyFinal ? "empty final response" : `exit ${exitCode}`)
   );
   const reasonCode = success ? null : (
@@ -1131,7 +1504,8 @@ async function supervise(options, piArgs) {
             : timedOut ? `${timeoutType}_timeout`
               : summary.lastAssistant?.error ? "provider_error"
                 : !summary.settled ? "missing_settled"
-                  : emptyFinal ? "empty_final" : "process_exit"
+                  : settleShutdownMarked ? "shutdown_problem"
+                    : emptyFinal ? "empty_final" : "process_exit"
   );
   let failureLogPath = null;
   if (!success) {
@@ -1174,15 +1548,35 @@ async function supervise(options, piArgs) {
     tools: summary.tools,
     attention,
     attentions,
+    providerRetryCount: summary.providerRetryCount ?? null,
+    // Success and explicit cancellation clear current advice even after a
+    // transient alert; only failed runs keep terminal guidance. Null/absent
+    // and soft categories (startup_silent/silent_reminder/progress_stalled)
+    // never claim "unknown error" — they resolve to null.
+    retryGuidance: (success || cancelRequested)
+      ? null
+      : buildRetryGuidance({
+        category: attention?.category ?? null,
+        terminal: true,
+        providerRetryCount: summary.providerRetryCount ?? null,
+      }),
     progressWrites,
     ...patch,
     failureLogPath,
     reviewPending: initial.mode !== "read",
     cleanupRequired: true,
+    worker: {
+      version: WORKER_VERSION,
+      brand: WORKER_BRAND,
+    },
+    dispatcher: dispatcherFacts(),
+    backendVersion: backendVersion(),
     finishedAt: new Date().toISOString(),
     elapsedSeconds: Math.round((Date.now() - startedMs) / 100) / 10,
   });
   try { unlinkSync(join(directory, "cancel.json")); } catch {}
+  // The last attention may have arrived while the terminal receipt was being
+  // written; make one final pass so every waiter wakes on the durable state.
   notifyWaiter(directory);
 }
 
@@ -1190,7 +1584,7 @@ function startSupervisor(root, runId, piArgs) {
   const supervisor = spawn(
     process.execPath,
     [SCRIPT, "supervise", "--run-id", runId, "--state-root", root, "--", ...piArgs],
-    { detached: true, env: { ...process.env, PI_WORKER_STATE_ROOT: root }, stdio: "ignore" },
+    { detached: true, env: { ...process.env, [prefixed("STATE_ROOT")]: root }, stdio: "ignore" },
   );
   supervisor.unref();
   return supervisor.pid;
@@ -1200,7 +1594,7 @@ function dispatch(options, piArgs) {
   const root = stateRoot(options);
   const runId = validateRunId(one(options, "run-id"));
   const backend = one(options, "backend", "pi");
-  if (!["pi", "agy", "claude"].includes(backend)) fail("--backend must be pi, agy, or claude");
+  if (!["pi", "agy", "claude", "grok"].includes(backend)) fail("--backend must be pi, agy, claude, or grok");
   const mode = one(options, "mode", one(options, "source") ? "write" : "read");
   if (!["read", "write", "in-place"].includes(mode)) fail("--mode must be read, write, or in-place");
   if (piArgs.length === 0) fail("dispatch requires backend arguments after --");
@@ -1213,10 +1607,17 @@ function dispatch(options, piArgs) {
     if (backend === "agy") {
       const { prompt, args } = extractPrompt(piArgs);
       selection = selectAgy(args);
+      selection.args = applyNativePermissions(backend, selection.args);
       effectiveArgs = [...selection.args, prompt];
     } else if (backend === "claude") {
       const { prompt, args } = extractPrompt(piArgs);
       selection = selectClaude(args);
+      selection.args = applyNativePermissions(backend, selection.args);
+      effectiveArgs = [...selection.args, prompt];
+    } else if (backend === "grok") {
+      const { prompt, args } = extractPrompt(piArgs);
+      selection = selectGrok(args);
+      selection.args = applyNativePermissions(backend, selection.args);
       effectiveArgs = [...selection.args, prompt];
     } else {
       selection = applyDispatchProfile(piArgs);
@@ -1232,6 +1633,10 @@ function dispatch(options, piArgs) {
   if (!Number.isFinite(idleTimeoutSeconds) || idleTimeoutSeconds < 0) fail("--idle-timeout must be zero or positive");
   const startupAttentionSeconds = Number(one(options, "startup-attention", String(DEFAULT_STARTUP_ATTENTION_SECONDS)));
   if (!Number.isFinite(startupAttentionSeconds) || startupAttentionSeconds < 0) fail("--startup-attention must be zero or positive");
+  const silentReminderSeconds = Number(one(options, "silent-reminder", String(DEFAULT_SILENT_REMINDER_SECONDS)));
+  if (!Number.isFinite(silentReminderSeconds) || silentReminderSeconds < 0) fail("--silent-reminder must be zero or positive");
+  const progressReminderSeconds = Number(one(options, "progress-reminder", String(mode === "read" ? 0 : DEFAULT_PROGRESS_REMINDER_SECONDS)));
+  if (!Number.isFinite(progressReminderSeconds) || progressReminderSeconds < 0) fail("--progress-reminder must be zero or positive");
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const directory = runDirectory(root, runId);
   if (existsSync(directory)) fail(`run already exists: ${runId}`);
@@ -1266,10 +1671,14 @@ function dispatch(options, piArgs) {
     state: "starting",
     activity: "waiting_event",
     mode,
+    worker: { version: WORKER_VERSION, brand: WORKER_BRAND },
+    dispatcher: dispatcherFacts(),
+    backendVersion: null,
     sourceRoot: workspace.sourceRoot,
     workdir: workspace.worktree,
     managedWorktree: workspace.managedWorktree,
     sessionDir,
+    grokSession: backend === "grok" ? createGrokSession(workspace.worktree) : null,
     agentDir,
     turnIndex: 1,
     firstEventAt: null,
@@ -1292,6 +1701,8 @@ function dispatch(options, piArgs) {
     hardTimeoutSeconds,
     idleTimeoutSeconds,
     startupAttentionSeconds,
+    silentReminderSeconds,
+    progressReminderSeconds,
     attention: null,
     attentions: [],
     dispatchedAt: new Date().toISOString(),
@@ -1314,12 +1725,13 @@ function continueRun(options, promptArgs) {
   if (backend === "pi" && (!previous.sessionDir || !existsSync(previous.sessionDir))) fail(`managed session is unavailable: ${runId}`);
   if (backend === "agy" && !previous.conversationId) fail(`Agy conversation is unavailable: ${runId}`);
   if (backend === "claude" && !previous.conversationId) fail(`Claude session is unavailable: ${runId}`);
+  if (backend === "grok" && (!previous.conversationId || previous.conversationId !== previous.grokSession?.id)) fail(`Owned Grok session is unavailable: ${runId}`);
   if (!existsSync(previous.workdir)) fail(`worker directory is unavailable: ${previous.workdir}`);
   let effectiveArgs;
-  if (backend === "agy" || backend === "claude") {
+  if (backend === "agy" || backend === "claude" || backend === "grok") {
     const { prompt, args } = extractPrompt(promptArgs);
     if (args.length > 0) fail(`${backend} continue accepts only one prompt after --`);
-    effectiveArgs = [...(previous.backendArgs ?? []), prompt];
+    effectiveArgs = [...applyNativePermissions(backend, previous.backendArgs ?? []), prompt];
   } else {
     const selection = applyDispatchProfile([
       "--provider", previous.provider,
@@ -1334,6 +1746,10 @@ function continueRun(options, promptArgs) {
   if (!Number.isFinite(idleTimeoutSeconds) || idleTimeoutSeconds < 0) fail("--idle-timeout must be zero or positive");
   const startupAttentionSeconds = Number(one(options, "startup-attention", String(previous.startupAttentionSeconds ?? DEFAULT_STARTUP_ATTENTION_SECONDS)));
   if (!Number.isFinite(startupAttentionSeconds) || startupAttentionSeconds < 0) fail("--startup-attention must be zero or positive");
+  const silentReminderSeconds = Number(one(options, "silent-reminder", String(previous.silentReminderSeconds ?? DEFAULT_SILENT_REMINDER_SECONDS)));
+  if (!Number.isFinite(silentReminderSeconds) || silentReminderSeconds < 0) fail("--silent-reminder must be zero or positive");
+  const progressReminderSeconds = Number(one(options, "progress-reminder", String(previous.progressReminderSeconds ?? (previous.mode === "read" ? 0 : DEFAULT_PROGRESS_REMINDER_SECONDS))));
+  if (!Number.isFinite(progressReminderSeconds) || progressReminderSeconds < 0) fail("--progress-reminder must be zero or positive");
   const turns = [...(previous.turns ?? []), {
     turnIndex: previous.turnIndex ?? 1,
     state: previous.state,
@@ -1350,6 +1766,9 @@ function continueRun(options, promptArgs) {
     tools: previous.tools ?? [],
     conversationId: previous.conversationId ?? null,
     backendTurns: previous.backendTurns ?? null,
+    providerRetryCount: previous.providerRetryCount ?? null,
+    retryGuidance: previous.retryGuidance ?? null,
+    worker: previous.worker ?? { version: WORKER_VERSION, brand: WORKER_BRAND },
     finishedAt: previous.finishedAt,
   }];
   let supervisorPid;
@@ -1366,6 +1785,7 @@ function continueRun(options, promptArgs) {
         childPid: null,
         agentDir,
         resumeConversationId: backend === "pi" ? null : previous.conversationId,
+        backendArgs: backend === "pi" ? previous.backendArgs : extractPrompt(effectiveArgs).args,
         turnIndex: (previous.turnIndex ?? 1) + 1,
         turns,
         firstEventAt: null,
@@ -1391,9 +1811,20 @@ function continueRun(options, promptArgs) {
         tools: [],
         attention: null,
         attentions: [],
+        providerRetryCount: null,
+        retryGuidance: null,
+        // Stamp the actually running runtime on every continued turn; the old
+        // facts stay in turns[] history (worker field above) instead of
+        // claiming the previous launcher is still running.
+        worker: { version: WORKER_VERSION, brand: WORKER_BRAND },
+        dispatcher: previous.dispatcher ?? dispatcherFacts(),
+        backendVersion: null,
         live: options.has("live"),
         idleTimeoutSeconds,
         startupAttentionSeconds,
+        silentReminderSeconds,
+        progressReminderSeconds,
+        elapsedSeconds: null,
         failureLogPath: null,
         dispatchedAt: new Date().toISOString(),
         finishedAt: null,
@@ -1485,6 +1916,9 @@ function resultReceipt(root, result) {
     backendTurns: result.backendTurns ?? null,
     backendDeniedActionCount: result.backendDeniedActionCount ?? 0,
     elapsedSeconds: result.elapsedSeconds,
+    worker: result.worker,
+    dispatcher: result.dispatcher,
+    backendVersion: result.backendVersion,
     assistantCalls: result.assistantCalls,
     usage: result.usage,
     reportedReasoningTokens: result.reportedReasoningTokens,
@@ -1493,7 +1927,11 @@ function resultReceipt(root, result) {
     reasonCode: result.reasonCode,
     attention: result.attention,
     attentions: result.attentions ?? (result.attention ? [result.attention] : []),
+    providerRetryCount: result.providerRetryCount ?? null,
+    retryGuidance: result.retryGuidance ?? null,
     startupAttentionSeconds: result.startupAttentionSeconds,
+    silentReminderSeconds: result.silentReminderSeconds,
+    progressReminderSeconds: result.progressReminderSeconds,
     progressWrites: result.progressWrites,
     finalText: finalText.slice(0, 2048),
     finalTextTruncated: finalText.length > 2048,
@@ -1532,6 +1970,14 @@ function reconcileVanished(root, ids) {
         const failureLogPath = join(directory, "failure.log");
         writeFileSync(failureLogPath, `${redactText([reason, patchError].filter(Boolean).join("\n\n"))}\n`, { mode: 0o600 });
         const started = Date.parse(current.startedAt ?? current.dispatchedAt ?? "");
+        const previousAttentions = Array.isArray(current.attentions)
+          ? [...current.attentions]
+          : (current.attention ? [current.attention] : []);
+        const writtenAttentions = attentionEvents(readJson(join(directory, "attention.json")));
+        const merged = [...writtenAttentions];
+        for (const entry of previousAttentions) {
+          if (!merged.some((item) => attentionFingerprint(item.category, item.detail) === attentionFingerprint(entry.category, entry.detail))) merged.push(entry);
+        }
         atomicJson(path, {
           ...current,
           schema: 3,
@@ -1540,6 +1986,11 @@ function reconcileVanished(root, ids) {
           activeTools: [],
           reason,
           reasonCode: "supervisor_lost",
+          attention: merged.at(-1) ?? null,
+          attentions: merged,
+          worker: current.worker ?? { version: WORKER_VERSION, brand: WORKER_BRAND },
+          dispatcher: current.dispatcher ?? dispatcherFacts(),
+          backendVersion: current.backendVersion ?? backendVersion(),
           exitCode: null,
           signal: null,
           ...patch,
@@ -1607,17 +2058,44 @@ async function cancelRun(options) {
   if (results.some((result) => result.state === "failed")) process.exitCode = 3;
 }
 
-function pendingAttention(root, ids) {
+function pendingAttention(root, ids, consumer) {
   return ids.flatMap((runId) => {
     const directory = runDirectory(root, runId);
     const path = join(directory, "attention.json");
     return attentionEvents(readJson(path)).flatMap((attention) => {
-      const receipt = attentionReceipt(directory, attention);
-      return !attention.delivered && !existsSync(receipt)
+      // The readiness check and the atomic claim must agree on the exact same
+      // receipt file: attentionReceipt maps the default consumer onto the
+      // legacy global path, so default claims are never split between a legacy
+      // and a suffixed file (old receipts stay compatible), while any explicit
+      // named consumer gets its own namespace and is never shadowed by a
+      // legacy default receipt.
+      const receipt = attentionReceipt(directory, attention, consumer);
+      // A claimed delivery is a regular receipt file; a directory or any other
+      // foreign object at that path is an IO fault, not a delivery, so the
+      // alert stays ready and the claim surfaces the error instead of being
+      // mistaken for already-notified.
+      let claimed = false;
+      try {
+        claimed = existsSync(receipt) && statSync(receipt).isFile();
+      } catch {
+        claimed = false;
+      }
+      return !attention.delivered && !claimed
         ? [{ runId, receipt, attention }]
         : [];
     });
   });
+}
+
+function consumerFromOptions(options, env = process.env) {
+  // An explicit --consumer wins; otherwise the available thread id is the
+  // stable default, falling back to the literal default consumer. Both spell
+  // the same scope (the legacy receipt namespace).
+  const explicit = consumerName(one(options, "consumer"));
+  if (explicit) return explicit === DEFAULT_CONSUMER ? DEFAULT_CONSUMER : explicit;
+  const thread = env.CODEX_THREAD_ID || "";
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(thread)) return thread;
+  return DEFAULT_CONSUMER;
 }
 
 async function waitForResults(options) {
@@ -1627,50 +2105,104 @@ async function waitForResults(options) {
   const timeoutSeconds = Number(one(options, "timeout", "0"));
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) fail("--timeout must be zero or positive");
   for (const id of ids) if (!existsSync(runDirectory(root, id))) fail(`unknown run: ${id}`);
+  const full = one(options, "full") === "true";
+  const consumer = consumerFromOptions(options);
   reconcileVanished(root, ids);
+  const readyAttention = () => pendingAttention(root, ids, consumer);
   const terminalReady = () => currentResults(root, ids).some((item) => terminal(item.result));
-  const attentionReady = () => pendingAttention(root, ids).length > 0;
-  if (!terminalReady() && !attentionReady()) {
-    await new Promise((resolveWait, rejectWait) => {
-      let finished = false;
-      const fallback = setInterval(check, FALLBACK_MS);
-      const timeout = timeoutSeconds > 0 ? setTimeout(() => finish(new Error("wait timed out")), timeoutSeconds * 1000) : null;
-      process.on("SIGUSR1", check);
-      const waiterPaths = ids.map((id) => {
-        const directory = eventDirectory(runDirectory(root, id));
-        mkdirSync(directory, { recursive: true, mode: 0o700 });
-        const path = join(directory, `${process.pid}.json`);
-        atomicJson(path, { pid: process.pid, registeredAt: new Date().toISOString() });
-        return path;
+  const claimReady = () => {
+    // claimAttention returns null only when a concurrent twin claimed this
+    // delivery first (EEXIST). Any other receipt IO failure is a real error:
+    // it must fail the wait loudly instead of being misreported as notified.
+    const claimedAny = [];
+    for (const alert of readyAttention()) {
+      try {
+        const receipt = claimAttention(runDirectory(root, alert.runId), alert.attention, consumer);
+        if (receipt) claimedAny.push({ ...alert, receipt });
+      } catch (error) {
+        // A real receipt IO fault (anything but a lost EEXIST race) must fail
+        // this wait loudly; it is never reported as a delivered notification.
+        throw new Error(`attention claim failed for ${alert.runId}: ${error.message}`);
+      }
+    }
+    return claimedAny;
+  };
+  const deadline = timeoutSeconds > 0 ? Date.now() + timeoutSeconds * 1000 : null;
+  let claimed = [];
+  let turnResolve = null;
+  let turnTimer = null;
+  const wakeTurn = () => {
+    const resolve = turnResolve;
+    turnResolve = null;
+    if (resolve) resolve();
+  };
+  const onSignal = () => wakeTurn();
+  process.on("SIGUSR1", onSignal);
+  let waiterPaths = [];
+  const cleanupWaiters = () => {
+    for (const path of waiterPaths) try { unlinkSync(path); } catch {}
+    for (const directory of new Set(waiterPaths.map(dirname))) try { rmdirSync(directory); } catch {}
+  };
+  let fallback = null;
+  let waitError = null;
+  try {
+    // Register this waiter once for the whole command; every wait turn reuses
+    // the same slot so a waiter that loses a claim to a concurrent twin stays in
+    // this wait (same overall deadline) until a terminal state or a delivery it
+    // actually wins, never returning a fabricated "completed".
+    waiterPaths = ids.map((id) => {
+      const directory = eventDirectory(runDirectory(root, id));
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      const path = join(directory, `${process.pid}.json`);
+      atomicJson(path, { pid: process.pid, consumer, registeredAt: new Date().toISOString() });
+      return path;
+    });
+    fallback = setInterval(() => {
+      reconcileVanished(root, ids);
+      if (turnResolve && (terminalReady() || readyAttention().length > 0)) wakeTurn();
+    }, FALLBACK_MS);
+    for (;;) {
+      reconcileVanished(root, ids);
+      if (terminalReady()) break;
+      claimed = claimReady();
+      if (claimed.length > 0) break;
+      if (deadline !== null && Date.now() >= deadline) {
+        waitError = new Error("wait timed out");
+        break;
+      }
+      await new Promise((resolveTurn) => {
+        turnResolve = resolveTurn;
+        const remaining = deadline === null ? 0 : deadline - Date.now();
+        if (remaining > 0) {
+          turnTimer = setTimeout(() => {
+            turnTimer = null;
+            if (turnResolve) {
+              turnResolve = null;
+              resolveTurn();
+            }
+          }, remaining);
+        }
       });
-      function finish(error = null) {
-        if (finished) return;
-        finished = true;
-        clearInterval(fallback);
-        if (timeout) clearTimeout(timeout);
-        for (const path of waiterPaths) try { unlinkSync(path); } catch {}
-        for (const directory of new Set(waiterPaths.map(dirname))) try { rmdirSync(directory); } catch {}
-        error ? rejectWait(error) : resolveWait();
+      if (turnTimer) {
+        clearTimeout(turnTimer);
+        turnTimer = null;
       }
-      function check() {
-        if (finished) return;
-        reconcileVanished(root, ids);
-        if (terminalReady() || attentionReady()) return finish();
-      }
-      check();
-    }).catch((error) => fail(error.message, 3));
+      turnResolve = null;
+    }
+  } catch (error) {
+    waitError = error;
+  } finally {
+    cleanupWaiters();
+    if (fallback) clearInterval(fallback);
+    if (turnTimer) clearTimeout(turnTimer);
   }
+  if (waitError) fail(waitError.message, 3);
   reconcileVanished(root, ids);
   const snapshot = currentResults(root, ids);
-  const full = one(options, "full") === "true";
   const results = snapshot.filter((item) => terminal(item.result)).map((item) => full ? item.result : resultReceipt(root, item.result));
   const pending = snapshot.filter((item) => !terminal(item.result)).map((item) => item.runId);
   const failures = snapshot.filter((item) => ["failed", "cancelled"].includes(item.result?.state));
-  const alerts = pendingAttention(root, ids);
-  for (const alert of alerts) {
-    mkdirSync(dirname(alert.receipt), { recursive: true, mode: 0o700 });
-    atomicJson(alert.receipt, { deliveredAt: new Date().toISOString() });
-  }
+  const alerts = claimed;
   if (failures.length > 0) {
     console.log(JSON.stringify({
       state: "failed",
@@ -1715,6 +2247,7 @@ function cleanup(options) {
       worktree = withRunLock(directory, () => {
         const current = readJson(join(directory, "result.json"));
         if (!terminal(current) || current.finishedAt !== result.finishedAt) throw new Error(`run changed before cleanup: ${runId}`);
+        if (current.backend === "grok") cleanupGrokSession(current.grokSession);
         const removal = removeManagedWorktree(current, directory);
         if (removal.errors.length > 0 || (current.managedWorktree && !removal.removed)) {
           throw new Error(`worktree cleanup failed for ${runId}: ${removal.errors.join("; ")}`);
@@ -1746,6 +2279,13 @@ function status(options) {
   })) }));
 }
 
+function diagnose(options) {
+  const root = stateRoot(options);
+  const ids = runIds(options);
+  if (ids.length === 0) fail("diagnose requires at least one --run-id");
+  console.log(JSON.stringify(diagnoseRuns(root, ids)));
+}
+
 const [command, ...argv] = process.argv.slice(2);
 if (["help", "--help", "-h", undefined].includes(command)) {
   console.log(usage());
@@ -1760,12 +2300,14 @@ else if (command === "supervise") await supervise(options, passthrough);
 else if (command === "wait") await waitForResults(options);
 else if (command === "cleanup") cleanup(options);
 else if (command === "status") status(options);
+else if (command === "diagnose") diagnose(options);
 else if (command === "cache-status") console.log(JSON.stringify(cacheReport()));
 else if (command === "profiles") console.log(JSON.stringify({
   backends: {
     pi: { capabilities: ["docs", "lens", "context", "browser"], live: true },
     agy: { efforts: AGY_PROFILES.efforts, defaultEffort: AGY_PROFILES.defaultEffort, live: false },
     claude: { efforts: CLAUDE_PROFILES.efforts, defaultEffort: CLAUDE_PROFILES.defaultEffort, live: false },
+    grok: { ...GROK_PROFILES, live: false },
   },
   models: [...PROFILES].map(([id, profile]) => ({ id, ...profile })),
   capabilities: ["docs", "lens", "context", "browser"],

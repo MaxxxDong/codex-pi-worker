@@ -2,17 +2,24 @@
 
 ## 角色边界
 
-Codex 是调度者和最终责任方：编写任务、选择模式、等待事件、审查 patch、运行独立验证并决定接受或拒绝。Pi、Agy 或 Claude Code 是最内层执行器：在给定 cwd、模型和可选 timeout 内完成一轮任务。
+宿主 IDE（如 Codex 等）是调度者和最终责任方：编写任务、选择模式、等待事件、审查 patch、运行独立验证并决定接受或拒绝。Pi、Agy 或 Claude Code 是最内层执行器：在给定 cwd、模型和可选 timeout 内完成一轮任务。
 
-本项目不修改 Codex 主模型，也不使用 Codex Multi-Agent V2 的 `agent_message` 协议。任务以普通 prompt 进入所选 CLI，因此第三方 Responses provider 是否支持 Codex 专用输入类型，与本 Worker 是两个独立问题。
+本项目不修改宿主主模型，也不使用 Codex Multi-Agent V2 的 `agent_message` 协议。任务以普通 prompt 进入所选 CLI，因此第三方 Responses provider 是否支持 Codex 专用输入类型，与本 Worker 是两个独立问题。
 
-macOS 的执行器边界保持很小：Pi 适配器负责 profile、capability、session 和 JSON/RPC；Agy 适配器负责 CLI 参数与 stream-json；Claude 适配器负责 Claude stream-json、session 和 CommandCode 本机 Messages 桥。worktree、状态、事件等待、取消、patch 与清理全部共享，新增执行器不得复制这些生命周期能力。
+macOS 的执行器边界保持很小：
+- **Pi 适配器**：负责 profile、capability（`docs`、`lens`、`context`、`browser`）、session 与 JSON/RPC 通信，支持 `--live` 和运行中 RPC `steer` 纠偏；
+- **Agy 适配器**：负责 CLI 参数与 stream-json 解析，支持 `--effort`（High/Medium/Low，无 Max），只读/写入权限映射为 `plan`/`accept-edits`，设置 24 小时 internal print wait，不嵌套 `agy-staff`；
+- **Claude 适配器**：负责 Claude stream-json、session 和 CommandCode 本机回环 Messages 桥（或 `--provider native`），只读/写入权限映射为 `plan`/`auto`，默认禁用内部二次编排（`--allow-orchestration` 显式开放）。
+
+worktree、状态、事件等待、取消、patch 与清理全部共享，新增执行器不得复制这些生命周期能力。
 
 ## 组件
 
+### Windows Python 实现
+
 | 文件 | 职责 |
 |---|---|
-| `SKILL.md` | Codex 可见的最短操作协议 |
+| `SKILL.md` | 调度可见的最短操作协议 |
 | `start_pi_worker.py` | 校验、worktree/session 分配、receipt 先提交、后台启动 |
 | `run_pi_worker.py` | 调用 Pi、压缩事件、idle watchdog、attention、result 和 patch |
 | `watch_pi_worker.py` | Windows named event/进程句柄等待 |
@@ -23,34 +30,44 @@ macOS 的执行器边界保持很小：Pi 适配器负责 profile、capability�
 | `steer_pi_worker.py` | receipt 绑定的 Windows named-event RPC steer 客户端 |
 | `cache_gc.py` | Worker 空闲时将自有共享缓存从 20 GiB 修剪到 19 GiB |
 
+### macOS Node.js 实现 (Subworker v0.3.1)
+
+| 文件 | 职责 |
+|---|---|
+| `macos/bin/subworker` | 唯一可执行入口，处理环境映射、typo/未知命令拦截与执行器启动 |
+| `macos/lib/events.mjs` | 核心生命周期（dispatch, continue, steer, cancel, wait, cleanup, status） |
+| `macos/lib/agy-backend.mjs` | Agy CLI stream-json 流式解析、参数组装与状态摘要 |
+| `macos/lib/claude-backend.mjs` | Claude Code stream-json 解析与 CommandCode 临时回环桥 |
+| `macos/lib/cache.mjs` | 宿主依赖缓存（npm, pnpm, uv, pip, Poetry, Lens）LRU 与 20 GiB 约束 |
+
 ## 数据流
 
 ```text
-Codex prompt file
+Host (Codex) prompt file
       |
       v
-start -> validate -> reserve cache -> optional detached worktree
-      -> create session/job -> spawn gated runner
+dispatch / start -> validate -> reserve cache -> optional detached worktree
+      -> create session/job -> spawn gated runner / supervisor
       -> atomically write receipt -> release launch gate
                                   |
                                   v
-                           Pi --mode rpc
+                     Executor (Pi / Agy / Claude)
                                   |
                +------------------+------------------+
-               |                    |                        |
-          compact events      steer named event         stderr classifier
-               |                    |                        |
-       token/tool/final text    RPC stdin queue       attention named event
+               |                  |                  |
+          compact events      steer / signal    stderr / transport
+               |                  |                  |
+       token/tool/final text   turn queue         attention event
                |                                     |
                +------------------+------------------+
                                   v
-                           pi-result.json
+                             result.json
                                   |
-                         watch returns terminal
+                         wait returns terminal
                                   |
-                  Codex review / verify / integrate
+                  Host review / verify / integrate
                          |                    |
-                      continue             finalize
+                      continue             cleanup / finalize
                                               |
                                       settled + cleanup
 ```
@@ -65,20 +82,27 @@ starting -> running -> pending_review -> settled
 - `starting`：job 已登记，runner 尚未通过 receipt launch gate。
 - `running`：receipt 已原子落盘，后台 PID 和 active marker 已登记。
 - `pending_review`：runner 已终态，结果和证据可审查；worktree/session 必须保留。
-- `settled`：Codex 已接受或拒绝，受控临时资源已删除。
+- `settled`：宿主已接受或拒绝，受控临时资源已删除。
 - `orphaned`：进程消失且没有可信 result，需要人工审计；reconcile 不会自动删除证据。
 
 ## 为什么 receipt 先于执行
 
-后台进程先启动、receipt 后写入会产生不可追踪的孤儿任务。当前实现让 runner 阻塞在单字节 launch gate；只有 receipt、job 和 cache marker 都原子提交后才放行。任一步失败都会终止进程树并回滚本轮自有资源。
+后台进程先启动、receipt 后写入会产生不可追踪的孤儿任务。当前实现让 runner 阻塞在单字节 launch gate 或进程启动屏障；只有 receipt、job 和 cache marker 都原子提交后才放行。任一步失败都会终止进程树并回滚本轮自有资源。
 
-## 分析与实现模式
+## 分析与实现模式（平台差异）
 
-- `analysis`：直接在源 cwd 运行，但排除 `bash/edit/write/ast_grep_replace`，适合审查、搜索和研究。
-- `implementation`：要求源 checkout 干净，从当前 HEAD 创建 detached worktree。Pi 的直接写工具只能指向执行 worktree；shell guard 拦截已知路径逃逸和破坏模式。
+不同平台的模式约束因操作系统与历史运行机制存在明确差异，不得将某一平台的特性泛化：
 
-implementation 的隔离是工程防护，不是安全边界。模型仍在用户权限下运行，不能用于不可信代码或恶意 prompt。
+### Windows 平台
+- `analysis` 模式：直接在源 cwd 运行，但严格排除 `bash/edit/write/ast_grep_replace`，适合审查、搜索和研究。
+- `implementation` 模式：要求源 checkout 保持干净（严格 clean-tree 检查），从当前 HEAD 创建 detached worktree。Pi 的直接写工具只能指向执行 worktree；shell guard 拦截已知路径逃逸和破坏模式。
+
+### macOS 平台 (Subworker v0.3.1)
+- `read` 模式：直接在现有仓库运行，提供 `read`、`grep`、`find`、`ls`、`web_search` 以及受提示词约束的 `bash`（仅限只读检查或已知不修改项目文件的命令），排除 `edit/write`。
+- `write` 模式：从源仓库创建轻量 detached Git worktree，并**正常携带**源目录的 staged、unstaged 和非忽略 untracked 文件作为基线（dirty baseline 正常携带，不执行 clean-tree 门禁）。最终生成的 `changes.patch` 仅包含 Worker 在该基线上新产生的改动。
+
+无论哪个平台，implementation/write 的隔离均为工程防护而非操作系统安全边界。模型仍在用户权限下运行，不能用于不可信代码或恶意 prompt。
 
 ## 并发模型
 
-每个 run 有独立 UUID、session、output 和可选 worktree。runtime lock 只保护 job、turn 分配和 cache marker 等短临界区；多个独立 Worker 可并行。不要让两个 implementation Worker 修改同一逻辑范围，最终昂贵的全仓检查应在 Codex 集成后只跑一次。
+每个 run 有独立 UUID、session、output 和可选 worktree。runtime lock 只保护 job、turn 分配和 cache marker 等短临界区；多个独立 Worker 可并行。不要让两个 implementation Worker 修改同一逻辑范围，最终昂贵的全仓检查应在宿主集成后只跑一次。

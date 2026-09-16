@@ -1,5 +1,49 @@
 # 发布记录
 
+## 2026-09-16 - GitHub 发布批次
+
+- 将此前仅保存在本机的 v0.3.0、v0.3.1、v0.3.2、v0.4.0 与 v0.4.1 一次性同步到现有 GitHub 仓库。
+- 用户可见变化集中在 macOS Subworker：统一入口与环境变量、多执行器编排、诊断与重试建议、进展提醒、权限偏好继承，以及 Grok Build 后端。
+- Windows Python runtime 本批没有行为变化；Windows 升级只需在干净工作区拉取 `main`，原有本机 Pi provider、Key、receipt、session 和任务输出不会由仓库更新覆盖。
+
+## v0.4.1 - 2026-09-08
+
+- 按用户授权将 Grok bypass 作为 runtime 默认：dispatch 和 continue 自动提供参数，避免调用 agent 漏传导致后台终端审批取消。旧任务下次续聊同样生效，已运行进程不变。
+- 不修改全局配置；read 模式也跳过原生审批，其只读范围依靠提示约束。定向测试 7/7，覆盖无参数派发和旧任务续聊。
+
+## v0.4.0 - 2026-09-08
+
+- macOS 新增 Grok Build 原生后端，默认 `grok-4.6 / xhigh`；共享派发、消息解析、等待、取消、patch 与审核后清理，不使用旧 grok-worker 生命周期。
+- 显式 `--dangerously-skip-permissions` 映射为 Grok 原生 `bypassPermissions + --always-approve`，不改全局设置。原生登录、Skills、MCP 与插件照常加载。
+- 为任务分配唯一原生 session ID，续聊精确 resume；清理仅删除分配的本地会话，不删除共享或远程历史。未知 reasoning token 不推算。
+- 验证：完整回归 149/150，唯一失败为原版本同样复现的固定 300ms 取消时序用例；最终定向测试 26/26。真实 Grok 4.6 xhigh 工作树实现和同会话追修均成功，最终 9 项任务测试及宿主独立输入检查通过。
+
+## v0.3.2 - 2026-09-05
+
+- macOS dispatch/continue 继承原生全局权限偏好：Agy `toolPermission=always-proceed` 或 Claude `permissions.defaultMode=bypassPermissions` 时显式传入 `--dangerously-skip-permissions`。只对明确选择此设置的机器生效，不改变其他安装的默认权限。
+- 实际参数写入 `backendArgs`，Agy/Claude 的 diagnose 明确报告 bypass；旧 run 续跑也会读取当前全局设置。Pi 不接受该参数，保持原生无审批层的行为。
+- 全权限模式不提供强制文件写入隔离；任务范围和审核后清理仍保留。模式不会自动解决系统文件权限、登录失效或服务端拒绝。
+- 本机验证：146/146 回归通过；三后端真实 Node 写入并读取任务全部成功且无权限拒绝，Agy 15.8s、Claude 18.9s、Pi 7.0s（小型权限冒烟，不是性能排名）。
+
+## v0.3.1 - 2026-09-05
+
+- **按需只读诊断 (`subworker diagnose`)**：新增只读 `diagnose --run-id ID...` 命令，输出记录中的版本、模型、进程存活、工作目录、错误和建议；未记录的信息保持未知。不调和运行状态、不全盘扫描。区分任务缺失、元数据损坏与不可读取。
+- **结构化原生重试建议与计数**：保留结构化 `retryGuidance`（kind, action, retryOwner, message）并字段脱敏；`providerRetryCount` 仅反映真实记录（未记录时保持 `null`，不混淆或猜测无关重试次数）；不引入自动重试、模型/Provider 切换或新生命周期限制。
+- **可选无工具进展提醒**：支持长任务可选进展提醒（`write`/`in-place` 模式默认 600 秒，`read` 模式及显式关闭为 0 秒），作为软提醒通知，不强杀任务。
+- **续跑与测试修正**：续跑清空旧耗时与重试建议，并记录实际运行时版本；测试夹具清除继承的运行目录变量，避免写入正式任务目录。补齐 `steer`、`cancel` 的宿主调用说明。
+- **本机验收**：macOS 144/144 项测试通过；相同写入冒烟中 Pi 16.2s、Claude 22.5s、Agy 35.8s，Root 分别复核 6/6 项冻结测试。耗时为任务端到端时间，不是启动时间。实现阶段使用正式 0.3.0，最终冒烟使用 0.3.1。
+
+## v0.3.0 - 2026-09-05
+
+- **多执行器统一编排与实测验收**：Root 最终验收全量通过 macOS 113/113 项测试；同题真实写任务（4 项断言）三执行器全部通过：Pi CommandCode DeepSeek Flash Max 8.7s、Claude CommandCode Muse Spark 1.3 Contributor Max 16.6s、Agy 3.8 Flash High 19.2s。
+- **品牌与入口收敛**：公开品牌与 Skill 名称统一为 **Subworker**（唯一安装位置为 `~/.codex/skills/subworker`）；旧 `pi-worker` 命令路径仅作为薄转发层（thin forwarder），不保留第二个旧 `SKILL.md`；不向 GitHub 远端虚报已发布。
+- **启动器解析与安全**：macOS 唯一官方入口为 `macos/bin/subworker`。编排子命令严格校验，未知命令或拼写错误直接退出码 2 并报错，杜绝 typo 降级误启；显式子命令 `subworker exec ...` 与 `subworker raw ...` 仅用于非交互式无头裸 Pi（headless bare Pi），脱离调度生命周期。
+- **Agy 后端增强**：自动为 workdir 附加 `--add-dir` 避免多路径工作区逃逸；权限模式统一为 `accept-edits`；支持 `--effort`（High/Medium/Low，无 Max）并保持 24 小时 internal print wait 消除 5 分钟超时限制。
+- **Claude 桥与协议健壮性**：切换为真实上游 SSE Claude 桥，支持交错工具调用（interleaved tools）、客户端断开即时中止（abort on disconnect），并完整保留输入及缓存计量（input/cache accounting）；畸形协议、null 或回调异常会立刻终止所持进程并收敛为失败结果。
+- **并发等待与多会话告警**：修复 `SIGUSR1` 启动与退出时的等待竞态（wait races）；引入 `--consumer <id>`（默认 `$CODEX_THREAD_ID` 或 `default`）实现会话级独立告警回执（per-consumer alerts），多会话并发等待互不覆盖。
+- **通知机制解耦**：明确启动静默 `--startup-attention`（默认 60s 首事件前软提醒）与运行期静默 `--silent-reminder`（默认 600s 无新活动软提醒，收到新事件自动重置）；两者均设 `0` 关闭，绝不作为任务硬性取消。
+- **环境与平台边界**：公开规范环境变量采用 `SUBWORKER_*`，旧 `PI_WORKER_*` 保持兼容输入；`pi-worker/runs` 存储目录保留以兼容既有任务；明确 macOS write 模式携带 staged、unstaged 及未忽略 untracked 脏基线，read 模式允许受约束 bash，Windows 原有干净 HEAD 检查与 bash 禁用逻辑保持不变。
+
 ## v0.2.2 - 2026-09-04
 
 - macOS runtime 新增 `--backend claude`，直接消费 Claude Code stream-json，保存真实 session ID、tool/usage/terminal 状态并支持同 run `continue`。

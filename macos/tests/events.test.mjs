@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -11,7 +12,13 @@ const THINKING_LEVELS_FOR_TEST = new Set(["off", "minimal", "low", "medium", "hi
 
 function command(args, env, allowFailure = false) {
   const result = spawnSync(process.execPath, [events, ...args], { encoding: "utf8", env });
-  if (!allowFailure && result.status !== 0) throw new Error(result.stderr || result.stdout);
+  if (!allowFailure && (result.status !== 0 || result.signal)) {
+    const detail = result.stderr?.trim() || result.stdout?.trim() || `command failed: status=${result.status} signal=${result.signal}`;
+    const error = new Error(detail);
+    error.status = result.status;
+    error.signal = result.signal;
+    throw error;
+  }
   return { ...result, json: result.stdout ? JSON.parse(result.stdout) : null };
 }
 
@@ -37,6 +44,38 @@ function waitAll(ids, env) {
   return ids.map((id) => byId.get(id));
 }
 
+// Attention interrupts every wait (exit 4 with alerts). Drain until the run
+// reaches a terminal state, claiming one alert per iteration per consumer.
+// Terminal states surface as state "settled"/"completed" (success, exit 0) or
+// "failed" (exit 3).
+function drainUntilTerminal(ids, env, consumerArgs = []) {
+  const byId = new Map();
+  let last = null;
+  for (let iteration = 0; iteration < 40; iteration += 1) {
+    const waited = command(["wait", "--full", ...ids.flatMap((id) => ["--run-id", id]), ...consumerArgs, "--timeout", "10"], env, true);
+    last = waited.json;
+    for (const result of last.results ?? []) byId.set(result.runId, result);
+    const remaining = ids.filter((id) => !byId.has(id));
+    if (remaining.length === 0) break;
+    if (last.state !== "attention") {
+      if (waited.status !== 0 || last.pending?.length > 0) break;
+    }
+  }
+  return { last, byId };
+}
+
+function cleanSubprocessEnv(overrides = {}) {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("SUBWORKER_") || key.startsWith("PI_WORKER_")) {
+      delete env[key];
+    }
+  }
+  delete env.CODEX_THREAD_ID;
+  delete env.PI_CODING_AGENT_DIR;
+  return Object.assign(env, overrides);
+}
+
 function testEnv(temporary, launcher) {
   const caches = [join(temporary, ".npm"), join(temporary, ".cache", "uv")];
   caches.forEach((path) => mkdirSync(path, { recursive: true }));
@@ -45,14 +84,14 @@ function testEnv(temporary, launcher) {
   for (const name of ["auth.json", "models.json", "models-store.json", "settings.json"]) {
     writeFileSync(join(agent, name), "{}\n");
   }
-  return {
-    ...process.env,
+  return cleanSubprocessEnv({
+    HOME: temporary,
     PI_WORKER_STATE_ROOT: join(temporary, "state"),
     PI_WORKER_LAUNCHER: launcher,
     PI_WORKER_AGENT_SOURCE: agent,
     PI_WORKER_TEST_CACHE_ROOTS: caches.join(delimiter),
     PI_WORKER_CACHE_MAX_BYTES: String(1024 * 1024),
-  };
+  });
 }
 
 function fakeLauncher(temporary, body) {
@@ -356,6 +395,158 @@ ${successEvents}`);
   }
 });
 
+test("named consumers each receive the same alert while the legacy default receipt stays separate", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-consumers-"));
+  const fake = fakeLauncher(temporary, `
+process.stderr.write("HTTP 429 too many requests\\n");
+await new Promise((resolve) => setTimeout(resolve, 500));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "consumers", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    // The alert interrupts the first waiter of each independent consumer while
+    // the run is still pending: named consumer, then the legacy default.
+    const firstNamed = command(["wait", "--full", "--run-id", "consumers", "--consumer", "root", "--timeout", "10"], env, true);
+    assert.equal(firstNamed.status, 4);
+    assert.equal(firstNamed.json.alerts[0].category, "rate_limit");
+    const other = command(["wait", "--full", "--run-id", "consumers", "--consumer", "peer", "--timeout", "10"], env, true);
+    assert.equal(other.status, 4);
+    assert.equal(other.json.alerts[0].category, "rate_limit");
+    const legacy = command(["wait", "--full", "--run-id", "consumers", "--timeout", "10"], env, true);
+    assert.equal(legacy.status, 4);
+    assert.equal(legacy.json.alerts[0].category, "rate_limit");
+    // The same named consumer sees nothing new after its delivery, and the run
+    // reaches success with the alert retained once per consumer receipt.
+    const terminal = drainUntilTerminal(["consumers"], env, ["--consumer", "root"]).byId.get("consumers");
+    assert.equal(terminal.state, "success");
+    assert.deepEqual(terminal.attentions.map((alert) => alert.category), ["rate_limit"]);
+    command(["cleanup", "--reviewed", "yes", "--run-id", "consumers"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("concurrent named waiters atomically claim one delivery per consumer", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-consumer-claim-"));
+  const fake = fakeLauncher(temporary, [
+    'process.stderr.write("HTTP 429 too many requests\\n");',
+    "await new Promise((resolve) => setTimeout(resolve, 600));",
+    successEvents,
+  ].join("\n"));
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "claim", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const args = ["wait", "--full", "--run-id", "claim", "--consumer", "root", "--timeout", "5"];
+    const [first, second] = await Promise.all([commandAsync(args, env), commandAsync(args, env)]);
+    assert.ok([0, 4].includes(first.status), first.stderr);
+    assert.ok([0, 4].includes(second.status), second.stderr);
+    const alerts = [first.json, second.json].map((value) => value.alerts?.length ?? 0).reduce((total, count) => total + count, 0);
+    assert.equal(alerts, 1, "exactly one concurrent waiter may deliver the alert");
+    const terminal = drainUntilTerminal(["claim"], env, ["--consumer", "root"]).byId.get("claim");
+    assert.equal(terminal.state, "success");
+    assert.equal(terminal.attentions.length, 1);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("wait defaults to CODEX_THREAD_ID when no consumer is given", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-consumer-default-"));
+  const fake = fakeLauncher(temporary, `
+process.stderr.write("HTTP 429 too many requests\\n");
+await new Promise((resolve) => setTimeout(resolve, 1500));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  env.CODEX_THREAD_ID = "thread-abc";
+  try {
+    command(["dispatch", "--run-id", "consumer-default", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const first = command(["wait", "--full", "--run-id", "consumer-default", "--timeout", "10"], env, true);
+    assert.equal(first.status, 4);
+    assert.equal(first.json.alerts[0].category, "rate_limit");
+    // The same thread id (default consumer) sees nothing new after delivery;
+    // the other thread id is a different consumer and receives its own copy.
+    const args = ["wait", "--full", "--run-id", "consumer-default", "--timeout", "10"];
+    const sameEnv = { ...env, CODEX_THREAD_ID: "thread-abc" };
+    const otherEnv = { ...env, CODEX_THREAD_ID: "thread-xyz" };
+    const [same, other] = await Promise.all([
+      new Promise((resolveWait) => {
+        const child = spawn(process.execPath, [events, ...args], { env: sameEnv });
+        let stdout = ""; let stderr = "";
+        child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+        child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+        child.on("close", (status) => resolveWait({ status, stderr, json: stdout ? JSON.parse(stdout) : null }));
+      }),
+      new Promise((resolveWait) => {
+        const child = spawn(process.execPath, [events, ...args], { env: otherEnv });
+        let stdout = ""; let stderr = "";
+        child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+        child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+        child.on("close", (status) => resolveWait({ status, stderr, json: stdout ? JSON.parse(stdout) : null }));
+      }),
+    ]);
+    assert.equal(same.status, 0, same.stderr);
+    assert.deepEqual(same.json.alerts, []);
+    assert.equal(same.json.results[0].state, "success");
+    assert.equal(other.status, 4, other.stderr);
+    assert.equal(other.json.alerts[0].category, "rate_limit");
+    assert.deepEqual(other.json.pending, ["consumer-default"]);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("reading result.json directly does not consume attention for later waiters", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-observe-"));
+  const fake = fakeLauncher(temporary, `
+process.stderr.write("HTTP 429 too many requests\\n");
+await new Promise((resolve) => setTimeout(resolve, 500));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "observe", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    let seen = null;
+    for (let index = 0; index < 100; index += 1) {
+      const path = join(env.PI_WORKER_STATE_ROOT, "observe", "attention.json");
+      if (existsSync(path)) {
+        seen = JSON.parse(readFileSync(path, "utf8"));
+        if (seen?.events?.length > 0) break;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+    assert.equal(seen.events[0].category, "rate_limit");
+    // The consumer still receives the alert afterwards: a plain read consumed
+    // nothing. The alert may already be terminal by then; drain until success
+    // and require the alert to have been part of the delivery history.
+    const terminal = drainUntilTerminal(["observe"], env).byId.get("observe");
+    assert.equal(terminal.state, "success");
+    assert.equal(terminal.attentions[0].category, "rate_limit");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "observe"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("the upstream truncation phrase is classified as transport attention", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-transport-phrase-"));
+  const fake = fakeLauncher(temporary, `
+process.stderr.write("Upstream stream ended before terminal chunk.\\n");
+await new Promise((resolve) => setTimeout(resolve, 400));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "transport-phrase", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const alert = command(["wait", "--full", "--run-id", "transport-phrase", "--timeout", "10"], env, true);
+    assert.equal(alert.status, 4);
+    assert.equal(alert.json.alerts[0].category, "transport");
+    const terminal = drainUntilTerminal(["transport-phrase"], env).byId.get("transport-phrase");
+    assert.equal(terminal.state, "success");
+    assert.ok(terminal.attentions.some((entry) => entry.category === "transport"));
+    command(["cleanup", "--reviewed", "yes", "--run-id", "transport-phrase"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
 test("a silent startup raises attention without stopping the worker", () => {
   const temporary = mkdtempSync(join(tmpdir(), "pi-worker-startup-silent-"));
   const fake = fakeLauncher(temporary, `
@@ -372,6 +563,133 @@ ${successEvents}`);
     assert.equal(terminal.results[0].state, "success");
     assert.equal(terminal.results[0].startupAttentionSeconds, 0.15);
     command(["cleanup", "--reviewed", "yes", "--run-id", "startup-silent"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("startup_silent no longer cancels the first reminder once the backend wakes", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-reminder-"));
+  // Startup stays silent (startup_silent fires), then one event wakes the run,
+  // then silence continues: the post-wake phase must still produce exactly one
+  // silent_reminder soft alert and finish successfully without any hard
+  // timeout.
+  const fake = fakeLauncher(temporary, `
+await new Promise((resolve) => setTimeout(resolve, 300));
+console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"test",model:"fake",stopReason:"toolUse",content:[{type:"text",text:"WORKING"}],usage:{input:1,output:1}}}));
+await new Promise((resolve) => setTimeout(resolve, 700));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  env.CODEX_THREAD_ID = "thread-reminder";
+  try {
+    command(["dispatch", "--run-id", "reminder", "--workdir", temporary, "--startup-attention", "0.15", "--silent-reminder", "0.3", "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const first = command(["wait", "--full", "--run-id", "reminder", "--timeout", "10"], env, true);
+    assert.equal(first.status, 4);
+    assert.deepEqual(first.json.alerts.map((entry) => entry.category), ["startup_silent"]);
+    const alert = command(["wait", "--full", "--run-id", "reminder", "--timeout", "10"], env, true);
+    assert.equal(alert.status, 4);
+    assert.equal(alert.json.state, "attention");
+    assert.deepEqual(alert.json.alerts.map((entry) => entry.category), ["silent_reminder"]);
+    assert.deepEqual(alert.json.pending, ["reminder"]);
+    const terminal = command(["wait", "--full", "--run-id", "reminder", "--timeout", "10"], env).json;
+    assert.equal(terminal.results[0].state, "success");
+    const stored = JSON.parse(readFileSync(join(env.PI_WORKER_STATE_ROOT, "reminder", "result.json"), "utf8"));
+    assert.equal(stored.silentReminderSeconds, 0.3);
+    assert.equal(stored.worker.version, "0.4.1");
+    assert.equal(stored.worker.brand, "subworker");
+    assert.equal(stored.dispatcher.threadId, "thread-reminder");
+    assert.equal(stored.backendVersion, null);
+    assert.deepEqual(stored.attentions.map((entry) => entry.category), ["startup_silent", "silent_reminder"]);
+    command(["cleanup", "--reviewed", "yes", "--run-id", "reminder"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("resumed activity restarts the reminder period exactly once", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-reminder-cycle-"));
+  const fake = fakeLauncher(temporary, `
+console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"test",model:"fake",stopReason:"toolUse",content:[{type:"text",text:"FIRST"}],usage:{input:1,output:1}}}));
+await new Promise((resolve) => setTimeout(resolve, 400));
+console.log(JSON.stringify({type:"message_update",phase:"next"}));
+await new Promise((resolve) => setTimeout(resolve, 400));
+console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"test",model:"fake",stopReason:"toolUse",content:[{type:"text",text:"SECOND"}],usage:{input:1,output:1}}}));
+await new Promise((resolve) => setTimeout(resolve, 200));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "reminder-cycle", "--workdir", temporary, "--startup-attention", "0", "--silent-reminder", "0.15", "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const terminal = drainUntilTerminal(["reminder-cycle"], env).byId.get("reminder-cycle");
+    assert.equal(terminal.state, "success");
+    const stored = JSON.parse(readFileSync(join(env.PI_WORKER_STATE_ROOT, "reminder-cycle", "result.json"), "utf8"));
+    const categories = stored.attentions.map((entry) => entry.category);
+    const reminders = categories.filter((entry) => entry === "silent_reminder").length;
+    // Every resumed-activity phase may raise at most one reminder; the run has
+    // two distinct quiet spans, so two (or three under load, if a third span
+    // opened before the terminal message) is expected. Duplicate fingerprints
+    // within one span are never raised twice.
+    assert.ok(reminders >= 2, `expected a fresh reminder after resumed activity, got ${reminders}`);
+    const spans = new Set(stored.attentions.filter((entry) => entry.category === "silent_reminder").map((entry) => entry.detail));
+    assert.equal(spans.size, reminders, "each reminder belongs to a distinct silent span");
+    assert.equal(stored.attention.category, "silent_reminder");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "reminder-cycle"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("silent-reminder zero keeps the run quiet after wake", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-reminder-off-"));
+  const fake = fakeLauncher(temporary, `
+console.log(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"test",model:"fake",stopReason:"toolUse",content:[{type:"text",text:"WORKING"}],usage:{input:1,output:1}}}));
+await new Promise((resolve) => setTimeout(resolve, 400));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "reminder-off", "--workdir", temporary, "--silent-reminder", "0", "--startup-attention", "0", "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const result = command(["wait", "--full", "--run-id", "reminder-off", "--timeout", "10"], env).json.results[0];
+    assert.equal(result.state, "success");
+    assert.equal(result.attention, null);
+    assert.equal(result.silentReminderSeconds, 0);
+    command(["cleanup", "--reviewed", "yes", "--run-id", "reminder-off"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("nine distinct alerts stay bounded with the newest 401 retained", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-attention-capacity-"));
+  const fake = fakeLauncher(temporary, `
+const lines = [
+  "extension error alpha",
+  "extension error beta",
+  "extension error gamma",
+  "extension error delta",
+  "extension error epsilon",
+  "extension error zeta",
+  "extension error eta",
+  "extension error theta",
+  "extension error iota",
+  "HTTP 401 invalid api key"
+];
+for (const line of lines) {
+  process.stderr.write(line + "\\n");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+}
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "capacity", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const terminal = drainUntilTerminal(["capacity"], env).byId.get("capacity");
+    assert.equal(terminal.state, "success");
+    const stored = JSON.parse(readFileSync(join(env.PI_WORKER_STATE_ROOT, "capacity", "result.json"), "utf8"));
+    assert.ok(stored.attentions.length <= 8, "attention history stays bounded");
+    assert.equal(stored.attention.category, "authentication");
+    assert.match(stored.attention.detail, /401/);
+    assert.equal(stored.attentions.at(-1).category, "authentication");
+    const categories = new Set(stored.attentions.map((entry) => entry.category + entry.detail));
+    assert.equal(categories.size, stored.attentions.length, "no duplicate alert is retained");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "capacity"], env);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -887,9 +1205,15 @@ console.log(JSON.stringify({type:"result",subtype:"success",is_error:false,sessi
     const firstArgs = JSON.parse(readFileSync(join(receipt.workdir, "first-args.json"), "utf8"));
     assert.equal(firstArgs[firstArgs.indexOf("--permission-mode") + 1], "auto");
     assert.match(firstArgs[firstArgs.indexOf("--disallowedTools") + 1], /Agent/);
+    mkdirSync(join(temporary, ".claude"), { recursive: true });
+    writeFileSync(join(temporary, ".claude/settings.json"), JSON.stringify({ permissions: { defaultMode: "bypassPermissions" } }));
     command(["continue", "--run-id", "claude-continue", "--", "second"], env);
     const second = command(["wait", "--full", "--run-id", "claude-continue", "--timeout", "10"], env).json.results[0];
     assert.equal(second.finalText, "SECOND");
+    assert.ok(second.backendArgs.includes("--dangerously-skip-permissions"));
+    const continuedArgs = JSON.parse(readFileSync(join(receipt.workdir, "continued-args.json"), "utf8"));
+    assert.ok(continuedArgs.includes("--dangerously-skip-permissions"));
+    assert.ok(!continuedArgs.includes("--permission-mode"));
     assert.equal(second.conversationId, "claude-second");
     assert.equal(second.turns[0].conversationId, "claude-first");
     assert.equal(readFileSync(join(receipt.workdir, "continued.txt"), "utf8"), "claude-first");
@@ -1057,6 +1381,109 @@ ${successEvents}`);
     if (backgroundPid) try { process.kill(backgroundPid, "SIGKILL"); } catch {}
     if (supervisorPid) try { process.kill(supervisorPid, "SIGTERM"); } catch {}
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("headless settled with a held pipe stops its process tree precisely and fails", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-settle-held-"));
+  const marker = join(temporary, "held.pid");
+  const fake = fakeLauncher(temporary, `
+import {spawn} from "node:child_process";
+import {writeFileSync} from "node:fs";
+// A background descendant inherits stdout, holding the pipe open forever.
+const held = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {stdio:["ignore","inherit","inherit"]});
+held.unref();
+writeFileSync(process.env.PI_WORKER_TEST_BACKGROUND_PID, String(held.pid));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  env.PI_WORKER_TEST_BACKGROUND_PID = marker;
+  let heldPid;
+  try {
+    command(["dispatch", "--run-id", "settle-held", "--workdir", temporary, "--startup-attention", "0", "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const waited = command(["wait", "--full", "--run-id", "settle-held", "--timeout", "30"], env, true);
+    assert.equal(waited.status, 4);
+    const alert = waited.json.alerts[0];
+    assert.equal(alert.category, "shutdown_problem");
+    assert.match(alert.detail, /stayed alive after its terminal event/);
+    const terminal = command(["wait", "--full", "--run-id", "settle-held", "--timeout", "10"], env, true);
+    assert.equal(terminal.status, 3);
+    const result = terminal.json.results[0];
+    assert.equal(result.state, "failed");
+    assert.equal(result.reasonCode, "shutdown_problem");
+    assert.equal(result.agentSettled, true);
+    assert.ok(existsSync(result.failureLogPath));
+    heldPid = Number(readFileSync(marker, "utf8"));
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(heldPid, 0);
+        await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+      } catch {
+        heldPid = null;
+        break;
+      }
+    }
+    assert.equal(heldPid, null, "held-pipe descendant remained alive after the settle shutdown");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "settle-held"], env);
+  } finally {
+    if (!heldPid && existsSync(marker)) heldPid = Number(readFileSync(marker, "utf8"));
+    if (heldPid) try { process.kill(heldPid, "SIGKILL"); } catch {}
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("fast settled exit stays successful while slow settled headless exits fail", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-settle-grace-"));
+  const fast = fakeLauncher(temporary, `${successEvents}`);
+  const slow = fakeLauncher(temporary, `
+console.log(JSON.stringify({type:"agent_settled"}));
+await new Promise((resolve) => setTimeout(resolve, 20000));`);
+  const env = testEnv(temporary, fast);
+  try {
+    command(["dispatch", "--run-id", "grace-fast", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const fastResult = command(["wait", "--full", "--run-id", "grace-fast", "--timeout", "10"], env).json.results[0];
+    assert.equal(fastResult.state, "success");
+    assert.equal(fastResult.agentSettled, true);
+    command(["cleanup", "--reviewed", "yes", "--run-id", "grace-fast"], env);
+    const slowEnv = testEnv(temporary, slow);
+    command(["dispatch", "--run-id", "grace-slow", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], slowEnv);
+    // The settle force raises a shutdown_problem alert first, then the run
+    // fails explicitly; both wake waiters.
+    const alert = command(["wait", "--full", "--run-id", "grace-slow", "--timeout", "30"], slowEnv, true);
+    assert.equal(alert.status, 4);
+    assert.equal(alert.json.alerts[0].category, "shutdown_problem");
+    assert.deepEqual(alert.json.pending, ["grace-slow"]);
+    const waited = command(["wait", "--full", "--run-id", "grace-slow", "--timeout", "10"], slowEnv, true);
+    assert.equal(waited.status, 3);
+    const result = waited.json.results[0];
+    assert.equal(result.state, "failed");
+    assert.equal(result.reasonCode, "shutdown_problem");
+    assert.equal(result.agentSettled, true);
+    command(["cleanup", "--reviewed", "yes", "--run-id", "grace-slow"], slowEnv);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("cancel during settle grace still records an explicit cancellation", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-settle-cancel-"));
+  const fake = fakeLauncher(temporary, `
+console.log(JSON.stringify({type:"agent_settled"}));
+await new Promise((resolve) => setTimeout(resolve, 20000));`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "settle-cancel", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    // The child settles immediately and then hangs; cancel inside the bounded
+    // grace window (8 s) so the run still records an explicit cancellation.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+    const response = command(["cancel", "--run-id", "settle-cancel", "--reason", "reviewer done", "--timeout", "10"], env).json;
+    assert.equal(response.state, "cancelled");
+    const result = response.results[0];
+    assert.equal(result.state, "cancelled");
+    assert.equal(result.reasonCode, "user_cancelled");
+    assert.equal(result.agentSettled, true);
+  } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
 });
@@ -1238,16 +1665,16 @@ console.log(JSON.stringify({type:"agent_settled"}));`);
 test("the public wrapper executes its adjacent staged runtime", () => {
   const temporary = mkdtempSync(join(tmpdir(), "pi-worker-wrapper-"));
   try {
-    const result = spawnSync(join(root, "bin", "pi-worker"), ["cache-status"], {
+    const result = spawnSync(join(root, "bin", "subworker"), ["cache-status"], {
       encoding: "utf8",
-      env: { ...process.env, PI_WORKER_TEST_CACHE_ROOTS: temporary, PI_WORKER_CACHE_MAX_BYTES: "1234" },
+      env: cleanSubprocessEnv({ PI_WORKER_TEST_CACHE_ROOTS: temporary, PI_WORKER_CACHE_MAX_BYTES: "1234" }),
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(JSON.parse(result.stdout).maxBytes, 1234);
-    const help = spawnSync(join(root, "bin", "pi-worker"), ["--help"], { encoding: "utf8" });
+    const help = spawnSync(join(root, "bin", "subworker"), ["--help"], { encoding: "utf8", env: cleanSubprocessEnv() });
     assert.equal(help.status, 0, help.stderr);
     assert.match(help.stdout, /--capability/);
-    const profiles = spawnSync(join(root, "bin", "pi-worker"), ["profiles"], { encoding: "utf8" });
+    const profiles = spawnSync(join(root, "bin", "subworker"), ["profiles"], { encoding: "utf8", env: cleanSubprocessEnv() });
     const profileOutput = JSON.parse(profiles.stdout);
     const configured = profileOutput.models;
     assert.deepEqual(profileOutput.backends.agy, { efforts: ["low", "medium", "high"], defaultEffort: "high", live: false });
@@ -1256,9 +1683,9 @@ test("the public wrapper executes its adjacent staged runtime", () => {
     assert.ok(configured.some((profile) => profile.id === "ahzm/glm-5.3" && profile.defaultThinking === "max"));
     assert.ok(configured.some((profile) => profile.id === "commandcode/Qwen/Qwen3.8-Flash" && profile.defaultThinking === "max"));
     assert.ok(!configured.some((profile) => profile.id.startsWith("opencode-go/")));
-    const cancel = spawnSync(join(root, "bin", "pi-worker"), ["cancel", "--run-id", "missing"], {
+    const cancel = spawnSync(join(root, "bin", "subworker"), ["cancel", "--run-id", "missing"], {
       encoding: "utf8",
-      env: { ...process.env, PI_WORKER_STATE_ROOT: temporary },
+      env: cleanSubprocessEnv({ PI_WORKER_STATE_ROOT: temporary }),
     });
     assert.equal(cancel.status, 2);
     assert.match(cancel.stderr, /unknown run/);
@@ -1273,15 +1700,14 @@ test("the public wrapper falls back to PATH when the preferred Node path is abse
   const home = join(temporary, "empty-home");
   mkdirSync(home, { recursive: true });
   try {
-    const result = spawnSync(join(root, "bin", "pi-worker"), ["cache-status"], {
+    const result = spawnSync(join(root, "bin", "subworker"), ["cache-status"], {
       encoding: "utf8",
-      env: {
-        ...process.env,
+      env: cleanSubprocessEnv({
         HOME: home,
         PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
         PI_WORKER_TEST_CACHE_ROOTS: temporary,
         PI_WORKER_CACHE_MAX_BYTES: "4321",
-      },
+      }),
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(JSON.parse(result.stdout).maxBytes, 4321);
@@ -1291,7 +1717,8 @@ test("the public wrapper falls back to PATH when the preferred Node path is abse
 });
 
 test("the headless wrapper keeps optional extensions out of the default path", () => {
-  const wrapper = readFileSync(join(root, "bin", "pi-worker"), "utf8");
+  // The staged launcher lives in subworker; bin/pi-worker is a thin forwarder.
+  const wrapper = readFileSync(join(root, "bin", "subworker"), "utf8");
   assert.match(wrapper, /--no-extensions/);
   assert.match(wrapper, /--offline/);
   assert.doesNotMatch(wrapper, /--no-skills/);
@@ -1309,9 +1736,9 @@ test("the headless wrapper keeps optional extensions out of the default path", (
 });
 
 test("the public wrapper fails before dispatch when Codex blocks provider network", () => {
-  const blocked = spawnSync(join(root, "bin", "pi-worker"), ["dispatch"], {
+  const blocked = spawnSync(join(root, "bin", "subworker"), ["dispatch"], {
     encoding: "utf8",
-    env: { ...process.env, CODEX_SANDBOX: "seatbelt", CODEX_SANDBOX_NETWORK_DISABLED: "1" },
+    env: cleanSubprocessEnv({ CODEX_SANDBOX: "seatbelt", CODEX_SANDBOX_NETWORK_DISABLED: "1" }),
   });
   assert.equal(blocked.status, 69);
   assert.match(blocked.stderr, /provider network is blocked by the Codex sandbox/);
@@ -1349,9 +1776,7 @@ test("production shared-cache discovery parses host paths", () => {
   const du = join(bin, "du");
   writeFileSync(du, "#!/bin/sh\nprintf '0 %s\\n' \"$2\"\n");
   chmodSync(du, 0o700);
-  const env = { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` };
-  delete env.PI_WORKER_TEST_CACHE_ROOTS;
-  delete env.PI_WORKER_CACHE_MAX_BYTES;
+  const env = cleanSubprocessEnv({ PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` });
   try {
     const result = command(["cache-status"], env);
     assert.equal(result.json.maxBytes, 20 * 1024 * 1024 * 1024);
@@ -1453,6 +1878,448 @@ test("old result-bearing runs remain until reviewed cleanup", () => {
     assert.ok(existsSync(oldDirectory));
     command(["wait", "--full", "--run-id", "new", "--timeout", "10"], env);
   } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+// Helpers for receipt path forensics used by the wait/attention regressions.
+function eventReceiptDir(stateRoot, runId) {
+  const key = createHash("sha256").update(resolve(join(stateRoot, runId))).digest("hex");
+  return join(tmpdir(), "pi-worker-events", key);
+}
+
+function receiptFileFor(stateRoot, runId, attentionOrCategory, detailOrConsumer = null, maybeConsumer = null) {
+  let attention;
+  let consumerSuffix = maybeConsumer;
+  if (attentionOrCategory && typeof attentionOrCategory === "object") {
+    attention = attentionOrCategory;
+    consumerSuffix = detailOrConsumer;
+  } else {
+    const category = attentionOrCategory;
+    const detail = detailOrConsumer;
+    const fingerprint = createHash("sha256").update(String(category) + "\0" + String(detail)).digest("hex");
+    attention = { category, detail, fingerprint };
+  }
+  // Mirrors attentionReceipt: new records key on sha256(detectedAt\0fingerprint);
+  // legacy records without fingerprint key on sha256(detectedAt\\0category).
+  const keyMaterial = attention?.fingerprint
+    ? String(attention.detectedAt ?? "") + "\0" + String(attention.fingerprint)
+    : String(attention.detectedAt ?? "") + "\\0" + String(attention.category ?? "");
+  const key = createHash("sha256").update(keyMaterial).digest("hex");
+  const suffix = consumerSuffix
+    ? "-" + createHash("sha256").update(consumerSuffix).digest("hex").slice(0, 16)
+    : "";
+  return join(eventReceiptDir(stateRoot, runId), `attention-${key}${suffix}.json`);
+}
+
+test("default consumer readiness and claim agree on the same receipt path", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-default-consistency-"));
+  const fake = fakeLauncher(temporary, `
+process.stderr.write("HTTP 429 too many requests\\n");
+await new Promise((resolve) => setTimeout(resolve, 1200));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "consistency", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    // Consume the alert with an explicit named consumer first while the run
+    // is still pending: the named namespace is independent of the legacy
+    // default receipt.
+    const named = command(["wait", "--full", "--run-id", "consistency", "--consumer", "peer", "--timeout", "10"], env, true);
+    assert.equal(named.status, 4);
+    assert.equal(named.json.alerts[0].category, "rate_limit");
+    assert.deepEqual(named.json.pending, ["consistency"]);
+    // The default consumer claims the alert on the legacy global path (no
+    // suffix); a suffixed "default" receipt must not exist.
+    const first = command(["wait", "--full", "--run-id", "consistency", "--timeout", "10"], env, true);
+    assert.equal(first.status, 4);
+    assert.equal(first.json.alerts[0].category, "rate_limit");
+    const runDir = join(env.PI_WORKER_STATE_ROOT, "consistency");
+    const attention = JSON.parse(readFileSync(join(runDir, "attention.json"), "utf8")).events[0];
+    const legacy = receiptFileFor(env.PI_WORKER_STATE_ROOT, "consistency", attention);
+    const suffixed = receiptFileFor(env.PI_WORKER_STATE_ROOT, "consistency", attention, "default");
+    assert.ok(existsSync(legacy), "default consumer must claim the legacy global receipt");
+    assert.ok(!existsSync(suffixed), "default consumer must not create a suffixed receipt");
+    // A second default waiter sees the same receipt as already claimed and
+    // keeps waiting until the terminal instead of double-delivering.
+    const second = command(["wait", "--full", "--run-id", "consistency", "--timeout", "10"], env, true);
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(second.json.results[0].state, "success");
+    assert.deepEqual(second.json.alerts, []);
+    command(["cleanup", "--reviewed", "yes", "--run-id", "consistency"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("a waiter losing the claim keeps waiting for the real terminal, never a fake completed", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-claim-loser-"));
+  const fake = fakeLauncher(temporary, [
+    'process.stderr.write("HTTP 429 too many requests\\n");',
+    "await new Promise((resolve) => setTimeout(resolve, 1200));",
+    successEvents,
+  ].join("\n"));
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "loser", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    // Start both waiters before the alert fires so both register as peers.
+    const args = ["wait", "--full", "--run-id", "loser", "--consumer", "root", "--timeout", "20"];
+    const started = Date.now();
+    const [winner, loser] = await Promise.all([commandAsync(args, env), commandAsync(args, env)]);
+    const elapsed = Date.now() - started;
+    // Exactly one delivery, and the loser does not exit early with a bogus
+    // "completed" + empty results: it must stay inside this same wait until
+    // the real terminal (the fake settles after ~1.3 s).
+    const alerts = [winner.json, loser.json].map((value) => value.alerts?.length ?? 0).reduce((a, b) => a + b, 0);
+    assert.equal(alerts, 1, "exactly one concurrent waiter may deliver the alert");
+    const exitCodes = [winner.status, loser.status].sort();
+    assert.ok(exitCodes.includes(4), "one waiter returns the attention");
+    assert.ok(exitCodes.includes(0), "the claim loser waits for the terminal");
+    const attentionOut = winner.status === 4 ? winner.json : loser.json;
+    const terminalOut = winner.status === 4 ? loser.json : winner.json;
+    assert.equal(attentionOut.state, "attention");
+    assert.deepEqual(attentionOut.pending, ["loser"]);
+    assert.equal(terminalOut.state, "settled");
+    assert.equal(terminalOut.results[0].state, "success");
+    assert.deepEqual(terminalOut.alerts, []);
+    assert.ok(elapsed >= 1100, `claim loser must keep waiting for the terminal (${elapsed} ms)`);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("a receipt IO fault during the claim fails the wait instead of reporting completed", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-claim-io-fault-"));
+  const fake = fakeLauncher(temporary, `
+process.stderr.write("HTTP 429 too many requests\\n");
+await new Promise((resolve) => setTimeout(resolve, 800));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "io-fault", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    // Force the alert into readiness, then replace the claim target with a
+    // non-file object: a directory is an IO fault that must not be treated as
+    // already notified.
+    const alert = command(["wait", "--full", "--run-id", "io-fault", "--consumer", "faulted", "--timeout", "10"], env, true);
+    assert.equal(alert.status, 4);
+    assert.equal(alert.json.alerts[0].category, "rate_limit");
+    const attention = JSON.parse(readFileSync(join(env.PI_WORKER_STATE_ROOT, "io-fault", "attention.json"), "utf8")).events[0];
+    const blocked = receiptFileFor(env.PI_WORKER_STATE_ROOT, "io-fault", attention, "blocked");
+    // Wait: the same alert is still pending for an unconsumed named consumer;
+    // its claim target is now blocked by a directory.
+    mkdirSync(blocked, { recursive: true });
+    const waiter = command(["wait", "--full", "--run-id", "io-fault", "--consumer", "blocked", "--timeout", "10"], env, true);
+    assert.equal(waiter.status, 3);
+    assert.match(waiter.stderr, /attention claim failed/);
+    assert.doesNotMatch(waiter.stderr, /completed/);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("same-category alerts in the same millisecond stay independently consumable", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-same-ms-"));
+  const fake = fakeLauncher(temporary, `
+await new Promise((resolve) => setTimeout(resolve, 1200));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "same-ms", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const runDir = join(env.PI_WORKER_STATE_ROOT, "same-ms");
+
+    // Synthetic event fixture deterministically sharing the exact same detectedAt millisecond.
+    // They share category and detectedAt timestamp, but differ by detail/fingerprint.
+    const now = new Date().toISOString();
+    const firstEvent = {
+      category: "extension_error",
+      detail: "extension failed alpha",
+      fingerprint: createHash("sha256").update("extension_error\0extension failed alpha").digest("hex"),
+      detectedAt: now,
+    };
+    const secondEvent = {
+      category: "extension_error",
+      detail: "extension failed beta",
+      fingerprint: createHash("sha256").update("extension_error\0extension failed beta").digest("hex"),
+      detectedAt: now,
+    };
+    writeFileSync(join(runDir, "attention.json"), JSON.stringify({ events: [firstEvent, secondEvent] }));
+
+    // The runtime legitimately batches all pending alerts in one turn,
+    // claiming separate receipts for each alert.
+    const first = command(["wait", "--full", "--run-id", "same-ms", "--consumer", "alpha", "--timeout", "10"], env, true);
+    assert.equal(first.status, 4);
+    assert.equal(first.json.alerts.length, 2);
+    assert.deepEqual(first.json.alerts.map((entry) => entry.detail), [firstEvent.detail, secondEvent.detail]);
+
+    // Prove two distinct receipts exist on disk for the same detection millisecond.
+    const firstReceipt = receiptFileFor(env.PI_WORKER_STATE_ROOT, "same-ms", firstEvent, "alpha");
+    const secondReceipt = receiptFileFor(env.PI_WORKER_STATE_ROOT, "same-ms", secondEvent, "alpha");
+    assert.ok(existsSync(firstReceipt), `first alert receipt missing: ${firstReceipt}`);
+    assert.ok(existsSync(secondReceipt), `second alert receipt missing: ${secondReceipt}`);
+    assert.notEqual(firstReceipt, secondReceipt);
+
+    // Prove no repeat delivery: a subsequent wait for the same consumer does not
+    // re-deliver either alert and waits until terminal success.
+    const second = command(["wait", "--full", "--run-id", "same-ms", "--consumer", "alpha", "--timeout", "10"], env, true);
+    assert.equal(second.status, 0, second.stderr);
+    assert.deepEqual(second.json.alerts, []);
+    assert.equal(second.json.results[0].state, "success");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "same-ms"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("legacy attention records without fingerprint remain consumable under detectedAt+category receipt path", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-legacy-receipt-"));
+  const fake = fakeLauncher(temporary, `
+await new Promise((resolve) => setTimeout(resolve, 1200));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "legacy-compat", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const runDir = join(env.PI_WORKER_STATE_ROOT, "legacy-compat");
+    const detectedAt = new Date().toISOString();
+    const legacyEvent = {
+      category: "rate_limit",
+      detail: "HTTP 429 legacy rate limit",
+      detectedAt,
+    };
+    writeFileSync(join(runDir, "attention.json"), JSON.stringify({ events: [legacyEvent] }));
+    const waited = command(["wait", "--full", "--run-id", "legacy-compat", "--timeout", "10"], env, true);
+    assert.equal(waited.status, 4);
+    assert.equal(waited.json.alerts[0].category, "rate_limit");
+    const legacyReceipt = receiptFileFor(env.PI_WORKER_STATE_ROOT, "legacy-compat", legacyEvent);
+    assert.ok(existsSync(legacyReceipt), "legacy alert must be claimed on the legacy detectedAt+category key path");
+    const second = command(["wait", "--full", "--run-id", "legacy-compat", "--timeout", "10"], env, true);
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(second.json.results[0].state, "success");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "legacy-compat"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("identical alert across multiple turns remains consumable in continue", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-continue-attention-"));
+  const fake = fakeLauncher(temporary, `
+import { mkdirSync } from "node:fs";
+const args = process.argv.slice(2);
+const sessionIndex = args.indexOf("--session-dir");
+if (sessionIndex >= 0 && args[sessionIndex + 1]) {
+  mkdirSync(args[sessionIndex + 1], { recursive: true });
+}
+process.stderr.write("HTTP 429 too many requests\\n");
+await new Promise((resolve) => setTimeout(resolve, 800));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  try {
+    command(["dispatch", "--run-id", "turn-alert", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash", "first"], env);
+    const firstWait = command(["wait", "--full", "--run-id", "turn-alert", "--timeout", "10"], env, true);
+    assert.equal(firstWait.status, 4);
+    assert.equal(firstWait.json.alerts[0].category, "rate_limit");
+    const finishTurn1 = command(["wait", "--full", "--run-id", "turn-alert", "--timeout", "10"], env, true);
+    assert.equal(finishTurn1.status, 0, finishTurn1.stderr);
+    assert.equal(finishTurn1.json.results[0].state, "success");
+
+    command(["continue", "--run-id", "turn-alert", "--", "second"], env);
+    const secondWait = command(["wait", "--full", "--run-id", "turn-alert", "--timeout", "10"], env, true);
+    assert.equal(secondWait.status, 4);
+    assert.equal(secondWait.json.alerts[0].category, "rate_limit");
+    const finishTurn2 = command(["wait", "--full", "--run-id", "turn-alert", "--timeout", "10"], env, true);
+    assert.equal(finishTurn2.status, 0, finishTurn2.stderr);
+    assert.equal(finishTurn2.json.results[0].state, "success");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "turn-alert"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("supervise terminates child and marks failed when Agy stream emits null frame without leaving orphan process", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-agy-null-frame-"));
+  const fake = fakeLauncher(temporary, `
+console.log("null");
+await new Promise((resolve) => setTimeout(resolve, 4000));
+`);
+  const env = testEnv(temporary, "/missing-pi");
+  env.AGY_WORKER_LAUNCHER = fake;
+  try {
+    command(["dispatch", "--backend", "agy", "--run-id", "agy-null-frame", "--workdir", temporary, "--", "--model", "gemini-3.8-flash-high", "task"], env);
+    const final = command(["wait", "--full", "--run-id", "agy-null-frame", "--timeout", "10"], env, true);
+    assert.equal(final.status, 3);
+    const result = final.json.results[0];
+    assert.equal(result.state, "failed");
+    assert.match(result.reason, /Corrupted protocol frame.*null/i);
+    assert.ok(result.childPid, "childPid should be recorded");
+    let childAlive = true;
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(result.childPid, 0);
+        await new Promise((r) => setTimeout(r, 25));
+      } catch {
+        childAlive = false;
+        break;
+      }
+    }
+    assert.equal(childAlive, false, "child process must not remain alive");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "agy-null-frame"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("supervise terminates child and marks failed when Agy stream emits array frame without leaving orphan process", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-agy-array-frame-"));
+  const fake = fakeLauncher(temporary, `
+console.log(JSON.stringify([1, 2, 3]));
+await new Promise((resolve) => setTimeout(resolve, 4000));
+`);
+  const env = testEnv(temporary, "/missing-pi");
+  env.AGY_WORKER_LAUNCHER = fake;
+  try {
+    command(["dispatch", "--backend", "agy", "--run-id", "agy-array-frame", "--workdir", temporary, "--", "--model", "gemini-3.8-flash-high", "task"], env);
+    const final = command(["wait", "--full", "--run-id", "agy-array-frame", "--timeout", "10"], env, true);
+    assert.equal(final.status, 3);
+    const result = final.json.results[0];
+    assert.equal(result.state, "failed");
+    assert.match(result.reason, /Corrupted protocol frame.*array/i);
+    assert.ok(result.childPid, "childPid should be recorded");
+    let childAlive = true;
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(result.childPid, 0);
+        await new Promise((r) => setTimeout(r, 25));
+      } catch {
+        childAlive = false;
+        break;
+      }
+    }
+    assert.equal(childAlive, false, "child process must not remain alive");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "agy-array-frame"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Agy launcher automatically appends --add-dir workdir and preserves explicit add-dir", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-agy-add-dir-"));
+  const marker = join(temporary, "agy-args.json");
+  const fake = fakeLauncher(temporary, `
+import {writeFileSync} from "node:fs";
+writeFileSync(process.env.AGY_TEST_ARGS, JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({event:"init",conversation_id:"agy-adddir-1"}));
+console.log(JSON.stringify({event:"result",result:{conversation_id:"agy-adddir-1",status:"SUCCESS",response:"OK"}}));
+`);
+  const env = testEnv(temporary, "/missing-pi");
+  env.AGY_WORKER_LAUNCHER = fake;
+  env.AGY_TEST_ARGS = marker;
+  const customDir = join(temporary, "custom-dir");
+  mkdirSync(customDir, { recursive: true });
+  try {
+    command([
+      "dispatch",
+      "--backend", "agy",
+      "--run-id", "agy-adddir",
+      "--workdir", temporary,
+      "--",
+      "--model", "gemini-3.8-flash-high",
+      "--add-dir", customDir,
+      "test prompt",
+    ], env);
+    const final = command(["wait", "--full", "--run-id", "agy-adddir", "--timeout", "10"], env);
+    assert.equal(final.json.results[0].state, "success");
+    const args = JSON.parse(readFileSync(marker, "utf8"));
+    const addDirIndices = [];
+    args.forEach((arg, index) => {
+      if (arg === "--add-dir") addDirIndices.push(index);
+    });
+    const addDirValues = addDirIndices.map((i) => args[i + 1]);
+    assert.ok(addDirValues.includes(customDir), "user explicit --add-dir must be preserved");
+    assert.ok(addDirValues.includes(temporary), "supervise must automatically pass --add-dir with task workdir");
+    assert.equal(args.includes("--dangerously-skip-permissions"), false);
+    command(["cleanup", "--reviewed", "yes", "--run-id", "agy-adddir"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("supervise terminates child and marks failed when Agy stream emits invalid JSON then sleeps", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-agy-corrupted-"));
+  const fake = fakeLauncher(temporary, `
+console.log('{"event": "step_update", broken json syntax');
+await new Promise((resolve) => setTimeout(resolve, 4000));
+`);
+  const env = testEnv(temporary, "/missing-pi");
+  env.AGY_WORKER_LAUNCHER = fake;
+  try {
+    command(["dispatch", "--backend", "agy", "--run-id", "agy-corrupt", "--workdir", temporary, "--", "--model", "gemini-3.8-flash-high", "task"], env);
+    let final;
+    do {
+      final = command(["wait", "--full", "--run-id", "agy-corrupt", "--timeout", "10"], env, true);
+    } while (final.status === 4);
+    assert.equal(final.status, 3);
+    const result = final.json.results[0];
+    assert.equal(result.state, "failed");
+    assert.match(result.reason, /Corrupted protocol JSON/i);
+    assert.ok(result.childPid, "childPid should be recorded");
+    let childAlive = true;
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(result.childPid, 0);
+        await new Promise((r) => setTimeout(r, 25));
+      } catch {
+        childAlive = false;
+        break;
+      }
+    }
+    assert.equal(childAlive, false, "child process must not remain alive");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "agy-corrupt"], env);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("waiter tolerates in-flight late SIGUSR1 signals during shutdown without being killed", async () => {
+  const temporary = mkdtempSync(join(tmpdir(), "pi-worker-late-signal-"));
+  const fake = fakeLauncher(temporary, `
+await new Promise((resolve) => setTimeout(resolve, 150));
+${successEvents}`);
+  const env = testEnv(temporary, fake);
+  let signalInterval = null;
+  try {
+    command(["dispatch", "--run-id", "late-signal", "--workdir", temporary, "--", "--provider", "deepseek", "--model", "deepseek-v4-flash"], env);
+    const child = spawn(process.execPath, [events, "wait", "--full", "--run-id", "late-signal", "--timeout", "10"], { env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    const exitPromise = new Promise((resolveChild, rejectChild) => {
+      child.on("error", rejectChild);
+      child.on("close", (status, signal) => resolveChild({ status, signal }));
+    });
+    const waiterDir = eventReceiptDir(env.PI_WORKER_STATE_ROOT, "late-signal");
+    for (let index = 0; index < 50; index += 1) {
+      if (existsSync(join(waiterDir, `${child.pid}.json`))) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    signalInterval = setInterval(() => {
+      try { child.kill("SIGUSR1"); } catch {}
+    }, 5);
+    const exitResult = await exitPromise;
+    if (signalInterval) {
+      clearInterval(signalInterval);
+      signalInterval = null;
+    }
+    assert.equal(exitResult.signal, null, `waiter must not be killed by SIGUSR1 (got signal ${exitResult.signal})`);
+    assert.equal(exitResult.status, 0, stderr);
+    const parsed = JSON.parse(stdout);
+    assert.equal(parsed.state, "settled");
+    assert.equal(parsed.results[0].state, "success");
+    command(["cleanup", "--reviewed", "yes", "--run-id", "late-signal"], env);
+  } finally {
+    if (signalInterval) clearInterval(signalInterval);
     rmSync(temporary, { recursive: true, force: true });
   }
 });

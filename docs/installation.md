@@ -36,12 +36,28 @@ git clone https://github.com/MaxxxDong/codex-pi-worker C:\CodexWS\Software\codex
 推荐用 Junction 保持一份源码：
 
 ```powershell
-$skill = "$env:USERPROFILE\.codex\skills\pi-worker"
+$skill = "$env:USERPROFILE\.codex\skills\subworker"
 $source = "C:\CodexWS\Software\codex-pi-worker"
 New-Item -ItemType Junction -Path $skill -Target $source
 ```
 
 如果 `$skill` 已存在，先检查并备份；不要直接覆盖包含个人修改的目录。新启动的 Codex 任务会读取 `SKILL.md`。
+
+## 升级现有 Windows 安装
+
+仓库通过 Junction 注册时，只需更新原仓库。先确认工作区没有需要保留的修改，再快进拉取 `main`：
+
+```powershell
+$repo = "C:\CodexWS\Software\codex-pi-worker"
+Push-Location $repo
+git status --short
+git pull --ff-only origin main
+Pop-Location
+```
+
+如果 `git status --short` 有输出，先提交或备份本机修改，不要直接覆盖。仓库更新不会修改 `~/.pi/agent/` 下的 provider、Key 和模型配置，也不会删除已有 receipt、session 或任务输出。
+
+旧安装如果仍使用 `~/.codex/skills/pi-worker`，可继续兼容运行；建议确认其目标后，将 Junction 迁移为 `~/.codex/skills/subworker`，避免新旧名称同时加载。
 
 ## 4. 配置 Pi provider
 
