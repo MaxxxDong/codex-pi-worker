@@ -1,5 +1,7 @@
 # 发布记录
 
+- Windows 对齐包标识为 `0.4.1+windows.1`：修正上游发布记录已到 v0.4.1、根 VERSION 仍为 0.1.5 的不一致，同时区别纯 macOS 发布。
+
 ## Windows 对齐批次 - 2026-09-16
 
 - 合并 main 的 Mac Subworker v0.4.1 源码和文档，保留 Windows 分支 WIP 快照、取消与 orphan rejected finalize 修复。
