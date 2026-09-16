@@ -2,15 +2,14 @@
 
 ## 威胁模型
 
-本工具用于用户授权的代码库和可信任务。Pi 与 Codex 以当前 Windows 用户权限运行；worktree、tool guard、环境白名单和 review gate 用于降低误操作风险，不构成恶意代码隔离。
+本工具用于用户授权的代码库和可信任务。Windows 默认以当前用户的完整原生权限运行 Pi，工具、环境与扩展不作额外裁剪，且通过 `--approve` 信任项目文件。analysis 只在提示中约定只读；worktree 是候选管理手段，不构成权限隔离。
 
 ## 已实现防护
 
-- implementation 只从干净 HEAD 创建 detached worktree。
-- direct write/edit 路径必须位于 execution worktree，解析 realpath 防止 symlink/junction 逃逸。
-- shell guard 阻断危险递归删除、磁盘命令、明显路径逃逸及 source/home mutation。
+- implementation 从当前非 ignored WIP 创建 detached worktree 和独立基线，源工作区不 stash。
+- 仅显式 `--guarded` 启用原有 write/edit 路径检查、shell guard 和工具/环境白名单。
 - runtime 自有目录删除必须通过 owned-root 校验，拒绝删除根本身、根外路径和链接目标。
-- Worker 环境采用显式白名单，避免把无关秘密继承给模型工具。
+- 默认继承原生进程环境；runtime 仅为本轮覆盖临时目录和共享缓存路径，不打印环境内容。
 - receipt/result 使用同目录临时文件原子替换。
 - runner 先写 receipt 再通过 launch gate 执行，失败终止整个进程树。
 - 候选在 Codex 审核前保持 `pending_review`，Worker 无权自行 finalize。
@@ -20,7 +19,7 @@
 `pi_worker_guard.mjs` 解析工具调用和命令字符串。Shell 语法、解释器、脚本和原生 API 很难由正则完全覆盖，因此：
 
 - 不要运行来自不可信来源的 prompt。
-- 不要把 implementation 指向含高价值未提交数据的用户目录。
+- in-place 会直接修改指定目录，cleanup 不删除该目录；宿主负责分配不重叠写范围。
 - 需要强隔离时使用虚拟机、容器、Windows Sandbox 或权限受限账户。
 - `sourceEscapeDetected` 等审计字段只能反映已实现检查，不能证明不存在所有逃逸。
 

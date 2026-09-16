@@ -32,7 +32,7 @@ class PiRpcSteerTests(unittest.TestCase):
                 "print(json.dumps({'id':initial['id'],'type':'response','command':'prompt','success':True}),flush=True)\n"
                 "print(json.dumps({'type':'agent_start'}),flush=True)\n"
                 "for i in range(3):\n"
-                " print(json.dumps({'type':'tool_execution_end','toolName':'bash','isError':True,'result':{'error':str(i)}}),flush=True)\n"
+                " print(json.dumps({'type':'tool_execution_end','toolName':'bash','isError':True,'result':{'error':'same missing path'}}),flush=True)\n"
                 "for line in sys.stdin:\n"
                 " command=json.loads(line)\n"
                 " if command.get('type')=='steer':\n"
@@ -82,7 +82,10 @@ class PiRpcSteerTests(unittest.TestCase):
                 [sys.executable, str(SCRIPTS / "watch_pi_worker.py"), str(receipt), "--timeout-seconds", "5"],
                 env,
             )
-            self.assertEqual(json.loads(first.stdout)["attention"]["category"], "repeated_tool_errors")
+            first_event = json.loads(first.stdout)
+            self.assertEqual(first_event["attention"]["category"], "repeated_tool_errors")
+            self.assertEqual(len(first_event["attention"]["recentToolErrors"]), 3)
+            self.assertEqual(first_event["lifecycleState"], "running")
 
             steered = self.run_command(
                 [

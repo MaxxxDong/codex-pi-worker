@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -13,15 +16,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from runtime_support import (
-    DEFAULT_MODEL,
-    DEFAULT_PROVIDER,
-    DEFAULT_THINKING,
-    MODEL_CHOICES,
     PROVIDER_MODELS,
+    SourceSnapshot,
     activate_cache,
     atomic_json,
     attention_event_name,
+    cancel_event_name,
+    capture_source_snapshot,
     emit_json,
+    pi_defaults,
     reconcile_jobs,
     record_job,
     release_cache,
@@ -51,32 +54,127 @@ def git(source: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
+def git_input(source: Path, args: list[str], content: bytes) -> None:
+    completed = subprocess.run(
+        ["git", "-C", str(source), *args],
+        input=content,
+        capture_output=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.decode("utf-8", errors="replace").strip() or "git apply failed")
+
+
+def prepare_snapshot_baseline(
+    source: Path,
+    worktree: Path,
+    source_head: str,
+    snapshot: SourceSnapshot,
+    evidence_files: list[Path],
+) -> tuple[str, dict[str, object] | None]:
+    tracked_patch = snapshot["trackedPatch"]
+    if tracked_patch:
+        git_input(worktree, ["apply", "--binary", "--whitespace=nowarn", "-"], tracked_patch)
+    for item in snapshot["untracked"]:
+        relative = str(item["path"])
+        source_file = source / relative
+        target = worktree / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, target)
+        if hashlib.sha256(target.read_bytes()).hexdigest() != item["sha256"]:
+            raise RuntimeError(f"source changed while copying untracked file: {relative}")
+
+    copied = capture_source_snapshot(worktree)
+    if copied["fingerprint"] != snapshot["fingerprint"]:
+        raise RuntimeError("isolated worktree does not match the captured source WIP")
+    if capture_source_snapshot(source)["fingerprint"] != snapshot["fingerprint"]:
+        raise RuntimeError("source checkout changed while creating the isolated WIP snapshot")
+
+    manifest: dict[str, object] | None = None
+    if evidence_files:
+        input_dir = worktree / ".pi-worker-inputs"
+        input_dir.mkdir()
+        entries: list[dict[str, str]] = []
+        for index, supplied in enumerate(evidence_files, 1):
+            source_file = supplied.resolve()
+            mode = source_file.lstat().st_mode
+            if not stat.S_ISREG(mode):
+                raise RuntimeError(f"evidence input is not a regular file: {source_file}")
+            target = input_dir / f"{index:03d}-{source_file.name}"
+            before = hashlib.sha256(source_file.read_bytes()).hexdigest()
+            shutil.copy2(source_file, target)
+            if hashlib.sha256(target.read_bytes()).hexdigest() != before:
+                raise RuntimeError(f"evidence input changed while copying: {source_file}")
+            entries.append({"source": str(source_file), "copy": target.relative_to(worktree).as_posix()})
+        manifest = {"files": entries}
+        atomic_json(input_dir / "manifest.json", manifest)
+
+    if not snapshot["dirty"] and not evidence_files:
+        return source_head, None
+    git(worktree, "add", "-A")
+    tree = git(worktree, "write-tree")
+    baseline = git(
+        worktree,
+        "-c",
+        "user.name=Pi Worker Snapshot",
+        "-c",
+        "user.email=pi-worker@local.invalid",
+        "commit-tree",
+        tree,
+        "-p",
+        source_head,
+        "-m",
+        "pi-worker: captured source WIP baseline",
+    )
+    git(worktree, "reset", "--hard", baseline)
+    return baseline, manifest
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cwd", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, required=True)
-    parser.add_argument("--mode", choices=("analysis", "implementation"), default="implementation")
+    parser.add_argument("--mode", choices=("analysis", "implementation", "in-place"), default="implementation")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--timeout-seconds", type=int, default=0)
+    parser.add_argument("--guarded", action="store_true")
+    parser.add_argument("--startup-attention", type=int, default=60)
+    parser.add_argument("--silent-reminder", type=int, default=600)
+    parser.add_argument("--progress-reminder", type=int, default=None)
     parser.add_argument(
         "--provider",
-        choices=tuple(PROVIDER_MODELS),
-        default=DEFAULT_PROVIDER,
+        default=None,
     )
     parser.add_argument(
         "--model",
-        choices=MODEL_CHOICES,
-        default=DEFAULT_MODEL,
+        default=None,
     )
     parser.add_argument(
         "--thinking",
         choices=("off", "minimal", "low", "medium", "high", "xhigh", "max"),
-        default=DEFAULT_THINKING,
+        default=None,
     )
     parser.add_argument("--context-mode", action="store_true")
     parser.add_argument("--firecrawl", action="store_true")
     parser.add_argument("--playwright", action="store_true")
+    parser.add_argument("--evidence-file", type=Path, action="append", default=[])
     args = parser.parse_args()
+    default_provider, default_model, default_thinking = pi_defaults()
+    args.provider = args.provider or default_provider
+    if not args.model and args.provider != default_provider:
+        options = sorted(PROVIDER_MODELS.get(args.provider, []))
+        if len(options) != 1:
+            parser.error("specify --model when selecting a different provider")
+        args.model = options[0]
+    args.model = args.model or default_model
+    args.thinking = args.thinking or default_thinking
+    if args.progress_reminder is None:
+        args.progress_reminder = 0 if args.mode == "analysis" else 600
+    if min(args.timeout_seconds, args.startup_attention, args.silent_reminder, args.progress_reminder) < 0:
+        parser.error("timeouts and reminders must be non-negative")
+    if args.evidence_file and args.mode != "implementation":
+        raise SystemExit("--evidence-file requires implementation mode")
 
     output_dir = args.output_dir.resolve()
     receipt_path = output_dir / "pi-receipt.json"
@@ -100,11 +198,18 @@ def main() -> int:
     execution_cwd = source_cwd
     source_root = source_cwd
     base_commit = ""
+    source_head = ""
+    source_snapshot: SourceSnapshot | None = None
+    input_manifest: dict[str, object] | None = None
     if args.mode == "implementation":
         source_root = Path(git(source_cwd, "rev-parse", "--show-toplevel")).resolve()
-        if git(source_root, "status", "--porcelain", "--untracked-files=all"):
-            raise SystemExit("implementation mode requires a clean source worktree")
-        base_commit = git(source_root, "rev-parse", "HEAD")
+        if git(source_root, "diff", "--name-only", "--diff-filter=U"):
+            raise SystemExit("implementation mode cannot snapshot unresolved merge conflicts")
+        if "-dirty" in git(source_root, "diff", "--submodule=short", "HEAD"):
+            raise SystemExit("implementation mode cannot snapshot dirty submodules")
+        source_head = git(source_root, "rev-parse", "HEAD")
+        source_snapshot = capture_source_snapshot(source_root)
+        base_commit = source_head
         worktree_path = (root / "worktrees" / run_id[:12]).resolve()
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
         if worktree_path.exists():
@@ -113,9 +218,29 @@ def main() -> int:
     cache_status = reserve_cache(root, run_id)
     if worktree_path is not None:
         try:
-            git(source_root, "worktree", "add", "--detach", str(worktree_path), base_commit)
+            git(source_root, "worktree", "add", "--detach", str(worktree_path), source_head)
             execution_cwd = worktree_path / source_cwd.relative_to(source_root)
+            assert source_snapshot is not None
+            base_commit, input_manifest = prepare_snapshot_baseline(
+                source_root,
+                worktree_path,
+                source_head,
+                source_snapshot,
+                args.evidence_file,
+            )
         except BaseException:
+            subprocess.run(
+                ["git", "-C", str(source_root), "worktree", "remove", "--force", str(worktree_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                check=False,
+            )
+            if worktree_path.is_dir():
+                try:
+                    remove_owned_tree(worktree_path, root / "worktrees")
+                except (OSError, ValueError):
+                    pass
             release_cache(root, run_id)
             raise
     try:
@@ -201,6 +326,8 @@ def main() -> int:
         str(root),
         "--base-commit",
         base_commit,
+        "--source-fingerprint",
+        str(source_snapshot["fingerprint"] if source_snapshot else ""),
         "--session-id",
         session_id,
         "--session-dir",
@@ -211,6 +338,8 @@ def main() -> int:
         "1",
         "--attention-event-name",
         attention_event_name(run_id),
+        "--cancel-event-name",
+        cancel_event_name(run_id),
         "--steer-event-name",
         steer_event_name(run_id),
         "--steer-queue-dir",
@@ -219,6 +348,13 @@ def main() -> int:
     ]
     if worktree_path is not None:
         command.extend(("--worktree-path", str(worktree_path)))
+    if input_manifest is not None:
+        command.extend(("--input-manifest", ".pi-worker-inputs/manifest.json"))
+    if args.guarded:
+        command.append("--guarded")
+    command.extend(("--startup-attention", str(args.startup_attention),
+                    "--silent-reminder", str(args.silent_reminder),
+                    "--progress-reminder", str(args.progress_reminder)))
     if args.context_mode:
         command.append("--context-mode")
     if args.firecrawl:
@@ -258,6 +394,7 @@ def main() -> int:
         "resultPath": str(result_path),
         "attentionPath": str(output_dir / "pi-attention.json"),
         "attentionEventName": attention_event_name(run_id),
+        "cancelEventName": cancel_event_name(run_id),
         "steerEventName": steer_event_name(run_id),
         "steerQueueDir": str(steer_queue_dir),
         "steerAvailable": os.name == "nt",
@@ -267,6 +404,19 @@ def main() -> int:
         "executionCwd": str(execution_cwd),
         "worktreePath": str(worktree_path) if worktree_path else None,
         "baseCommit": base_commit or None,
+        "sourceHead": source_head or None,
+        "sourceSnapshot": (
+            {
+                "fingerprint": source_snapshot["fingerprint"],
+                "dirty": source_snapshot["dirty"],
+                "trackedPatchSha256": source_snapshot["trackedPatchSha256"],
+                "untrackedFiles": len(source_snapshot["untracked"]),
+                "untrackedBytes": sum(int(item["bytes"]) for item in source_snapshot["untracked"]),
+            }
+            if source_snapshot
+            else None
+        ),
+        "inputManifest": input_manifest,
         "sessionId": session_id,
         "sessionDir": str(session_dir),
         "turnIndex": 1,
@@ -278,6 +428,11 @@ def main() -> int:
         "model": args.model,
         "thinking": args.thinking,
         "timeoutSeconds": args.timeout_seconds,
+        "guarded": args.guarded,
+        "permissionProfile": "guarded" if args.guarded else "native-unrestricted",
+        "startupAttentionSeconds": args.startup_attention,
+        "silentReminderSeconds": args.silent_reminder,
+        "progressReminderSeconds": args.progress_reminder,
         "cleanupStatus": "pending_worker",
         "cacheRoots": {name: str(path) for name, path in cache_roots.items()},
         "cacheLimitBytes": 20 * 1024**3,

@@ -33,6 +33,7 @@ from run_pi_worker import (  # noqa: E402
 from runtime_support import (  # noqa: E402
     atomic_json,
     attention_event_name,
+    capture_source_snapshot,
     close_windows_handle,
     create_attention_event,
     emit_json,
@@ -48,6 +49,142 @@ from runtime_support import (  # noqa: E402
 
 
 class WindowsEventTests(unittest.TestCase):
+    def test_dirty_source_snapshot_preserves_wip_and_patch_contains_only_worker_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            worktree = root / "worktree"
+            output = root / "output"
+            source.mkdir()
+            output.mkdir()
+            for command in (
+                ["git", "init", str(source)],
+                ["git", "-C", str(source), "config", "user.email", "pi-test@example.invalid"],
+                ["git", "-C", str(source), "config", "user.name", "Pi Test"],
+            ):
+                subprocess.run(command, check=True, capture_output=True)
+            (source / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+            (source / "tracked.txt").write_text("base\n", encoding="utf-8")
+            (source / "untouched.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "base"], check=True, capture_output=True)
+
+            (source / "tracked.txt").write_text("base\nwip\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+            (source / "tracked.txt").write_text("base\nwip\nunstaged\n", encoding="utf-8")
+            (source / "untouched.txt").write_text("base\nuser-only\n", encoding="utf-8")
+            (source / "new.txt").write_text("untracked WIP\n", encoding="utf-8")
+            (source / ".venv").mkdir()
+            (source / ".venv" / "ignored.txt").write_text("ignored\n", encoding="utf-8")
+            evidence = root / "evidence.json"
+            evidence.write_text('{"ok":true}\n', encoding="utf-8")
+
+            before = capture_source_snapshot(source)
+            source_head = start_pi_worker.git(source, "rev-parse", "HEAD")
+            start_pi_worker.git(source, "worktree", "add", "--detach", str(worktree), source_head)
+            try:
+                baseline, manifest = start_pi_worker.prepare_snapshot_baseline(
+                    source,
+                    worktree,
+                    source_head,
+                    before,
+                    [evidence],
+                )
+                self.assertNotEqual(baseline, source_head)
+                self.assertEqual(capture_source_snapshot(source)["fingerprint"], before["fingerprint"])
+                self.assertEqual(subprocess.run(
+                    ["git", "-C", str(worktree), "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout, "")
+                self.assertEqual((worktree / "tracked.txt").read_text(encoding="utf-8"), "base\nwip\nunstaged\n")
+                self.assertEqual((worktree / "new.txt").read_text(encoding="utf-8"), "untracked WIP\n")
+                self.assertFalse((worktree / ".venv").exists())
+                assert manifest is not None
+                self.assertEqual(manifest["files"][0]["copy"], ".pi-worker-inputs/001-evidence.json")
+
+                (worktree / "tracked.txt").write_text("base\nwip\nunstaged\nworker\n", encoding="utf-8")
+                (worktree / "worker.txt").write_text("worker\n", encoding="utf-8")
+                patch_info = write_patch(worktree, output, baseline)
+                self.assertIsNotNone(patch_info)
+                assert patch_info is not None
+                self.assertEqual(set(patch_info["files"]), {"tracked.txt", "worker.txt"})
+                subprocess.run(
+                    ["git", "-C", str(source), "apply", "--whitespace=nowarn", str(output / "changes.patch")],
+                    check=True,
+                    capture_output=True,
+                )
+                self.assertEqual((source / "tracked.txt").read_text(encoding="utf-8"), "base\nwip\nunstaged\nworker\n")
+                self.assertEqual((source / "untouched.txt").read_text(encoding="utf-8"), "base\nuser-only\n")
+            finally:
+                subprocess.run(
+                    ["git", "-C", str(source), "worktree", "remove", "--force", str(worktree)],
+                    capture_output=True,
+                    check=False,
+                )
+
+    @unittest.skipUnless(os.name == "nt", "Windows integration test")
+    def test_start_rejects_source_drift_and_rolls_back_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            output = root / "output"
+            runtime = root / "runtime"
+            source.mkdir()
+            for command in (
+                ["git", "init", str(source)],
+                ["git", "-C", str(source), "config", "user.email", "pi-test@example.invalid"],
+                ["git", "-C", str(source), "config", "user.name", "Pi Test"],
+            ):
+                subprocess.run(command, check=True, capture_output=True)
+            tracked = source / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-m", "base"], check=True, capture_output=True)
+            tracked.write_text("base\nwip\n", encoding="utf-8")
+            prompt = root / "task.md"
+            prompt.write_text("test", encoding="utf-8")
+
+            real_capture = capture_source_snapshot
+            capture_count = 0
+
+            def capture_with_drift(path: Path):
+                nonlocal capture_count
+                capture_count += 1
+                if capture_count == 3:
+                    tracked.write_text("base\nwip\nconcurrent edit\n", encoding="utf-8")
+                return real_capture(path)
+
+            argv = [
+                "start_pi_worker.py",
+                "--cwd",
+                str(source),
+                "--prompt-file",
+                str(prompt),
+                "--output-dir",
+                str(output),
+            ]
+            env = {
+                "PI_WORKER_ROOT": str(runtime),
+                "LOCALAPPDATA": str(root / "local"),
+                "PI_WORKER_DISABLE_CACHE_GC": "1",
+            }
+            with (
+                patch.dict(os.environ, env),
+                patch.object(sys, "argv", argv),
+                patch.object(start_pi_worker, "capture_source_snapshot", side_effect=capture_with_drift),
+                self.assertRaisesRegex(RuntimeError, "source checkout changed"),
+            ):
+                start_pi_worker.main()
+
+            self.assertFalse((output / "pi-receipt.json").exists())
+            self.assertFalse(any((runtime / "worktrees").glob("*")))
+            self.assertFalse(any((runtime / "active").glob("*.json")))
+            self.assertFalse(any((runtime / "jobs").glob("*.json")))
+            registrations = source / ".git" / "worktrees"
+            self.assertFalse(registrations.exists() and any(registrations.iterdir()))
+
     def test_playwright_windows_patch_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -448,10 +585,99 @@ class WindowsEventTests(unittest.TestCase):
             )
 
             self.assertEqual(watched.returncode, 0, watched.stderr)
-            self.assertEqual(json.loads(watched.stdout)["event"], "orphaned")
+            orphan = json.loads(watched.stdout)
+            self.assertEqual(orphan["event"], "orphaned")
+            self.assertEqual(orphan["lifecycleState"], "orphaned")
             job = json.loads((runtime / "jobs" / f"{run_id}.json").read_text(encoding="utf-8"))
             self.assertEqual(job["state"], "orphaned")
             self.assertFalse((runtime / "active" / f"{run_id}.json").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows integration test")
+    def test_receipt_bound_cancel_preserves_review_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            source = root / "source"
+            output = root / "output"
+            fake_bin.mkdir()
+            source.mkdir()
+            prompt = root / "task.md"
+            prompt.write_text("test", encoding="utf-8")
+            fake = fake_bin / "fake_pi.py"
+            fake.write_text("import time; time.sleep(30)\n", encoding="utf-8")
+            (fake_bin / "pi.cmd").write_text(
+                f'@echo off\r\n"{sys.executable}" "{fake}" %*\r\n',
+                encoding="utf-8",
+            )
+            runtime = root / "runtime"
+            env = {
+                **os.environ,
+                "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                "PI_WORKER_ROOT": str(runtime),
+                "PI_WORKER_DISABLE_CACHE_GC": "1",
+                "PYTHONIOENCODING": "utf-8",
+            }
+            started = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "start_pi_worker.py"),
+                    "--cwd",
+                    str(source),
+                    "--prompt-file",
+                    str(prompt),
+                    "--mode",
+                    "analysis",
+                    "--output-dir",
+                    str(output),
+                    "--timeout-seconds",
+                    "30",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False,
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+
+            cancelled = subprocess.run(
+                [sys.executable, str(SCRIPTS / "cancel_pi_worker.py"), str(output / "pi-receipt.json")],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False,
+            )
+            self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
+            self.assertEqual(json.loads(cancelled.stdout)["event"], "cancel_requested")
+
+            watched = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "watch_pi_worker.py"),
+                    str(output / "pi-receipt.json"),
+                    "--timeout-seconds",
+                    "10",
+                    "--full",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False,
+            )
+            self.assertEqual(watched.returncode, 0, watched.stderr)
+            terminal = json.loads(watched.stdout)
+            self.assertEqual(terminal["event"], "terminal")
+            self.assertEqual(terminal["result"]["status"], "cancelled")
+            self.assertEqual(terminal["result"]["stopReason"], "cancelled")
+            self.assertEqual(terminal["lifecycleState"], "pending_review")
+            self.assertTrue((output / "pi-result.json").is_file())
+            self.assertTrue(Path(terminal["result"]["sessionDir"]).is_dir())
+            self.assertFalse((runtime / "active" / f"{terminal['result']['runId']}.json").exists())
 
     @unittest.skipUnless(os.name == "nt", "Windows integration test")
     def test_start_rolls_back_when_receipt_write_fails(self) -> None:
@@ -500,14 +726,19 @@ class WindowsEventTests(unittest.TestCase):
             self.assertFalse(any((runtime / "active").glob("*.json")))
 
     @unittest.skipUnless(os.name == "nt", "Windows event test")
-    def test_named_attention_wakes_watcher_without_polling(self) -> None:
+    def test_multi_receipt_watch_returns_first_attention_without_waiting_for_others(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             attention_path = root / "pi-attention.json"
             receipt_path = root / "pi-receipt.json"
+            other_receipt_path = root / "other-receipt.json"
             run_id = "test-attention"
             event_name = attention_event_name(run_id)
             sleeper = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            other_sleeper = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(10)"],
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
@@ -523,8 +754,25 @@ class WindowsEventTests(unittest.TestCase):
                         "attentionEventName": event_name,
                     },
                 )
+                atomic_json(
+                    other_receipt_path,
+                    {
+                        "runId": "still-running",
+                        "pid": other_sleeper.pid,
+                        "resultPath": str(root / "other-result.json"),
+                    },
+                )
                 watcher = subprocess.Popen(
-                    [sys.executable, str(SCRIPTS / "watch_pi_worker.py"), str(receipt_path), "--timeout-seconds", "5"],
+                    [
+                        sys.executable,
+                        str(SCRIPTS / "watch_pi_worker.py"),
+                        str(other_receipt_path),
+                        str(receipt_path),
+                        "--timeout-seconds",
+                        "5",
+                        "--consumer",
+                        "default",
+                    ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -539,12 +787,17 @@ class WindowsEventTests(unittest.TestCase):
                 stdout, stderr = watcher.communicate(timeout=3)
                 self.assertEqual(watcher.returncode, 0, stderr)
                 self.assertLess(time.perf_counter() - started, 1.0)
-                self.assertEqual(json.loads(stdout)["event"], "attention")
+                event = json.loads(stdout)
+                self.assertEqual(event["event"], "attention")
+                self.assertTrue(Path(event["receipt"]).samefile(receipt_path))
+                self.assertIsNone(other_sleeper.poll())
                 self.assertTrue((root / "pi-attention-delivered-001.json").is_file())
             finally:
                 close_windows_handle(handle)
                 sleeper.terminate()
                 sleeper.wait(timeout=5)
+                other_sleeper.terminate()
+                other_sleeper.wait(timeout=5)
 
     @unittest.skipUnless(os.name == "nt", "Windows integration test")
     def test_runner_stderr_attention_arrives_before_terminal(self) -> None:

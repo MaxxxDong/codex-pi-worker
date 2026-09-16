@@ -95,7 +95,7 @@ starting -> running -> pending_review -> settled
 
 ### Windows 平台
 - `analysis` 模式：直接在源 cwd 运行，但严格排除 `bash/edit/write/ast_grep_replace`，适合审查、搜索和研究。
-- `implementation` 模式：要求源 checkout 保持干净（严格 clean-tree 检查），从当前 HEAD 创建 detached worktree。Pi 的直接写工具只能指向执行 worktree；shell guard 拦截已知路径逃逸和破坏模式。
+- Windows `implementation` 自动将 staged、unstaged 与非 ignored untracked WIP 快照到 detached worktree；补丁仅包含 Worker 增量。默认完整原生权限，不加载 shell guard；`--guarded` 才恢复旧工具限制。worktree 是修改隔离，不是权限沙箱。
 
 ### macOS 平台 (Subworker v0.3.1)
 - `read` 模式：直接在现有仓库运行，提供 `read`、`grep`、`find`、`ls`、`web_search` 以及受提示词约束的 `bash`（仅限只读检查或已知不修改项目文件的命令），排除 `edit/write`。

@@ -1,5 +1,15 @@
 # 发布记录
 
+- Windows 对齐包标识为 `0.4.1+windows.1`：修正上游发布记录已到 v0.4.1、根 VERSION 仍为 0.1.5 的不一致，同时区别纯 macOS 发布。
+
+## Windows 对齐批次 - 2026-09-16
+
+- 合并 main 的 Mac Subworker v0.4.1 源码和文档，保留 Windows 分支 WIP 快照、取消与 orphan rejected finalize 修复。
+- Windows 默认原生权限和环境，加载 Skills/扩展/提示模板，启用全部原生工具及搜索工具；guard 改为显式 `--guarded`。本机 Pi 已升级为 npm 正式版 0.85.1，CLI 与模型目录正常；真实 canary 被当前 provider 余额不足（HTTP 400）阻断，不宣称模型验收成功。
+- 保留脱敏 provider errorMessage 到 compact event/result，并即时发送 provider_error attention，避免余额不足等错误只剩空的失败状态。
+- 默认模型路由继承 Pi settings；新增 in-place、零默认硬超时、启动/静默/工具进展软提醒、consumer 独立告警、紧凑 wait/显式 full 和只读 diagnose。
+- Windows 保留现有 pi-worker Skill 路径；subworker.py 只转发现有 Python 生命周期。Mac 多执行器没有冒充 Windows 支持。详细边界见 [Windows 对齐说明](../windows-alignment.md)。
+
 ## 2026-09-16 - GitHub 发布批次
 
 - 将此前仅保存在本机的 v0.3.0、v0.3.1、v0.3.2、v0.4.0 与 v0.4.1 一次性同步到现有 GitHub 仓库。

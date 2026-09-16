@@ -10,18 +10,19 @@ Pi provider 配置位于 `~/.pi/agent/models.json`。它通常包含明文 API K
 
 仓库只提供 [占位示例](../examples/models.example.json)。
 
-## 当前路由白名单
+## Windows 路由
 
-`runtime_support.py` 对 provider/model 做 fail-closed 校验：
+不传路由时继承 Pi `settings.json` 的 defaultProvider/defaultModel/defaultThinkingLevel；显式参数优先。新 provider/model 交给 Pi 本机配置和扩展解析，无需修改 runtime 白名单。旧命名路由仍保留模型配对检查：
 
 | Provider | 允许模型 |
 |---|---|
 | `deepseek` | `deepseek-v4-flash` |
-| `ahzm` | `glm-5.3`, `glm-5.3-flash` |
-| `commandcode` | `z-ai/glm-5.3-flash`, `deepseek/deepseek-v4-flash`, `google/gemini-3.7-flash`, `Qwen/Qwen3.8-Flash`, `Qwen/Qwen3.8-Max` |
-| `xai` | `grok-4.5`, `grok-4.6` |
+| `opencode-go` | `deepseek-v4-flash` |
+| `shuaiapi` | `gpt-5.6-luna`, `gpt-5.6-sol` |
+| `shuaiapi-grok`, `krill` | `grok-4.5` |
+| `krill-sol` | `gpt-5.6-sol` |
 
-派发时必须显式指定 provider 和模型；已移除的 `opencode-go` 不再作为 Worker profile。Qwen 3.8 Flash 默认 thinking 为 `max`；Qwen 3.8 Max 默认 `xhigh`。未知 provider/model 仍可通过显式 `--thinking` 使用。
+命名路由是否安装和可用，以当前 Pi 的 `--list-models` 为准；表格不会安装或启用 provider。macOS 路由参见对应平台文档。
 
 ## 启动覆盖
 
@@ -42,23 +43,24 @@ python scripts\start_pi_worker.py `
 
 | 变量 | 作用 |
 |---|---|
-| `PI_WORKER_ROOT` | runtime 根；Windows 默认 `C:\piw` |
+| `SUBWORKER_STATE_ROOT` / `PI_WORKER_ROOT` | runtime 根，前者优先；Windows 默认 `C:\piw` |
+| `SUBWORKER_PI_BIN` / `PI_WORKER_PI_BIN` | 覆盖 Pi 入口，前者优先 |
 | `PI_WORKER_DISABLE_CACHE_GC=1` | 禁止后台缓存修剪 |
 | `UV_CACHE_DIR` | 显式覆盖 Worker 共享 uv cache |
 | `PIP_CACHE_DIR` | 显式覆盖 Worker 共享 pip cache |
 | `npm_config_cache` | 显式覆盖 Worker 共享 npm cache |
 | `PI_CODING_AGENT_DIR` | Pi agent 目录；用于定位可选 context-mode |
 | `PI_ALLOW_BROWSER_COOKIES` | 显式允许 Pi Web 访问浏览器 cookies |
-| `TAVILY_API_KEY` | Tavily 搜索；从用户环境按白名单传入 Worker |
-| `FIRECRAWL_API_KEY` | Firecrawl MCP；从用户环境按白名单传入 Worker |
+| `TAVILY_API_KEY` | Tavily 搜索；从用户环境继承 |
+| `FIRECRAWL_API_KEY` | Firecrawl MCP；从用户环境继承 |
 
-Worker 环境采用白名单继承。Java、Android、Rust、Go、Node、Python 等常见工具链变量会保留；无关秘密默认不传给子进程。联网搜索 Key 只有列入安全白名单时才会传递，因此应按最小权限配置。
+Worker 默认继承完整环境，包括本机工具链和凭证变量；仅 `--guarded` 使用旧环境白名单。运行任务应使用可信仓库和工具。
 
 ## 扩展加载策略
 
-- `pi_worker_guard.mjs` 始终加载。
+- `pi_worker_guard.mjs` 仅 `--guarded` 加载；默认不加载。
 - Pi 自身已配置的常规扩展、skills 和 web 工具保持可用。
-- 两种模式都显式启用 `grep/find/ls`。默认 `implementation` 另有 `bash/edit/write`；只有明确只读任务才传 `--mode analysis`。
+- 默认不裁剪工具，补充启用 `grep/find/ls/powershell` 并保留扩展工具；analysis 只提示只读，implementation 隔离 worktree，in-place 直接操作指定目录。
 - `context-mode` 只有显式 `--context-mode` 才额外加载，避免简单任务为大日志能力付固定成本。
 - `pi-mcp-adapter` 与 Firecrawl 只有显式 `--firecrawl` 才加载；MCP 配置使用 `${FIRECRAWL_API_KEY}`，不保存明文 Key。
 - `pi-playwright` 只有显式 `--playwright` 才加载，并要求 implementation 模式。

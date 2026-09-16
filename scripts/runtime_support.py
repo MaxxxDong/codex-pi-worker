@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, TypedDict
 
 CACHE_LIMIT_BYTES = 20 * 1024**3
 CACHE_TARGET_BYTES = 19 * 1024**3
@@ -19,12 +21,14 @@ CACHE_CHECK_INTERVAL_SECONDS = 3600
 RUN_TEMP_STALE_SECONDS = 3600
 JOB_HISTORY_RETENTION_SECONDS = 7 * 24 * 3600
 ATTENTION_EVENT_PREFIX = r"Local\pi-worker-attention-"
+CANCEL_EVENT_PREFIX = r"Local\pi-worker-cancel-"
 STEER_EVENT_PREFIX = r"Local\pi-worker-steer-"
 STEER_ACK_EVENT_PREFIX = r"Local\pi-worker-steer-ack-"
 DEFAULT_PROVIDER = "opencode-go"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_THINKING = "max"
 PROVIDER_MODELS = {
+    "deepseek": {"deepseek-v4-flash"},
     "opencode-go": {"deepseek-v4-flash"},
     "shuaiapi": {"gpt-5.6-luna", "gpt-5.6-sol"},
     "shuaiapi-grok": {"grok-4.5"},
@@ -32,6 +36,71 @@ PROVIDER_MODELS = {
     "krill-sol": {"gpt-5.6-sol"},
 }
 MODEL_CHOICES = tuple(sorted({model for models in PROVIDER_MODELS.values() for model in models}))
+
+
+class UntrackedSnapshot(TypedDict):
+    path: str
+    sha256: str
+    bytes: int
+
+
+class SourceSnapshot(TypedDict):
+    fingerprint: str
+    dirty: bool
+    status: list[str]
+    trackedPatch: bytes
+    trackedPatchSha256: str
+    untracked: list[UntrackedSnapshot]
+
+
+def _git_bytes(source: Path, *args: str) -> bytes:
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    completed = subprocess.run(
+        ["git", "-C", str(source), *args],
+        capture_output=True,
+        env=env,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(message or "git command failed")
+    return completed.stdout
+
+
+def capture_source_snapshot(source: Path) -> SourceSnapshot:
+    """Capture the non-ignored WIP fingerprint without mutating the source checkout."""
+    source = source.resolve()
+    head = _git_bytes(source, "rev-parse", "HEAD").strip()
+    status = _git_bytes(source, "status", "--porcelain=v1", "--untracked-files=all")
+    tracked_patch = _git_bytes(source, "diff", "--binary", "--no-ext-diff", "HEAD", "--", ".")
+    raw_paths = _git_bytes(source, "ls-files", "--others", "--exclude-standard", "-z")
+    untracked: list[UntrackedSnapshot] = []
+    digest = hashlib.sha256(head + b"\0tracked\0" + tracked_patch)
+    for raw_path in filter(None, raw_paths.split(b"\0")):
+        relative = os.fsdecode(raw_path)
+        candidate = source / relative
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(source)
+        except ValueError as exc:
+            raise RuntimeError(f"untracked path escapes source checkout: {relative}") from exc
+        mode = candidate.lstat().st_mode
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"unsupported untracked non-file in source snapshot: {relative}")
+        content_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        size = candidate.stat().st_size
+        untracked.append({"path": relative, "sha256": content_hash, "bytes": size})
+        digest.update(b"\0untracked\0" + raw_path + b"\0")
+        digest.update(content_hash.encode("ascii") + b"\0" + str(size).encode("ascii"))
+    return {
+        "fingerprint": digest.hexdigest(),
+        "dirty": bool(status),
+        "status": status.decode("utf-8", errors="replace").splitlines(),
+        "trackedPatch": tracked_patch,
+        "trackedPatchSha256": hashlib.sha256(tracked_patch).hexdigest(),
+        "untracked": untracked,
+    }
 SAFE_ENV_NAMES = {
     "ALLUSERSPROFILE",
     "APPDATA",
@@ -99,6 +168,10 @@ def emit_json(value: dict[str, object]) -> None:
 
 def attention_event_name(run_id: str) -> str:
     return f"{ATTENTION_EVENT_PREFIX}{run_id}"
+
+
+def cancel_event_name(run_id: str) -> str:
+    return f"{CANCEL_EVENT_PREFIX}{run_id}"
 
 
 def steer_event_name(run_id: str) -> str:
@@ -174,7 +247,7 @@ def close_windows_handle(handle: int | None) -> None:
 
 def runtime_root() -> Path:
     default = Path(r"C:\piw") if os.name == "nt" else Path.home() / ".cache" / "pi-worker"
-    return Path(os.environ.get("PI_WORKER_ROOT", default)).resolve()
+    return Path(os.environ.get("SUBWORKER_STATE_ROOT") or os.environ.get("PI_WORKER_ROOT", default)).resolve()
 
 
 def is_within(path: Path, parent: Path) -> bool:
@@ -253,8 +326,20 @@ def atomic_json(path: Path, value: dict[str, object]) -> None:
 
 
 def validate_route(provider: str, model: str) -> None:
-    if model not in PROVIDER_MODELS.get(provider, set()):
+    # Pi's native catalog and provider extensions own routes not in this legacy table.
+    if provider in PROVIDER_MODELS and model not in PROVIDER_MODELS[provider]:
         raise SystemExit(f"model {model} is not configured for provider {provider}")
+
+
+def pi_defaults() -> tuple[str, str, str]:
+    directory = Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi" / "agent")
+    settings_path = directory / "settings.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.is_file() else {}
+    return (
+        settings.get("defaultProvider") or DEFAULT_PROVIDER,
+        settings.get("defaultModel") or DEFAULT_MODEL,
+        settings.get("defaultThinkingLevel") or DEFAULT_THINKING,
+    )
 
 
 def record_job(root: Path, job_id: str, **values: object) -> dict[str, object]:
@@ -565,11 +650,12 @@ def release_cache(root: Path, run_id: str) -> dict[str, object]:
         return {**_last_cache_status(root), "activeWorkers": len(live), "gcEligible": not live}
 
 
-def worker_environment(root: Path, run_id: str) -> tuple[dict[str, str], Path]:
+def worker_environment(root: Path, run_id: str, *, guarded: bool = True) -> tuple[dict[str, str], Path]:
     run_temp = root / "runs" / run_id / "tmp"
     buckets = shared_cache_paths(root)
     run_temp.mkdir(parents=True, exist_ok=True)
-    env = {name: value for name, value in os.environ.items() if name.upper() in SAFE_ENV_NAMES}
+    env = ({name: value for name, value in os.environ.items() if name.upper() in SAFE_ENV_NAMES}
+           if guarded else dict(os.environ))
     env.update(
         {
             "UV_CACHE_DIR": str(buckets["uv"]),

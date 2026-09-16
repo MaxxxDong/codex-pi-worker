@@ -17,6 +17,7 @@ from runtime_support import (
     activate_cache,
     atomic_json,
     attention_event_name,
+    cancel_event_name,
     emit_json,
     is_within,
     pid_alive,
@@ -41,6 +42,9 @@ def main() -> int:
     parser.add_argument("receipt", type=Path)
     parser.add_argument("--prompt-file", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=None)
+    parser.add_argument("--startup-attention", type=int, default=None)
+    parser.add_argument("--silent-reminder", type=int, default=None)
+    parser.add_argument("--progress-reminder", type=int, default=None)
     args = parser.parse_args()
 
     started = time.perf_counter()
@@ -81,6 +85,15 @@ def main() -> int:
     receipt_path = output_dir / "pi-receipt.json"
     result_path = output_dir / "pi-result.json"
 
+    timeout_seconds = args.timeout_seconds if args.timeout_seconds is not None else int(latest.get("timeoutSeconds") or 0)
+    reminders = {
+        "startupAttentionSeconds": args.startup_attention if args.startup_attention is not None else int(latest.get("startupAttentionSeconds", 60)),
+        "silentReminderSeconds": args.silent_reminder if args.silent_reminder is not None else int(latest.get("silentReminderSeconds", 600)),
+        "progressReminderSeconds": args.progress_reminder if args.progress_reminder is not None else int(latest.get("progressReminderSeconds", 0 if owner["mode"] == "analysis" else 600)),
+    }
+    if min(timeout_seconds, *reminders.values()) < 0:
+        raise SystemExit("timeouts and reminders must be non-negative")
+
     with runtime_lock(root):
         owner = read_json(owner_path)
         if owner.get("cleanupStatus") == "settled":
@@ -97,7 +110,8 @@ def main() -> int:
         )
         atomic_json(owner_path, owner)
 
-    timeout_seconds = args.timeout_seconds or int(owner.get("timeoutSeconds") or 1800)
+    source_snapshot = owner.get("sourceSnapshot")
+    source_fingerprint = str(source_snapshot.get("fingerprint") or "") if isinstance(source_snapshot, dict) else ""
     cache_status = reserve_cache(root, run_id)
     runner = Path(__file__).with_name("run_pi_worker.py")
     command = [
@@ -129,6 +143,8 @@ def main() -> int:
         str(root),
         "--base-commit",
         str(owner.get("baseCommit") or ""),
+        "--source-fingerprint",
+        source_fingerprint,
         "--session-id",
         str(owner["sessionId"]),
         "--session-dir",
@@ -139,6 +155,8 @@ def main() -> int:
         str(turn_index),
         "--attention-event-name",
         attention_event_name(run_id),
+        "--cancel-event-name",
+        cancel_event_name(run_id),
         "--steer-event-name",
         steer_event_name(run_id),
         "--steer-queue-dir",
@@ -148,12 +166,19 @@ def main() -> int:
     worktree = owner.get("worktreePath")
     if worktree:
         command.extend(("--worktree-path", str(worktree), "--allow-existing-changes"))
+    if owner.get("inputManifest"):
+        command.extend(("--input-manifest", ".pi-worker-inputs/manifest.json"))
     if owner.get("contextMode"):
         command.append("--context-mode")
     if owner.get("firecrawl"):
         command.append("--firecrawl")
     if owner.get("playwright"):
         command.append("--playwright")
+    if owner.get("guarded"):
+        command.append("--guarded")
+    command.extend(("--startup-attention", str(reminders["startupAttentionSeconds"]),
+                    "--silent-reminder", str(reminders["silentReminderSeconds"]),
+                    "--progress-reminder", str(reminders["progressReminderSeconds"])))
 
     stdout_file = (output_dir / "runtime.stdout.log").open("wb")
     stderr_file = (output_dir / "runtime.stderr.log").open("wb")
@@ -216,6 +241,7 @@ def main() -> int:
         "resultPath": str(result_path),
         "attentionPath": str(output_dir / "pi-attention.json"),
         "attentionEventName": attention_event_name(run_id),
+        "cancelEventName": cancel_event_name(run_id),
         "steerEventName": steer_event_name(run_id),
         "steerQueueDir": str(steer_queue_dir),
         "steerAvailable": os.name == "nt",
@@ -225,6 +251,9 @@ def main() -> int:
         "executionCwd": str(execution_cwd),
         "worktreePath": worktree,
         "baseCommit": owner.get("baseCommit"),
+        "sourceHead": owner.get("sourceHead"),
+        "sourceSnapshot": owner.get("sourceSnapshot"),
+        "inputManifest": owner.get("inputManifest"),
         "sessionId": owner["sessionId"],
         "sessionDir": str(session_dir),
         "turnIndex": turn_index,
@@ -234,6 +263,9 @@ def main() -> int:
         "model": owner["model"],
         "thinking": owner["thinking"],
         "timeoutSeconds": timeout_seconds,
+        "guarded": bool(owner.get("guarded")),
+        "permissionProfile": "guarded" if owner.get("guarded") else "native-unrestricted",
+        **reminders,
         "contextMode": bool(owner.get("contextMode")),
         "firecrawl": bool(owner.get("firecrawl")),
         "playwright": bool(owner.get("playwright")),

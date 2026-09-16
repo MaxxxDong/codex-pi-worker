@@ -12,7 +12,7 @@
 | 事件优先等待 | POSIX/Windows 命名事件与进程句柄唤醒，不需要反复 `status`/日志轮询 |
 | 多执行器边界 | 支持 Pi（默认，带完整 RPC/steer/capability）、Agy（原生 stream-json/effort，无 5 分钟限制）、Claude Code（原生 stream-json，支持 CommandCode 与 native） |
 | 分析与实现分流 | 默认 `write`/`implementation`；只有明确只读任务才用 `read`/`analysis`，两者都有 `grep/find/ls` |
-| 平台差异清晰 | macOS 携带脏基线且只读模式允许受约束 bash；Windows 保持干净 HEAD 检查与 analysis 禁用 bash 原逻辑 |
+| 工作目录 | Windows/macOS 均支持脏基线 worktree 与 in-place；Windows analysis 默认以提示约束只读，工具不裁剪 |
 | 同任务续跑 | 统一凭据绑定会话、worktree 和 turn 序号，支持跨轮次 `continue` |
 | 运行中纠偏 | Pi 原生 RPC `steer`，receipt 绑定投递并等待 accepted 回执（Agy/Claude 续跑使用 `continue`） |
 | 审核后清理 | Worker 结束只进入 `pending_review`；宿主接受或拒绝后显式 `cleanup`/`finalize` |
@@ -27,17 +27,17 @@ Windows 要求 Python 3.12+、Node.js 22.19+、Git 和 Pi CLI 0.83+。macOS（v0
 ### Windows 安装与运行
 
 ```powershell
-npm install -g @earendil-works/pi-coding-agent@0.83.0
-git clone https://github.com/MaxxxDong/codex-pi-worker C:\CodexWS\Software\codex-pi-worker
+npm install -g @earendil-works/pi-coding-agent@0.85.1
+git clone --branch agent/pi-worker-capabilities https://github.com/MaxxxDong/codex-pi-worker C:\CodexWS\Software\codex-pi-worker
 New-Item -ItemType Junction `
-  -Path "$env:USERPROFILE\.codex\skills\subworker" `
+  -Path "$env:USERPROFILE\.codex\skills\pi-worker" `
   -Target "C:\CodexWS\Software\codex-pi-worker"
 ```
 
 启动一个普通实现 Worker（默认模式，无需写 `--mode implementation`）：
 
 ```powershell
-python "$env:USERPROFILE\.codex\skills\subworker\scripts\start_pi_worker.py" `
+python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\subworker.py" dispatch `
   --cwd C:\path\to\repo `
   --prompt-file C:\path\to\task.md `
   --output-dir C:\path\to\evidence
@@ -46,7 +46,7 @@ python "$env:USERPROFILE\.codex\skills\subworker\scripts\start_pi_worker.py" `
 然后只等待一次，不做轮询：
 
 ```powershell
-python "$env:USERPROFILE\.codex\skills\subworker\scripts\watch_pi_worker.py" `
+python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\subworker.py" wait `
   C:\path\to\evidence\pi-receipt.json `
   --timeout-seconds 1800
 ```
@@ -99,7 +99,7 @@ macOS v0.4.0 新增 `--backend grok`，原生 Grok Build 1.0.13 已验证；默�
 ## 重要边界
 
 - `status=completed` 只代表执行合同成立，不代表代码正确。
-- implementation/write 模式使用独立 worktree 和命令 guard，但不是 OS 级沙箱；不要执行不可信 prompt。
+- Windows 默认以原生权限运行：不加载自定义 guard，不裁剪工具，正常继承 Pi Skills/扩展/提示模板与进程环境，并传入 Pi 的项目文件信任参数 `--approve`。`--guarded` 显式恢复旧限制。worktree 仅用于候选管理，不是权限沙箱。
 - 启动与静默提醒：`--startup-attention`（默认 60 秒）在首事件前提醒，`--silent-reminder`（默认 600 秒）在运行中无新活动时提醒且有新事件时重置，两者均为软提醒，不终止任务（0 关闭）。
 - `--consumer <id>` 隔离不同对话/等待者的告警回执（默认 `$CODEX_THREAD_ID` 或 `default`；非 Codex 宿主显式传入）。
 - 清理必须发生在宿主审核之后；不要让 Worker 自己删除候选 worktree。
@@ -110,7 +110,7 @@ macOS v0.4.0 新增 `--backend grok`，原生 Grok Build 1.0.13 已验证；默�
 
 - 将本地积累的 v0.3.0 至 v0.4.1 正式同步到 GitHub：macOS 统一 `subworker` 入口，并在同一生命周期下支持 Pi、Agy、Claude Code 与 Grok Build。
 - 新增 `diagnose`、结构化重试建议、无工具进展提醒、原生权限偏好继承，以及 Grok dispatch/continue 自动 bypass 参数；这些行为均保留审核后清理边界。
-- Windows Python runtime 本批没有行为变更；Windows 用户可安全拉取最新 `main`，继续使用原有 Pi 生命周期。升级步骤见 [Windows 安装指南](docs/installation.md#升级现有-windows-安装)。
+- Windows 对齐分支保留本机 WIP/取消/清理修复，增加原生权限默认、Pi 配置继承、in-place、软提醒、独立 consumer、紧凑 wait 和 diagnose；Pi CLI 已验证版本为 0.85.1。详见 [Windows 对齐说明](docs/windows-alignment.md)。
 
 完整记录见 [发布记录](docs/releases/release-notes.md)。
 
