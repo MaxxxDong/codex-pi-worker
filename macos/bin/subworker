@@ -1,0 +1,100 @@
+#!/bin/zsh
+set -euo pipefail
+
+resolve_executable() {
+  local override="$1"
+  local preferred="$2"
+  local name="$3"
+  if [[ -n "$override" ]]; then
+    if [[ -x "$override" ]]; then
+      print -r -- "$override"
+      return
+    fi
+    print -u2 "Subworker executable is not runnable: $override"
+    return 127
+  fi
+  if [[ -x "$preferred" ]]; then
+    print -r -- "$preferred"
+    return
+  fi
+  local discovered
+  discovered="$(command -v "$name" 2>/dev/null || true)"
+  if [[ -n "$discovered" && -x "$discovered" ]]; then
+    print -r -- "$discovered"
+    return
+  fi
+  print -u2 "Subworker could not find $name at $preferred or on PATH"
+  return 127
+}
+
+# Environment variable backwards compatibility: prefer SUBWORKER_*, fallback to PI_WORKER_*
+node_override="${SUBWORKER_NODE_BIN:-${PI_WORKER_NODE_BIN:-}}"
+pi_override="${SUBWORKER_PI_BIN:-${PI_WORKER_PI_BIN:-}}"
+
+if [[ -n "${SUBWORKER_STATE_ROOT:-}" ]]; then
+  export PI_WORKER_STATE_ROOT="$SUBWORKER_STATE_ROOT"
+fi
+if [[ -n "${SUBWORKER_AGENT_SOURCE:-}" ]]; then
+  export PI_WORKER_AGENT_SOURCE="$SUBWORKER_AGENT_SOURCE"
+fi
+if [[ -n "${SUBWORKER_LAUNCHER:-}" ]]; then
+  export PI_WORKER_LAUNCHER="$SUBWORKER_LAUNCHER"
+fi
+
+if [[ ("${1:-}" == "dispatch" || "${1:-}" == "continue") && "${CODEX_SANDBOX:-}" == "seatbelt" && "${CODEX_SANDBOX_NETWORK_DISABLED:-}" == "1" ]]; then
+  print -u2 'Subworker provider network is blocked by the Codex sandbox. Re-run this command with sandbox_permissions="require_escalated".'
+  exit 69
+fi
+
+run_bare_pi() {
+  unset ANTHROPIC_API_KEY OPENAI_API_KEY GOOGLE_API_KEY GEMINI_API_KEY GROQ_API_KEY
+  unset DEEPSEEK_API_KEY DASHSCOPE_API_KEY OPENCODE_API_KEY OPENCODE_GO_API_KEY
+
+  export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+
+  local output_args=(--print --mode json)
+  local previous=""
+  for arg in "$@"; do
+    if [[ "$arg" == "--mode=rpc" || ( "$previous" == "--mode" && "$arg" == "rpc" ) ]]; then
+      output_args=()
+      break
+    fi
+    previous="$arg"
+  done
+
+  local pi_bin
+  pi_bin="$(resolve_executable "$pi_override" "$HOME/.local/node-lts/bin/pi" pi)"
+  exec "$pi_bin" \
+    "${output_args[@]}" \
+    --offline \
+    --tools read,bash,edit,write,grep,find,ls,web_search \
+    --no-extensions \
+    --extension "$HOME/.pi/agent/extensions/coding-runtime.ts" \
+    --append-system-prompt "Treat the current working directory as the task root. You may read external references, but write only inside the current working directory or TMPDIR; never switch to or edit a separate source checkout." \
+    --append-system-prompt "Follow the requested scope. Start with named files, failing tests, and direct callers. Do not scan the whole repository unless the task explicitly requires it or targeted evidence is insufficient. For output-only or connectivity checks, do not call tools." \
+    --no-prompt-templates \
+    --no-approve \
+    "$@"
+}
+
+case "${1:-}" in
+  dispatch|continue|steer|cancel|wait|cleanup|status|diagnose|cache-status|profiles|help|--help|-h)
+    skill_root="${0:A:h:h}"
+    node_bin="$(resolve_executable "$node_override" "$HOME/.local/node-lts/bin/node" node)"
+    exec "$node_bin" \
+      "$skill_root/lib/events.mjs" "$@"
+    ;;
+  exec|raw)
+    shift
+    run_bare_pi "$@"
+    ;;
+  *)
+    if [[ -z "${1:-}" ]]; then
+      print -u2 "Subworker: missing command. Run 'subworker help' for usage."
+      exit 2
+    else
+      print -u2 "Subworker: unknown command '$1'. Run 'subworker help' for usage."
+      exit 2
+    fi
+    ;;
+esac

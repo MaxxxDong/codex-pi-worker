@@ -32,7 +32,7 @@ class PiRpcSteerTests(unittest.TestCase):
                 "print(json.dumps({'id':initial['id'],'type':'response','command':'prompt','success':True}),flush=True)\n"
                 "print(json.dumps({'type':'agent_start'}),flush=True)\n"
                 "for i in range(3):\n"
-                " print(json.dumps({'type':'tool_execution_end','toolName':'bash','isError':True,'result':{'error':str(i)}}),flush=True)\n"
+                " print(json.dumps({'type':'tool_execution_end','toolName':'bash','isError':True,'result':{'error':'same missing path'}}),flush=True)\n"
                 "for line in sys.stdin:\n"
                 " command=json.loads(line)\n"
                 " if command.get('type')=='steer':\n"

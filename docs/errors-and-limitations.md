@@ -15,8 +15,6 @@
 
 续跑输出位于 `turns/turn-NNN/`，但 owner receipt 仍是首轮的 `pi-receipt.json`。不要只看首轮 `pi-result.json` 判断最新状态；应从 owner receipt 的 `latestReceiptPath` 继续追踪。
 
-receipt 中的 `status=running` 是启动时快照，不会持续同步；不要用它判断 Worker 是否仍存活。`watch_pi_worker.py` 返回的 `lifecycleState` 来自 `C:\piw\jobs`，才是运行、待审核、异常或已清理状态。需要停止时使用 receipt 绑定的 `cancel_pi_worker.py`，不要直接杀 PID。
-
 常用 PowerShell 检查：
 
 ```powershell
@@ -47,14 +45,9 @@ $runtime = if ($env:PI_WORKER_ROOT) { $env:PI_WORKER_ROOT } else { 'C:\piw' }
 
 ## 2. 启动阶段错误
 
-### 2.1 WIP snapshot 被拒绝
+### 2.1 脏源仓库启动
 
-implementation 支持 staged、unstaged 和非 ignored untracked WIP，但下列状态无法安全、完整地复制，因此会 fail closed：
-
-- unresolved merge conflict；
-- dirty submodule、嵌套仓库或非普通文件；
-- 越界 symlink/junction/reparse point；
-- 快照复制期间源内容发生变化。
+macOS write 模式不会因源仓库存在 staged、unstaged 或非忽略 untracked 文件而拒绝启动。runtime 会把这些内容带入 detached worktree 并记录为基线，最终 patch 只包含 Worker 在基线上新增的变化。
 
 ```powershell
 git -C '<repo>' status --short --untracked-files=all
@@ -62,7 +55,27 @@ git -C '<repo>' diff --stat
 git -C '<repo>' diff --cached --stat
 ```
 
-先处理具体错误或等并发写入结束后重试。不要 stash、reset 或删除用户 WIP 来绕过门禁。ignored 依赖和构建缓存不会复制，应继续使用共享缓存或主工作树既有验证环境。
+Windows 旧 runtime 仍可能要求干净仓库，应以对应版本文档为准。任何平台都不会自动丢弃用户文件。
+
+### 2.1.1 Agy `Eligibility check failed ... EOF`
+
+这是 Agy 在模型调用前访问 Google 账号资格接口失败，通常表现为 0 Token、无工具调用。macOS v0.2.0 会将它归类为 transport attention 并立即终态，不会等 idle timeout；应先恢复 Agy 登录或网络，再重试同一任务。它不是 worktree、prompt 或 Pi provider 错误。
+
+### 2.1.2 Agy `SUCCESS` 但 `denied_actions` 非空
+
+Agy Headless 无法弹出交互授权框。模型请求了未在 Agy 配置中允许的工具时，Agy 可能返回 `status=SUCCESS`、空 `response` 和非空 `denied_actions`。macOS v0.2.1 会把它判为失败并发出 `permission_denied`，不接受空成功。只读任务应给需要的安全命令配置精确 allow rule；可信隔离 worktree 任务可由调用方显式传入 Agy 的 `--dangerously-skip-permissions`，但 Worker 不把它设成全局默认。
+
+### 2.1.3 Agy `The stream was interrupted`
+
+这是 Agy/backend 在已有部分输出后仍返回的错误终态。macOS v0.2.1 将其归为 transport attention，并保留部分文本、usage 和工具摘要供审核，但仍保持失败；应从同一 conversation 续跑或在确认服务恢复后重试，不能仅因文本看起来正确就接受为成功。
+
+### 2.1.4 Claude CommandCode 请求仍进入原有 Claude endpoint
+
+`~/.claude/settings.json` 的 `env` 会覆盖普通子进程环境变量。macOS v0.2.2 使用本次命令级 `--settings` 指向临时回环桥；若自行删除该参数，Claude 可能继续调用原有 endpoint。不要为修复这一问题改写全局 Claude 配置。
+
+### 2.1.5 Claude 权限拒绝或内部编排循环
+
+Headless Claude 无法等待交互授权。Worker 对 read/write 分别使用 `plan`/`auto`，权限拒绝会立即产生 `permission_denied` attention。默认还禁止 Agent、Task、Workflow 等二次编排工具；只有任务确实需要、且调用方能接受额外进程与生命周期时才传 `--allow-orchestration`。
 
 ### 2.2 `output directory already contains a run`
 
@@ -153,6 +166,7 @@ runtime 会从 stderr 和 Pi RPC 事件中识别异常并尽早发出 attention�
 | `broken_pipe` | 子进程管道提前关闭 | 查看 runtime 与 Pi stderr，确认是否崩溃或被外部终止 |
 | `output_oversize` | 单事件或累计证据超限 | 依据 result 的截断字段检查最终结果，缩小任务或分轮执行 |
 | `repeated_tool_errors` | 连续 3 次工具调用失败 | 检查脱敏工具摘要，并用 steer 纠正路径、命令或任务范围 |
+| `request_rejected` | Provider 明确拒绝请求，例如内容审查或无效请求 | 不做同任务盲重试；调整输入或参数后再启动 |
 | `provider_retry` / `provider_retry_failed` | 自动重试达到第 2 次或最终失败 | 先看 provider 错误；必要时 steer 缩小任务或等待终态后重试 |
 | `extension_error` / `compaction_error` | 扩展或上下文压缩失败 | 检查紧凑事件；禁用有问题的按需扩展或缩小上下文 |
 | `steer_delivery_failed` | RPC steer 未写入当前 Pi 进程 | 重新读取 latest receipt；若已终态则使用 continuation |

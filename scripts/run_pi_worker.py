@@ -22,8 +22,6 @@ from runtime_support import (
     DEFAULT_MODEL,
     DEFAULT_PROVIDER,
     DEFAULT_THINKING,
-    MODEL_CHOICES,
-    PROVIDER_MODELS,
     atomic_json,
     cancel_event_name,
     capture_source_snapshot,
@@ -77,23 +75,120 @@ def tool_error_summary(event: dict[str, object]) -> str:
     return encoded[:MAX_TOOL_ERROR_BYTES].decode("utf-8", errors="ignore")
 
 
+def tool_error_category(event: dict[str, object]) -> str:
+    summary = tool_error_summary(event)
+    category = classify_attention(summary) or re.sub(r"\d+", "#", summary.casefold())
+    return f"{event.get('toolName')}:{category}"
+
+
+class ProgressTracker:
+    """Small, clock-driven progress state; reminders never terminate a worker."""
+
+    def __init__(self, now: float, startup: int, silent: int, progress: int):
+        self.started = now
+        self.started_at = utc_now()
+        self.first_event_at: str | None = None
+        self.last_activity = now
+        self.last_activity_at = self.started_at
+        self.last_tool = now
+        self.last_tool_at: str | None = None
+        self.last_tool_name: str | None = None
+        self.last_event_type: str | None = None
+        self.active_tool: str | None = None
+        self.event_count = 0
+        self.tool_starts = 0
+        self.tool_completions = 0
+        self.startup = startup
+        self.silent = silent
+        self.progress = progress
+        self.startup_notified = False
+        self.silent_notified = now
+        self.progress_notified = now
+
+    def observe(self, now: float, event: dict[str, object] | None = None) -> None:
+        at = utc_now()
+        self.last_activity = now
+        self.last_activity_at = at
+        if event is None:
+            return
+        self.first_event_at = self.first_event_at or at
+        self.event_count += 1
+        event_type = str(event.get("type") or "unknown")
+        self.last_event_type = event_type
+        if event_type in {"tool_execution_start", "tool_execution_end"}:
+            self.last_tool = now
+            self.last_tool_at = at
+            self.last_tool_name = str(event.get("toolName") or "unknown")
+            if event_type == "tool_execution_start":
+                self.tool_starts += 1
+                self.active_tool = self.last_tool_name
+            else:
+                self.tool_completions += 1
+                self.active_tool = None
+
+    def due_reminders(self, now: float) -> list[str]:
+        due = []
+        if self.startup and not self.first_event_at and not self.startup_notified and now - self.started >= self.startup:
+            self.startup_notified = True
+            due.append("startup_attention")
+        if self.silent and self.first_event_at and now - max(self.last_activity, self.silent_notified) >= self.silent:
+            self.silent_notified = now
+            due.append("silent_reminder")
+        if (self.progress and self.first_event_at and not self.active_tool
+                and now - max(self.last_tool, self.progress_notified) >= self.progress):
+            self.progress_notified = now
+            due.append("progress_reminder")
+        return due
+
+    def snapshot(self, now: float) -> dict[str, object]:
+        return {
+            "startedAt": self.started_at,
+            "firstEventAt": self.first_event_at,
+            "lastActivityAt": self.last_activity_at,
+            "lastEventType": self.last_event_type,
+            "lastToolAt": self.last_tool_at,
+            "lastToolName": self.last_tool_name,
+            "activeTool": self.active_tool,
+            "eventCount": self.event_count,
+            "toolStarts": self.tool_starts,
+            "toolCompletions": self.tool_completions,
+            "elapsedSeconds": round(now - self.started, 3),
+            "silentSeconds": round(now - self.last_activity, 3),
+            "noToolProgressSeconds": round(now - self.last_tool, 3),
+        }
+
+
+def permission_profile(args: argparse.Namespace) -> dict[str, object]:
+    guarded = bool(getattr(args, "guarded", False))
+    return {
+        "name": "guarded" if guarded else "native-unrestricted",
+        "guardEnabled": guarded,
+        "toolAllowlist": (ANALYSIS_TOOLS if args.mode == "analysis" else BASE_TOOLS) if guarded else None,
+        "analysisReadOnly": ("guard-enforced" if guarded else "prompt-only") if args.mode == "analysis" else None,
+        "inheritsNativeExtensions": True,
+        "osSandbox": False,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cwd", type=Path, required=True)
     parser.add_argument("--source-cwd", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, default=None)
     parser.add_argument("--prompt-file", type=Path, required=True)
-    parser.add_argument("--mode", choices=("analysis", "implementation"), default="implementation")
+    parser.add_argument("--mode", choices=("analysis", "implementation", "in-place"), default="implementation")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--timeout-seconds", type=int, default=0)
+    parser.add_argument("--guarded", action="store_true")
+    parser.add_argument("--startup-attention", type=int, default=60)
+    parser.add_argument("--silent-reminder", type=int, default=600)
+    parser.add_argument("--progress-reminder", type=int, default=None)
     parser.add_argument(
         "--provider",
-        choices=tuple(PROVIDER_MODELS),
         default=DEFAULT_PROVIDER,
     )
     parser.add_argument(
         "--model",
-        choices=MODEL_CHOICES,
         default=DEFAULT_MODEL,
     )
     parser.add_argument(
@@ -160,6 +255,8 @@ def classify_attention(line: str) -> str | None:
 
 
 def git_changes(cwd: Path) -> list[str]:
+    if not any((parent / ".git").exists() for parent in (cwd, *cwd.parents)):
+        return []
     completed = subprocess.run(
         ["git", "status", "--short"],
         cwd=cwd,
@@ -218,6 +315,7 @@ def compact_event(raw: bytes) -> bytes | None:
                 "provider": message.get("provider"),
                 "model": message.get("model"),
                 "stopReason": message.get("stopReason"),
+                "errorMessage": redact_credentials(str(message.get("errorMessage") or "").encode())[:MAX_TOOL_ERROR_BYTES].decode(errors="ignore"),
                 "usage": message.get("usage") or {},
                 "content": [{"type": "text", "text": text}] if text else [],
                 "contentTruncated": text_truncated,
@@ -381,6 +479,7 @@ def parse_events(path: Path) -> dict[str, object]:
     provider = None
     model = None
     stop_reason = None
+    provider_error = None
     agent_ended = False
     agent_settled = False
     final_text_truncated = False
@@ -407,6 +506,7 @@ def parse_events(path: Path) -> dict[str, object]:
             provider = message.get("provider", provider)
             model = message.get("model", model)
             stop_reason = message.get("stopReason", stop_reason)
+            provider_error = message.get("errorMessage") or provider_error
             final_text_truncated |= bool(message.get("contentTruncated"))
             current_usage = message.get("usage") or {}
             for key in usage:
@@ -421,6 +521,7 @@ def parse_events(path: Path) -> dict[str, object]:
         "provider": provider,
         "model": model,
         "stopReason": stop_reason,
+        "providerError": provider_error,
         "usage": usage,
         "toolCalls": tools,
         "finalText": final_text,
@@ -456,13 +557,21 @@ def main(args: argparse.Namespace | None = None) -> int:
         raise SystemExit(f"cwd is not a directory: {cwd}")
     if not prompt_file.is_file():
         raise SystemExit(f"prompt file does not exist: {prompt_file}")
-    if args.timeout_seconds < 1:
-        raise SystemExit("timeout must be positive")
+    args.guarded = bool(getattr(args, "guarded", False))
+    args.startup_attention = getattr(args, "startup_attention", 60)
+    args.silent_reminder = getattr(args, "silent_reminder", 600)
+    args.progress_reminder = getattr(args, "progress_reminder", None)
+    if args.progress_reminder is None:
+        args.progress_reminder = 0 if args.mode == "analysis" else 600
+    if min(args.timeout_seconds, args.startup_attention, args.silent_reminder, args.progress_reminder) < 0:
+        raise SystemExit("timeout and reminder intervals must be non-negative")
+    if args.guarded and args.mode == "in-place":
+        raise SystemExit("guarded mode requires analysis or an isolated implementation worktree")
     changes_before = git_changes(cwd)
     if args.mode == "implementation" and changes_before and not args.allow_existing_changes:
         raise SystemExit("implementation mode requires a clean git worktree")
 
-    pi = shutil.which("pi.cmd" if os.name == "nt" else "pi")
+    pi = os.environ.get("SUBWORKER_PI_BIN") or os.environ.get("PI_WORKER_PI_BIN") or shutil.which("pi.cmd" if os.name == "nt" else "pi")
     if not pi:
         raise SystemExit("pi executable not found on PATH")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -470,6 +579,10 @@ def main(args: argparse.Namespace | None = None) -> int:
     stderr_path = output_dir / "pi-stderr.log"
     result_path = output_dir / "pi-result.json"
     attention_path = output_dir / "pi-attention.json"
+    progress_path = output_dir / "pi-progress.json"
+    profile = permission_profile(args)
+    progress = ProgressTracker(time.monotonic(), args.startup_attention, args.silent_reminder, args.progress_reminder)
+    last_productive_activity = progress.started
     attention_handle = create_attention_event(args.attention_event_name) if args.attention_event_name else None
     cancel_handle = create_attention_event(args.cancel_event_name) if args.cancel_event_name else None
     attention_lock = Lock()
@@ -488,7 +601,7 @@ def main(args: argparse.Namespace | None = None) -> int:
         with attention_lock:
             now = time.monotonic()
             previous = attention_times.get(category)
-            if attention_path.exists() or (previous is not None and now - previous < 30):
+            if previous is not None and now - previous < 30:
                 return
             attention_sequence += 1
             attention_times[category] = now
@@ -499,7 +612,16 @@ def main(args: argparse.Namespace | None = None) -> int:
                 "message": "Pi worker reported a runtime/provider error; inspect the redacted evidence log.",
                 "at": utc_now(),
                 "stderr": str(stderr_path),
+                "permissionProfile": profile,
+                "progress": progress.snapshot(now),
             }
+            if category in {"startup_attention", "silent_reminder", "progress_reminder"}:
+                payload["message"] = {
+                    "startup_attention": "Pi has not emitted its first event; the worker is still running.",
+                    "silent_reminder": "Pi has emitted no recent activity; the worker is still running.",
+                    "progress_reminder": "Pi has emitted no recent tool progress; the worker is still running.",
+                }[category]
+                payload["soft"] = True
             if category == "repeated_tool_errors":
                 payload["recentToolErrors"] = list(recent_tool_errors)
             atomic_json(attention_path, payload)
@@ -512,6 +634,10 @@ def main(args: argparse.Namespace | None = None) -> int:
         IMPLEMENTATION_GUIDANCE
         if args.mode == "implementation"
         else (
+            "The current working directory is the user-selected execution directory. "
+            "Work directly here and preserve unrelated existing changes. "
+            "Resolve uncertain paths with find or grep before targeting them."
+        ) if args.mode == "in-place" else (
             "This is a read-only task. Inspect the current working directory without changing files or repository state. "
             "Resolve uncertain paths with find or grep before targeting them; do not infer a file path from a symbol name."
         )
@@ -536,7 +662,6 @@ def main(args: argparse.Namespace | None = None) -> int:
         args.session_id,
         "--session-dir",
         str(args.session_dir.resolve()),
-        "--approve",
         "--provider",
         args.provider,
         "--model",
@@ -545,11 +670,11 @@ def main(args: argparse.Namespace | None = None) -> int:
         args.thinking,
         "--append-system-prompt",
         guidance,
-        "--extension",
-        str(Path(__file__).with_name("pi_worker_guard.mjs")),
-        "--tools",
-        enabled_tools,
     ]
+    if args.guarded:
+        command.extend(("--extension", str(Path(__file__).with_name("pi_worker_guard.mjs")), "--tools", enabled_tools))
+    else:
+        command.extend(("--approve", "--extension", str(Path(__file__).with_name("pi_worker_native_tools.mjs"))))
     if args.context_mode:
         agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
         context_root = agent_dir / "npm" / "node_modules" / "context-mode"
@@ -565,8 +690,8 @@ def main(args: argparse.Namespace | None = None) -> int:
             raise SystemExit(f"pi-mcp-adapter is not installed under {agent_dir}")
         command.extend(("--extension", str(adapter)))
     if args.playwright:
-        if args.mode != "implementation":
-            raise SystemExit("Playwright requires implementation mode")
+        if args.mode == "analysis":
+            raise SystemExit("Playwright requires implementation or in-place mode")
         playwright_skills = agent_dir / "npm" / "node_modules" / "pi-playwright" / "skills"
         if not playwright_skills.is_dir():
             raise SystemExit(f"pi-playwright is not installed under {agent_dir}")
@@ -584,11 +709,11 @@ def main(args: argparse.Namespace | None = None) -> int:
     process_done = Event()
     steer_stop = Event()
     activity = Condition()
-    last_activity = time.monotonic()
+    last_progress_write = 0.0
     source_status_after: list[str] = []
     source_drift_detected = False
     prompt = prompt_file.read_text(encoding="utf-8")
-    worker_env, _ = worker_environment(runtime, run_id)
+    worker_env, _ = worker_environment(runtime, run_id, guarded=args.guarded)
     worker_env.update(
         {
             "PI_WORKER_MODE": args.mode,
@@ -596,6 +721,7 @@ def main(args: argparse.Namespace | None = None) -> int:
             "PI_WORKER_SOURCE_ROOT": str(source_root),
             "PI_WORKER_EXECUTION_CWD": str(cwd),
             "PI_WORKER_RUN_ID": run_id,
+            "PI_WORKER_PERMISSION_PROFILE": profile["name"],
         }
     )
     cache_status: dict[str, object] = {}
@@ -680,15 +806,34 @@ def main(args: argparse.Namespace | None = None) -> int:
                         finally:
                             path.unlink(missing_ok=True)
 
-            def mark_activity() -> None:
-                nonlocal last_activity
+            def write_progress(now: float) -> None:
+                atomic_json(progress_path, {
+                    "runId": run_id,
+                    "permissionProfile": profile,
+                    **progress.snapshot(now),
+                })
+
+            write_progress(time.monotonic())
+
+            def mark_activity(event: dict[str, object] | None = None) -> None:
+                nonlocal last_progress_write, last_productive_activity
                 with activity:
-                    last_activity = time.monotonic()
+                    now = time.monotonic()
+                    progress.observe(now, event)
+                    if event and event.get("type") in {
+                        "tool_execution_start", "tool_execution_end", "message_end", "agent_end",
+                        "agent_settled", "auto_retry_start", "auto_retry_end", "queue_update",
+                    }:
+                        last_productive_activity = now
+                    if now - last_progress_write >= 1 or (event and event.get("type") in {"tool_execution_start", "tool_execution_end"}):
+                        write_progress(now)
+                        last_progress_write = now
                     activity.notify()
 
             def copy_stderr() -> None:
                 nonlocal stderr_log_bytes, stderr_log_truncated, reasoning_ignored_seen
                 for raw in process.stderr:
+                    mark_activity()
                     safe_raw = redact_credentials(raw)
                     remaining = MAX_STDERR_LOG_BYTES - stderr_log_bytes
                     if remaining > 0:
@@ -709,12 +854,16 @@ def main(args: argparse.Namespace | None = None) -> int:
             def watch_idle() -> None:
                 with activity:
                     while not process_done.is_set():
-                        remaining = args.timeout_seconds - (time.monotonic() - last_activity)
-                        if remaining <= 0:
+                        now = time.monotonic()
+                        remaining = args.timeout_seconds - (now - last_productive_activity) if args.timeout_seconds else None
+                        if remaining is not None and remaining <= 0:
                             timeout_event.set()
                             terminate_process_tree(process)
                             return
-                        activity.wait(remaining)
+                        for category in progress.due_reminders(now):
+                            write_progress(now)
+                            notify_attention(category)
+                        activity.wait(min(1, remaining) if remaining is not None else 1)
 
             watchdog = Thread(target=watch_idle, name=f"pi-idle-{run_id}", daemon=True)
             watchdog.start()
@@ -724,6 +873,7 @@ def main(args: argparse.Namespace | None = None) -> int:
             if steer_thread:
                 steer_thread.start()
             consecutive_tool_errors = 0
+            previous_tool_error_category = None
 
             def enforce_rpc_shutdown() -> None:
                 if not process_done.wait(5):
@@ -755,22 +905,22 @@ def main(args: argparse.Namespace | None = None) -> int:
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         event = {}
                     event_type = event.get("type")
-                    if event_type in {
-                        "tool_execution_start",
-                        "tool_execution_end",
-                        "message_end",
-                        "agent_end",
-                        "agent_settled",
-                        "auto_retry_start",
-                        "auto_retry_end",
-                        "queue_update",
-                    }:
-                        mark_activity()
+                    if event_type:
+                        mark_activity(event)
                     if event_type == "tool_execution_end":
                         if event.get("isError"):
+                            category = tool_error_category(event)
+                            if category != previous_tool_error_category:
+                                consecutive_tool_errors = 0
+                                recent_tool_errors.clear()
                             recent_tool_errors.append(tool_error_summary(event))
-                        consecutive_tool_errors = consecutive_tool_errors + 1 if event.get("isError") else 0
-                        if consecutive_tool_errors >= 3:
+                            consecutive_tool_errors += 1
+                            previous_tool_error_category = category
+                        else:
+                            consecutive_tool_errors = 0
+                            previous_tool_error_category = None
+                            recent_tool_errors.clear()
+                        if consecutive_tool_errors == 3:
                             notify_attention("repeated_tool_errors")
                     elif event_type == "auto_retry_start" and int(event.get("attempt") or 0) >= 2:
                         notify_attention("provider_retry")
@@ -778,6 +928,8 @@ def main(args: argparse.Namespace | None = None) -> int:
                         notify_attention("provider_retry_failed")
                     elif event_type == "extension_error":
                         notify_attention("extension_error")
+                    elif event_type == "message_end" and (event.get("message") or {}).get("stopReason") == "error":
+                        notify_attention("provider_error")
                     elif event_type == "compaction_end" and not event.get("result") and not event.get("aborted"):
                         notify_attention("compaction_error")
                     elif event_type == "response" and str(event.get("id") or "").startswith("steer-"):
@@ -826,6 +978,7 @@ def main(args: argparse.Namespace | None = None) -> int:
                 with activity:
                     activity.notify()
                 watchdog.join(timeout=1)
+                write_progress(time.monotonic())
     finally:
         close_windows_handle(steer_handle)
         close_windows_handle(cancel_handle)
@@ -859,7 +1012,7 @@ def main(args: argparse.Namespace | None = None) -> int:
         and parsed["stopReason"] == "stop"
         and not reasoning_warning
     )
-    patch = write_patch(cwd, output_dir, args.base_commit)
+    patch = write_patch(cwd, output_dir, args.base_commit) if args.mode == "implementation" else None
     changes_after = git_changes(cwd)
     cache_gc_scheduled = bool(cache_status.get("gcEligible")) and schedule_cache_gc(runtime)
     result = {
@@ -872,11 +1025,20 @@ def main(args: argparse.Namespace | None = None) -> int:
         "contextMode": bool(getattr(args, "context_mode", False)),
         "firecrawl": bool(getattr(args, "firecrawl", False)),
         "playwright": bool(getattr(args, "playwright", False)),
+        "permissionProfile": profile,
+        "progress": progress.snapshot(time.monotonic()),
+        "reminders": {
+            "startupAttentionSeconds": args.startup_attention,
+            "silentReminderSeconds": args.silent_reminder,
+            "progressReminderSeconds": args.progress_reminder,
+        },
         "exitCode": exit_code,
         "timedOut": timed_out,
-        "timeoutMode": "idle",
+        "timeoutMode": "idle" if args.timeout_seconds else "disabled",
+        "timeoutSeconds": args.timeout_seconds,
         "elapsedSeconds": round(time.perf_counter() - started, 3),
         "stopReason": "cancelled" if cancelled else parsed["stopReason"],
+        "providerError": parsed["providerError"],
         "reasoningWarning": reasoning_warning,
         "evidenceTruncated": (
             event_log_truncated
@@ -902,7 +1064,8 @@ def main(args: argparse.Namespace | None = None) -> int:
         "sourceCheckoutChanged": source_drift_detected,
         "sourceDriftDetected": source_drift_detected,
         "sourceStatusAfter": source_status_after,
-        "changedFiles": changes_after if args.mode == "implementation" else [],
+        "changedFiles": changes_after if args.mode != "analysis" else [],
+        "changeTracking": "git-status" if any((parent / ".git").exists() for parent in (cwd, *cwd.parents)) else "unavailable-non-git",
         "finalText": parsed["finalText"],
         "sourceCwd": str(source_cwd),
         "sourceRoot": str(source_root),
@@ -928,7 +1091,7 @@ def main(args: argparse.Namespace | None = None) -> int:
             "releaseStatus": cache_status,
             "gcScheduled": cache_gc_scheduled,
         },
-        "evidence": {"events": str(events_path), "stderr": str(stderr_path)},
+        "evidence": {"events": str(events_path), "stderr": str(stderr_path), "progress": str(progress_path)},
     }
     atomic_json(result_path, result)
     record_job(
@@ -963,6 +1126,7 @@ def write_runner_failure(args: argparse.Namespace, error: BaseException) -> int:
         "contextMode": bool(getattr(args, "context_mode", False)),
         "firecrawl": bool(getattr(args, "firecrawl", False)),
         "playwright": bool(getattr(args, "playwright", False)),
+        "permissionProfile": permission_profile(args),
         "exitCode": None,
         "timedOut": False,
         "stopReason": "runner_error",
@@ -1032,6 +1196,7 @@ def failure_args_from_argv(argv: list[str]) -> argparse.Namespace | None:
         context_mode="--context-mode" in argv,
         firecrawl="--firecrawl" in argv,
         playwright="--playwright" in argv,
+        guarded="--guarded" in argv,
         session_id=value("--session-id", "unknown"),
         session_dir=Path(value("--session-dir", str(Path(runtime) / "sessions" / "unknown"))),
         turn_index=int(value("--turn-index", "1") or 1),

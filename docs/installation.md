@@ -8,14 +8,14 @@
 - Python 3.12.10
 - Node.js 24.18.0；Pi 要求 Node 22.19+
 - Git for Windows 2.55+
-- `@earendil-works/pi-coding-agent` 0.83.0
+- `@earendil-works/pi-coding-agent` 0.85.1
 
 Python runtime 只使用标准库；JavaScript guard 只使用 Node 内置模块。
 
 ## 1. 安装 Pi
 
 ```powershell
-npm install -g @earendil-works/pi-coding-agent@0.83.0
+npm install -g @earendil-works/pi-coding-agent@0.85.1
 pi --version
 ```
 
@@ -28,7 +28,7 @@ where.exe pi
 ## 2. 克隆仓库
 
 ```powershell
-git clone https://github.com/MaxxxDong/codex-pi-worker C:\CodexWS\Software\codex-pi-worker
+git clone --branch agent/pi-worker-capabilities https://github.com/MaxxxDong/codex-pi-worker C:\CodexWS\Software\codex-pi-worker
 ```
 
 ## 3. 注册 Codex Skill
@@ -43,6 +43,22 @@ New-Item -ItemType Junction -Path $skill -Target $source
 
 如果 `$skill` 已存在，先检查并备份；不要直接覆盖包含个人修改的目录。新启动的 Codex 任务会读取 `SKILL.md`。
 
+## 升级现有 Windows 安装
+
+仓库通过 Junction 注册时，先确认没有活动 Worker，工作区没有需要保留的修改，再快进拉取当前 Windows 分支。合并 main 时应保留 Windows 修复并本机验证，不能用 main 覆盖：
+
+```powershell
+$repo = "C:\CodexWS\Software\codex-pi-worker"
+Push-Location $repo
+git status --short
+git pull --ff-only origin agent/pi-worker-capabilities
+Pop-Location
+```
+
+如果 `git status --short` 有输出，先提交或备份本机修改，不要直接覆盖。仓库更新不会修改 `~/.pi/agent/` 下的 provider、Key 和模型配置，也不会删除已有 receipt、session 或任务输出。
+
+Windows 继续使用 `~/.codex/skills/pi-worker`，根 SKILL 名称与之匹配。`scripts/subworker.py` 为统一命令入口，不另建第二份 Skill；macOS 使用 macos/SKILL.md 注册 subworker。
+
 ## 4. 配置 Pi provider
 
 将 [示例配置](../examples/models.example.json) 中需要的 provider 合并到 `~/.pi/agent/models.json`，并在本机填写 Key。真实配置不得进入本仓库、prompt、receipt 或日志。
@@ -51,7 +67,7 @@ New-Item -ItemType Junction -Path $skill -Target $source
 pi list
 ```
 
-provider 名称与模型必须匹配 runtime 白名单，详见 [配置指南](configuration.md)。
+默认读取本机 Pi settings；显式 provider/model 可使用 Pi 原生或扩展注册的路由，详见 [配置指南](configuration.md)。
 
 ## 5. 可选扩展
 

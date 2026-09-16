@@ -16,10 +16,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from runtime_support import (
-    DEFAULT_MODEL,
-    DEFAULT_PROVIDER,
-    DEFAULT_THINKING,
-    MODEL_CHOICES,
     PROVIDER_MODELS,
     SourceSnapshot,
     activate_cache,
@@ -28,6 +24,7 @@ from runtime_support import (
     cancel_event_name,
     capture_source_snapshot,
     emit_json,
+    pi_defaults,
     reconcile_jobs,
     record_job,
     release_cache,
@@ -138,29 +135,44 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cwd", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, required=True)
-    parser.add_argument("--mode", choices=("analysis", "implementation"), default="implementation")
+    parser.add_argument("--mode", choices=("analysis", "implementation", "in-place"), default="implementation")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--timeout-seconds", type=int, default=0)
+    parser.add_argument("--guarded", action="store_true")
+    parser.add_argument("--startup-attention", type=int, default=60)
+    parser.add_argument("--silent-reminder", type=int, default=600)
+    parser.add_argument("--progress-reminder", type=int, default=None)
     parser.add_argument(
         "--provider",
-        choices=tuple(PROVIDER_MODELS),
-        default=DEFAULT_PROVIDER,
+        default=None,
     )
     parser.add_argument(
         "--model",
-        choices=MODEL_CHOICES,
-        default=DEFAULT_MODEL,
+        default=None,
     )
     parser.add_argument(
         "--thinking",
         choices=("off", "minimal", "low", "medium", "high", "xhigh", "max"),
-        default=DEFAULT_THINKING,
+        default=None,
     )
     parser.add_argument("--context-mode", action="store_true")
     parser.add_argument("--firecrawl", action="store_true")
     parser.add_argument("--playwright", action="store_true")
     parser.add_argument("--evidence-file", type=Path, action="append", default=[])
     args = parser.parse_args()
+    default_provider, default_model, default_thinking = pi_defaults()
+    args.provider = args.provider or default_provider
+    if not args.model and args.provider != default_provider:
+        options = sorted(PROVIDER_MODELS.get(args.provider, []))
+        if len(options) != 1:
+            parser.error("specify --model when selecting a different provider")
+        args.model = options[0]
+    args.model = args.model or default_model
+    args.thinking = args.thinking or default_thinking
+    if args.progress_reminder is None:
+        args.progress_reminder = 0 if args.mode == "analysis" else 600
+    if min(args.timeout_seconds, args.startup_attention, args.silent_reminder, args.progress_reminder) < 0:
+        parser.error("timeouts and reminders must be non-negative")
     if args.evidence_file and args.mode != "implementation":
         raise SystemExit("--evidence-file requires implementation mode")
 
@@ -338,6 +350,11 @@ def main() -> int:
         command.extend(("--worktree-path", str(worktree_path)))
     if input_manifest is not None:
         command.extend(("--input-manifest", ".pi-worker-inputs/manifest.json"))
+    if args.guarded:
+        command.append("--guarded")
+    command.extend(("--startup-attention", str(args.startup_attention),
+                    "--silent-reminder", str(args.silent_reminder),
+                    "--progress-reminder", str(args.progress_reminder)))
     if args.context_mode:
         command.append("--context-mode")
     if args.firecrawl:
@@ -411,6 +428,11 @@ def main() -> int:
         "model": args.model,
         "thinking": args.thinking,
         "timeoutSeconds": args.timeout_seconds,
+        "guarded": args.guarded,
+        "permissionProfile": "guarded" if args.guarded else "native-unrestricted",
+        "startupAttentionSeconds": args.startup_attention,
+        "silentReminderSeconds": args.silent_reminder,
+        "progressReminderSeconds": args.progress_reminder,
         "cleanupStatus": "pending_worker",
         "cacheRoots": {name: str(path) for name, path in cache_roots.items()},
         "cacheLimitBytes": 20 * 1024**3,

@@ -42,6 +42,9 @@ def main() -> int:
     parser.add_argument("receipt", type=Path)
     parser.add_argument("--prompt-file", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=None)
+    parser.add_argument("--startup-attention", type=int, default=None)
+    parser.add_argument("--silent-reminder", type=int, default=None)
+    parser.add_argument("--progress-reminder", type=int, default=None)
     args = parser.parse_args()
 
     started = time.perf_counter()
@@ -82,6 +85,15 @@ def main() -> int:
     receipt_path = output_dir / "pi-receipt.json"
     result_path = output_dir / "pi-result.json"
 
+    timeout_seconds = args.timeout_seconds if args.timeout_seconds is not None else int(latest.get("timeoutSeconds") or 0)
+    reminders = {
+        "startupAttentionSeconds": args.startup_attention if args.startup_attention is not None else int(latest.get("startupAttentionSeconds", 60)),
+        "silentReminderSeconds": args.silent_reminder if args.silent_reminder is not None else int(latest.get("silentReminderSeconds", 600)),
+        "progressReminderSeconds": args.progress_reminder if args.progress_reminder is not None else int(latest.get("progressReminderSeconds", 0 if owner["mode"] == "analysis" else 600)),
+    }
+    if min(timeout_seconds, *reminders.values()) < 0:
+        raise SystemExit("timeouts and reminders must be non-negative")
+
     with runtime_lock(root):
         owner = read_json(owner_path)
         if owner.get("cleanupStatus") == "settled":
@@ -98,7 +110,6 @@ def main() -> int:
         )
         atomic_json(owner_path, owner)
 
-    timeout_seconds = args.timeout_seconds or int(owner.get("timeoutSeconds") or 1800)
     source_snapshot = owner.get("sourceSnapshot")
     source_fingerprint = str(source_snapshot.get("fingerprint") or "") if isinstance(source_snapshot, dict) else ""
     cache_status = reserve_cache(root, run_id)
@@ -163,6 +174,11 @@ def main() -> int:
         command.append("--firecrawl")
     if owner.get("playwright"):
         command.append("--playwright")
+    if owner.get("guarded"):
+        command.append("--guarded")
+    command.extend(("--startup-attention", str(reminders["startupAttentionSeconds"]),
+                    "--silent-reminder", str(reminders["silentReminderSeconds"]),
+                    "--progress-reminder", str(reminders["progressReminderSeconds"])))
 
     stdout_file = (output_dir / "runtime.stdout.log").open("wb")
     stderr_file = (output_dir / "runtime.stderr.log").open("wb")
@@ -247,6 +263,9 @@ def main() -> int:
         "model": owner["model"],
         "thinking": owner["thinking"],
         "timeoutSeconds": timeout_seconds,
+        "guarded": bool(owner.get("guarded")),
+        "permissionProfile": "guarded" if owner.get("guarded") else "native-unrestricted",
+        **reminders,
         "contextMode": bool(owner.get("contextMode")),
         "firecrawl": bool(owner.get("firecrawl")),
         "playwright": bool(owner.get("playwright")),

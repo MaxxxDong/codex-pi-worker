@@ -1,6 +1,13 @@
 # 运行、产物、通知和清理
 
+> 说明：本文档主要面向 Windows 平台的 Python 运行时操作；macOS 平台的 Subworker (v0.3.1) 多执行器操作与命令请参考 [macOS 安装与指南](macos.md) 与 [macOS SKILL.md](../macos/SKILL.md)。
+
 ## 一轮标准流程
+
+Windows 统一入口为 `python scripts/subworker.py`，提供 dispatch、wait、continue、steer、cancel、cleanup、diagnose、profiles；旧脚本仍可直接调用。
+默认读取当前 Pi 的 provider/model/thinking，显式参数优先。默认完整原生权限、环境与工具（含 PowerShell 和扩展工具），不加载额外 guard，Skills/扩展/模板正常发现；`--guarded` 才启用原限制。
+新增 `--mode in-place` 可直接在指定目录写入（包括非 Git）；analysis 仅通过任务指令约定只读。
+派发 `--timeout-seconds` 默认0，显式正数才启用 idle 硬超时；`--startup-attention 60 --silent-reminder 600 --progress-reminder 600` 为软提醒（analysis progress 默认0），不会终止任务。
 
 ### 1. 写任务文件
 
@@ -20,7 +27,7 @@ python scripts\start_pi_worker.py `
 
 implementation 会把源仓库当前的 staged、unstaged 和非 ignored untracked WIP 复制到隔离 worktree，并在隔离区建立临时 baseline；不会 stash、add、commit 或改写源仓库。最终 `changes.patch` 只包含 Worker 相对这份 WIP 的增量。冲突、dirty submodule、越界链接和快照期间并发变化会明确拒绝。
 
-需要让 Worker 用 Python/Node 等命令处理源仓库外部证据时，显式复制输入，不要让它对原绝对路径执行命令：
+需要固定外部证据副本时，可显式复制输入（guarded 模式下必须通过副本执行处理）：
 
 ```powershell
 python scripts\start_pi_worker.py ... `
@@ -51,7 +58,7 @@ python scripts\start_pi_worker.py ... --context-mode
 python scripts\watch_pi_worker.py C:\absolute\evidence\pi-receipt.json --timeout-seconds 1800
 ```
 
-不要用循环 `status`、日志 tail 或 10/30 秒轮询代替。watch 会返回：
+不要用循环 `status`、日志 tail 或 10/30 秒轮询代替。watch 默认返回紧凑结果，`--full` 保留完整 result；`--consumer` 默认使用 CODEX_THREAD_ID，不同对话独立确认提醒。`diagnose <receipt>` 可按需只读查看进展和重试建议。watch 会返回：
 
 - `attention`：运行中出现 provider/runtime 问题；审查证据后可继续等待同一 receipt。
 - `terminal`：`pi-result.json` 已存在；进入 Codex 审核。

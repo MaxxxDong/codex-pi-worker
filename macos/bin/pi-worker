@@ -1,0 +1,4 @@
+#!/bin/zsh
+set -euo pipefail
+# Deprecated launcher alias for Subworker. Forwards all calls to subworker.
+exec "${0:A:h}/subworker" "$@"

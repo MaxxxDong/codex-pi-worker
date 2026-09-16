@@ -1,47 +1,40 @@
 ---
 name: pi-worker
-description: Delegate bounded repository analysis, code review, implementation, repair, code search, or web research to Pi through configured OpenCode Go, ShuaiAPI, or Krill models. Supports receipt-bound continuation, isolated Git worktrees for writes, review-gated cleanup, a shared 20 GiB dependency cache, parallel detached runs, Windows completion-event watch, and structured results. Use when Codex should offload substantial work to Pi.
+description: Delegate implementation, repair, review, repository search or research to Pi on Windows. Supports detached runs, native permissions, WIP worktrees, in-place tasks, independent completion/attention, steer, continuation and review-gated cleanup. macOS uses Subworker.
 ---
 
-# Pi Worker
+# Subworker / Pi Worker
 
-Pi executes the bounded task; Codex reviews the result and verifies material changes.
+Codex assigns one cohesive task, reviews files and verifies the result. Windows keeps the existing
+`pi-worker` Skill path; the command entry is `scripts/subworker.py`. macOS instructions: [macos/SKILL.md](macos/SKILL.md).
 
-1. Write one UTF-8 prompt with scope, deliverable, and focused checks. Do not include secrets.
-2. Use the default `implementation` mode unless the task is explicitly read-only. Implementation
-   snapshots current non-ignored WIP into an isolated worktree without modifying or stashing the source.
-3. Start detached with a unique output directory. Add `--evidence-file <path>` for each external file
-   the Worker must process with commands; it receives a private worktree copy.
-
-```powershell
-python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\start_pi_worker.py" `
-  --cwd C:\absolute\repo --prompt-file C:\absolute\task.md `
-  --output-dir C:\absolute\evidence
-```
-
-4. Wait once; never replace it with status polling, log tails, or periodic narration.
+1. Write a UTF-8 prompt with scope, ownership, deliverable and focused checks.
+2. Dispatch with a unique output directory. Default `implementation` snapshots staged, unstaged
+   and non-ignored untracked WIP into a worktree. Use `in-place` to work directly in the assigned
+   directory (including non-Git work); `analysis` requests read-only work through instructions.
 
 ```powershell
-python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\watch_pi_worker.py" `
-  C:\absolute\evidence\pi-receipt.json --timeout-seconds 1800
+python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\subworker.py" dispatch `
+  --cwd C:\absolute\repo --prompt-file C:\absolute\task.md --output-dir C:\absolute\evidence
+python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\subworker.py" wait `
+  C:\absolute\evidence\pi-receipt.json --timeout-seconds 60
 ```
 
-For parallel runs in one Codex task, pass all live receipts to one watch. Handle the first
-`attention` or terminal event, remove only terminal receipts, then watch the rest. Different
-Codex tasks must not consume the same receipt.
+3. Resume a yielded wait process instead of starting status/log polling. A wait timeout ends only
+   the wait. Pass all pending receipts together; handle the first completion or attention and
+   wait again on the rest. Different conversations use distinct `--consumer` values
+   (default `CODEX_THREAD_ID`). Use `--full` only when the compact result is insufficient.
+4. On attention, use `diagnose <receipt>` and steer the same run where useful. On terminal,
+   inspect the candidate and focused checks; continue the session for a correction.
+5. After review, run `cleanup <receipt> --decision accepted --changes-integrated` once changes
+   are integrated, or `--decision rejected` for discarded work. In-place files are retained.
 
-On `attention`, steer or cancel the same receipt. On terminal, review and either continue the
-same session or finalize it. Read [docs/operations.md](docs/operations.md) only for these controls.
-After review, always settle the receipt; use `--changes-integrated` only after accepted changes
-have been applied or committed.
+Defaults: current Pi provider/model/thinking, native environment, normal Skills/extensions/prompts,
+full native tools, no extra guard and no forced timeout. `analysis` is not an enforced sandbox.
+Use explicit `--guarded` only when requested; use `--timeout-seconds` on dispatch only for a real
+idle limit. Startup/silence/no-tool reminders are soft notices (60/600/600 seconds; analysis no-tool=0).
 
-```powershell
-python "$env:USERPROFILE\.codex\skills\pi-worker\scripts\finalize_pi_worker.py" `
-  C:\absolute\evidence\pi-receipt.json --decision accepted --changes-integrated
-```
-
-Use `--decision rejected` for discarded work and finalize analysis runs too.
-
-- Parallelize only independent write scopes; run expensive repository-wide gates once after integration.
-- `completed` means execution ended, not that the result is correct.
-- Never print or copy `~/.pi/agent/models.json`; it contains provider credentials.
+Independent write ownership enables parallelism. Long code/reports belong in files, not final chat.
+Use `--context-mode` for large logs/aggregation, `--firecrawl` when needed and `--playwright` for browser tasks.
+Optional `--evidence-file` copies external inputs into implementation worktrees.
+Command details, controls and limits: [docs/operations.md](docs/operations.md).

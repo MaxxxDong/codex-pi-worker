@@ -247,7 +247,7 @@ def close_windows_handle(handle: int | None) -> None:
 
 def runtime_root() -> Path:
     default = Path(r"C:\piw") if os.name == "nt" else Path.home() / ".cache" / "pi-worker"
-    return Path(os.environ.get("PI_WORKER_ROOT", default)).resolve()
+    return Path(os.environ.get("SUBWORKER_STATE_ROOT") or os.environ.get("PI_WORKER_ROOT", default)).resolve()
 
 
 def is_within(path: Path, parent: Path) -> bool:
@@ -326,8 +326,20 @@ def atomic_json(path: Path, value: dict[str, object]) -> None:
 
 
 def validate_route(provider: str, model: str) -> None:
-    if model not in PROVIDER_MODELS.get(provider, set()):
+    # Pi's native catalog and provider extensions own routes not in this legacy table.
+    if provider in PROVIDER_MODELS and model not in PROVIDER_MODELS[provider]:
         raise SystemExit(f"model {model} is not configured for provider {provider}")
+
+
+def pi_defaults() -> tuple[str, str, str]:
+    directory = Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi" / "agent")
+    settings_path = directory / "settings.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.is_file() else {}
+    return (
+        settings.get("defaultProvider") or DEFAULT_PROVIDER,
+        settings.get("defaultModel") or DEFAULT_MODEL,
+        settings.get("defaultThinkingLevel") or DEFAULT_THINKING,
+    )
 
 
 def record_job(root: Path, job_id: str, **values: object) -> dict[str, object]:
@@ -638,11 +650,12 @@ def release_cache(root: Path, run_id: str) -> dict[str, object]:
         return {**_last_cache_status(root), "activeWorkers": len(live), "gcEligible": not live}
 
 
-def worker_environment(root: Path, run_id: str) -> tuple[dict[str, str], Path]:
+def worker_environment(root: Path, run_id: str, *, guarded: bool = True) -> tuple[dict[str, str], Path]:
     run_temp = root / "runs" / run_id / "tmp"
     buckets = shared_cache_paths(root)
     run_temp.mkdir(parents=True, exist_ok=True)
-    env = {name: value for name, value in os.environ.items() if name.upper() in SAFE_ENV_NAMES}
+    env = ({name: value for name, value in os.environ.items() if name.upper() in SAFE_ENV_NAMES}
+           if guarded else dict(os.environ))
     env.update(
         {
             "UV_CACHE_DIR": str(buckets["uv"]),

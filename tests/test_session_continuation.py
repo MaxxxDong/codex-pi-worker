@@ -526,6 +526,16 @@ class SessionContinuationTests(unittest.TestCase):
             self.assertIn("PROMPT=FIRST", first_result["finalText"])
             self.assertTrue(Path(first_receipt["sessionDir"]).is_dir())
 
+            owner_before = owner_receipt.read_bytes()
+            invalid = subprocess.run(
+                [sys.executable, str(SCRIPTS / "continue_pi_worker.py"), str(owner_receipt),
+                 "--prompt-file", str(second_prompt), "--silent-reminder", "-1"],
+                capture_output=True, env=env, creationflags=subprocess.CREATE_NO_WINDOW, check=False,
+            )
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertEqual(owner_receipt.read_bytes(), owner_before)
+            self.assertFalse((output / "turns").exists())
+
             continued = subprocess.run(
                 [
                     sys.executable,
